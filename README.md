@@ -65,7 +65,7 @@ To make `/plan` available across all your Prime Agent sessions and projects on y
 mkdir -p ~/.prime/agent/skills
 
 # 2. Clone the repository into ~/.prime/agent/skills/plan
-git clone https://github.com/lewbei/plan.git ~/.prime/agent/skills/plan
+git clone https://github.com/lewbei/prime-agent-plan.git ~/.prime/agent/skills/plan
 ```
 
 ### Method 2: Project-Local Installation
@@ -77,9 +77,9 @@ To include `/plan` as part of a specific project repository:
 mkdir -p .prime/agent/skills
 
 # 2. Clone or submodule plan into .prime/agent/skills/plan
-git clone https://github.com/lewbei/plan.git .prime/agent/skills/plan
+git clone https://github.com/lewbei/prime-agent-plan.git .prime/agent/skills/plan
 # OR add as a submodule:
-git submodule add https://github.com/lewbei/plan.git .prime/agent/skills/plan
+git submodule add https://github.com/lewbei/prime-agent-plan.git .prime/agent/skills/plan
 ```
 
 ### Method 3: Activating & Verifying
