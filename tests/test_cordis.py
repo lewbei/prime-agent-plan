@@ -1,0 +1,227 @@
+"""Tests for Cordis Spatiotemporal Composability Engine in plan_mode."""
+from __future__ import annotations
+
+import pytest
+from plan_mode.cordis import Context, Fiber, LifecycleState, TwistedMonoid, reset_root_context
+from plan_mode import execute_plan, speculative_rollout, create_subagent_context, provide_tool
+
+
+def test_twisted_monoid_lifo():
+    """Verify that inverses compose in twisted monoid (LIFO) order."""
+    ctx = Context(name="test_lifo")
+    trace = []
+
+    def op1():
+        trace.append("f1")
+        return lambda: trace.append("g1")
+
+    def op2():
+        trace.append("f2")
+        return lambda: trace.append("g2")
+
+    def op3():
+        trace.append("f3")
+        return lambda: trace.append("g3")
+
+    ctx.effect(op1)
+    ctx.effect(op2)
+    ctx.effect(op3)
+
+    assert trace == ["f1", "f2", "f3"]
+    ctx.dispose()
+    assert trace == ["f1", "f2", "f3", "g3", "g2", "g1"]
+
+
+def test_context_effect_generator():
+    """Verify effect iterators yielding step-by-step inverses."""
+    ctx = Context(name="test_iter")
+    trace = []
+
+    def multi_step_effect():
+        trace.append("step_1")
+        yield lambda: trace.append("undo_1")
+        trace.append("step_2")
+        yield lambda: trace.append("undo_2")
+
+    ctx.effect(multi_step_effect)
+    assert trace == ["step_1", "step_2"]
+    ctx.dispose()
+    assert trace == ["step_1", "step_2", "undo_2", "undo_1"]
+
+
+def test_reactive_coeffects_and_notification():
+    """Verify reactive coeffects: dynamic service provision and listener notifications."""
+    ctx = Context(name="test_coeffect")
+    notifications = []
+
+    ctx.on_change("db", lambda key, val, action: notifications.append((key, val, action)))
+
+    assert ctx.get("db") is None
+
+    # Provide db service
+    disp = ctx.provide("db", "postgres://localhost:5432")
+    assert ctx.get("db") == "postgres://localhost:5432"
+    assert ("db", "postgres://localhost:5432", "provided") in notifications
+
+    # Revert provision
+    disp()
+    assert ctx.get("db") is None
+    assert ("db", None, "withdrawn") in notifications
+
+
+def test_scoped_realm_isolation():
+    """Verify scoped realm isolation (ctx.isolate): private realms do not pollute parent."""
+    root = Context(name="root")
+    root.provide("scratch", "global_scratch")
+
+    sub_a = root.isolate("scratch", "realm_a")
+    sub_b = root.isolate("scratch", "realm_b")
+
+    sub_a.provide("scratch", "private_a")
+    sub_b.provide("scratch", "private_b")
+
+    assert root.get("scratch") == "global_scratch"
+    assert sub_a.get("scratch") == "private_a"
+    assert sub_b.get("scratch") == "private_b"
+
+    # Dispose sub_a only
+    sub_a.dispose()
+    assert sub_a.get("scratch") is None
+    assert root.get("scratch") == "global_scratch"
+    assert sub_b.get("scratch") == "private_b"
+
+
+def test_proxy_capability_interception():
+    """Verify metadata interception on coeffect bindings."""
+    ctx = Context(name="test_intercept")
+    ctx.provide("calculator", {"add": lambda a, b: a + b, "eval_code": lambda s: "unsafe"})
+
+    # Intercept and wrap with capability filter
+    def security_proxy(target, context):
+        return {
+            "add": target["add"],
+            "eval_code": lambda s: "BLOCKED_BY_CAPABILITY_FILTER"
+        }
+
+    ctx.intercept("calculator", proxy=security_proxy)
+
+    calc = ctx.get("calculator")
+    assert calc["add"](2, 3) == 5
+    assert calc["eval_code"]("rm -rf /") == "BLOCKED_BY_CAPABILITY_FILTER"
+
+
+def test_fiber_lifecycle_state_machine():
+    """Verify 10-rule fiber state machine: activation on satisfaction, deactivation, and failure handling."""
+    ctx = Context(name="fiber_test")
+    trace = []
+
+    def service_a_impl(c):
+        trace.append("service_a_active")
+        return lambda: trace.append("service_a_stopped")
+
+    def consumer_b_impl(c):
+        trace.append("consumer_b_active")
+        return lambda: trace.append("consumer_b_stopped")
+
+    fiber_a = Fiber(ctx, "provider_a", provisions={"service:a"}, apply_fn=lambda c: (service_a_impl(c), c.provide("service:a", "svc_a_val"))[0])
+    fiber_b = Fiber(ctx, "consumer_b", dependencies={"service:a"}, apply_fn=consumer_b_impl)
+
+    assert not fiber_b.is_satisfied()
+    assert fiber_b.state == LifecycleState.INACTIVE
+
+    # Activate provider
+    fiber_a.activate()
+    assert fiber_a.state == LifecycleState.ACTIVE
+    assert fiber_b.is_satisfied()
+
+    # Activate consumer
+    activated = fiber_b.activate()
+    assert activated
+    assert fiber_b.state == LifecycleState.ACTIVE
+    assert "consumer_b_active" in trace
+
+    # Deactivate consumer
+    fiber_b.deactivate()
+    assert fiber_b.state == LifecycleState.INACTIVE
+    assert "consumer_b_stopped" in trace
+
+    # Test failure handling (L-Raise)
+    def failing_fn(c):
+        raise ValueError("simulated fiber crash")
+
+    fiber_failing = Fiber(ctx, "failing_fiber", apply_fn=failing_fn)
+    ok = fiber_failing.activate()
+    assert not ok
+    assert fiber_failing.state == LifecycleState.FAILED
+    assert isinstance(fiber_failing.error, ValueError)
+
+
+def test_execute_plan_transactional_success():
+    """Verify execute_plan runs all tasks cleanly."""
+    plan_text = """# Sample Plan
+    1. Task One: Initialize
+    - output: init.txt
+    2. Task Two: Build
+    - depends on 1
+    - output: build.txt
+    """
+    trace = []
+
+    def h1(c):
+        trace.append("t1_run")
+        return {"done": 1}
+
+    def h2(c):
+        trace.append("t2_run")
+        return {"done": 2}
+
+    res = execute_plan(plan_text, task_handlers={1: h1, 2: h2})
+    assert res["ok"] is True
+    assert res["executed_tasks"] == [1, 2]
+    assert trace == ["t1_run", "t2_run"]
+    assert res["recovered"] is False
+
+
+def test_execute_plan_transactional_rollback_on_failure():
+    """Verify that failure at Task 2 automatically inverts Task 1 side effects in LIFO order."""
+    plan_text = """# Sample Plan
+    1. Task One: Setup
+    - output: setup.txt
+    2. Task Two: Risky Step
+    - depends on 1
+    - output: risk.txt
+    """
+    disk_state = []
+
+    def task1_handler(task_ctx):
+        # Register a revertible file mutation
+        disk_state.append("setup.txt")
+        task_ctx.effect(lambda: lambda: disk_state.remove("setup.txt"))
+        return {"created": "setup.txt"}
+
+    def task2_handler(task_ctx):
+        raise RuntimeError("Task 2 build error!")
+
+    res = execute_plan(plan_text, task_handlers={1: task1_handler, 2: task2_handler})
+    assert res["ok"] is False
+    assert res["failed_task"] == 2
+    assert res["recovered"] is True
+    # Verify Task 1 side effect was completely undone!
+    assert disk_state == []
+    assert "rolled back in LIFO order" in res["recovery_message"]
+
+
+def test_speculative_rollout_clean_teardown():
+    """Verify speculative_rollout scores without leaking any side effects."""
+    mutations = []
+
+    def candidate_eval(spec_ctx):
+        mutations.append("temp_db_table")
+        spec_ctx.effect(lambda: lambda: mutations.remove("temp_db_table"))
+        return 92.5
+
+    res = speculative_rollout("dummy plan", candidate_eval)
+    assert res["ok"] is True
+    assert res["score"] == 92.5
+    # Teardown must be complete
+    assert mutations == []
