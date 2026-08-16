@@ -8,10 +8,15 @@ Formal runtime realization of 'A Programming Paradigm for Spatiotemporal Composa
    - Twisted composition monoid T_Gamma: (f1, g1) o (f2, g2) = (f1 o f2, g2 o g1).
    - Accumulator phi rolls up inverses in LIFO order for complete context recovery.
    - Step-boundary effect iterators with cancellation guards (Algorithm 1).
+   - Full support for sync and async effect callbacks and inverses.
 
 2. Reactive Coeffects (Section 3.2):
    - Partial dependent coeffect context Sigma: (k: K) -> V_k.
    - Reactive notification: changes classified as activating / deactivating / neutral.
+   - Dynamic fiber lifecycle reactions: fibers activate when dependencies are satisfied
+     and deactivate when coeffects are withdrawn.
+   - Theorem 63 Provider Withdrawal Guard: a provider's withdrawal automatically
+     deactivates dependent fibers before the binding is unmounted.
    - Scoped Realm Isolation (isolate): 2-layer resolution key -> rho(k) -> sigma(rho(k)).
    - Metadata Interception (intercept): capability mediation without triggering reloads.
 
@@ -19,7 +24,7 @@ Formal runtime realization of 'A Programming Paradigm for Spatiotemporal Composa
    - Fibers <d, p, e, pi, sigma, tau, theta> spanning 10 formal operational rules:
      Orchestration: O-Insert, O-Retire, O-Remove
      Lifecycle: L-Begin, L-Iter, L-Finish, L-Divert, L-Raise, L-Leave, L-Unload
-   - Inertial unloading and asynchronous cancellation guards.
+   - Dynamic state transitions (INACTIVE, RELOADING, ACTIVE, UNLOADING, FAILED).
 
 4. Dynamic Execution & Rollback for Agent Harness & Planning:
    - Speculative execution rollouts with instant state recovery.
@@ -41,6 +46,34 @@ from typing import Any, Callable, Coroutine, Generator, Generic, Iterable, Itera
 T = TypeVar("T")
 
 
+def _run_inv_sync(inv: Callable[[], Any]) -> None:
+    """Run an inverse callable synchronously."""
+    if inspect.iscoroutinefunction(inv):
+        try:
+            loop = asyncio.get_running_loop()
+            loop.create_task(inv())
+        except RuntimeError:
+            asyncio.run(inv())
+        return
+    res = inv()
+    if inspect.isawaitable(res):
+        try:
+            loop = asyncio.get_running_loop()
+            loop.create_task(res)
+        except RuntimeError:
+            asyncio.run(res)
+
+
+async def _run_inv_async(inv: Callable[[], Any]) -> None:
+    """Run an inverse callable asynchronously, awaiting any coroutine."""
+    if inspect.iscoroutinefunction(inv):
+        await inv()
+        return
+    res = inv()
+    if inspect.isawaitable(res):
+        await res
+
+
 # ---------------------------------------------------------------------------
 # 1. Revertible Effects & Twisted Monoid Accumulator
 # ---------------------------------------------------------------------------
@@ -60,12 +93,12 @@ class TwistedMonoid:
             res2 = None
             res1 = None
             try:
-                res2 = g2()
-            except Exception as e2:
+                _run_inv_sync(g2)
+            except Exception:
                 pass  # preserve secondary errors while continuing recovery
             try:
-                res1 = g1()
-            except Exception as e1:
+                _run_inv_sync(g1)
+            except Exception:
                 pass
             return (res2, res1)
         return _composite
@@ -108,14 +141,14 @@ class Context:
         # @@intercept: Metadata table iota: (Key -> Metadata)
         self._intercept: dict[str, dict[str, Any]] = {} if parent is None else copy.deepcopy(parent._intercept)
 
-        # Effect accumulator phi: LIFO list of inverses
-        self._inverses: list[Callable[[], Any]] = []
+        # Effect accumulator phi: LIFO list of (sync_dispose, async_dispose) pairs
+        self._inverses: list[tuple[Callable[[], Any], Callable[[], Coroutine[Any, Any, None]]]] = []
         self._disposed = False
 
-        # Fiber registry: F_gamma
+        # Fiber registry: F_gamma (shared across hierarchy)
         self._registry: dict[str, Fiber] = {} if parent is None else parent._registry
 
-        # Reactive listeners on coeffect keys
+        # Reactive listeners on coeffect keys (shared across hierarchy)
         self._listeners: dict[str, list[Callable[[str, Any, str], None]]] = {} if parent is None else parent._listeners
 
         # Lock for thread safety during concurrent transitions
@@ -144,6 +177,13 @@ class Context:
             res = None
             try:
                 res = callback()
+                if inspect.isawaitable(res):
+                    try:
+                        loop = asyncio.get_running_loop()
+                        # If in running async loop, schedule
+                        loop.create_task(res)
+                    except RuntimeError:
+                        res = asyncio.run(res)
             except Exception as err:
                 self._disposed = False
                 raise err
@@ -160,14 +200,14 @@ class Context:
                     # rollback accumulated so far on error
                     for inv in reversed(inverses_collected):
                         try:
-                            inv()
+                            _run_inv_sync(inv)
                         except Exception:
                             pass
                     raise iter_err
             elif callable(res):
                 inverses_collected.append(res)
 
-            # Define self-disposal closure (LIFO)
+            # Define self-disposal closures (LIFO)
             def _dispose():
                 with self._lock:
                     if not armed[0]:
@@ -175,21 +215,74 @@ class Context:
                     armed[0] = False
                     for inv in reversed(inverses_collected):
                         try:
-                            if inspect.iscoroutinefunction(inv):
-                                asyncio.create_task(inv())
-                            else:
-                                inv()
-                        except Exception as e:
+                            _run_inv_sync(inv)
+                        except Exception:
                             pass
 
+            async def _dispose_async():
+                with self._lock:
+                    if not armed[0]:
+                        return
+                    armed[0] = False
+                    for inv in reversed(inverses_collected):
+                        try:
+                            await _run_inv_async(inv)
+                        except Exception:
+                            pass
+
+            pair = (_dispose, _dispose_async)
             # Prepend to context accumulator
-            self._inverses.append(_dispose)
+            self._inverses.append(pair)
 
             # If this is a child context, chain into parent
             if self.parent is not None:
-                self.parent._inverses.append(_dispose)
+                self.parent._inverses.append(pair)
 
             return _dispose
+
+    async def async_effect(self, callback: Callable[[], Any | Coroutine[Any, Any, Any]]) -> Callable[[], Any]:
+        """Async variant of effect execution."""
+        if self._disposed:
+            raise RuntimeError("Cannot execute effect on a disposed context")
+
+        armed = [True]
+        inverses_collected: list[Callable[[], Any]] = []
+
+        res = callback()
+        if inspect.isawaitable(res):
+            res = await res
+
+        if callable(res):
+            inverses_collected.append(res)
+
+        def _dispose():
+            with self._lock:
+                if not armed[0]:
+                    return
+                armed[0] = False
+                for inv in reversed(inverses_collected):
+                    try:
+                        _run_inv_sync(inv)
+                    except Exception:
+                        pass
+
+        async def _dispose_async():
+            with self._lock:
+                if not armed[0]:
+                    return
+                armed[0] = False
+                for inv in reversed(inverses_collected):
+                    try:
+                        await _run_inv_async(inv)
+                    except Exception:
+                        pass
+
+        pair = (_dispose, _dispose_async)
+        self._inverses.append(pair)
+        if self.parent is not None:
+            self.parent._inverses.append(pair)
+
+        return _dispose
 
     def dispose(self):
         """Recover all effects executed under this context in LIFO order."""
@@ -199,9 +292,23 @@ class Context:
             self._disposed = True
             to_run = list(reversed(self._inverses))
             self._inverses.clear()
-            for inv in to_run:
+            for disp_sync, _ in to_run:
                 try:
-                    inv()
+                    disp_sync()
+                except Exception:
+                    pass
+
+    async def async_dispose(self):
+        """Recover all effects executed under this context in LIFO order (async)."""
+        with self._lock:
+            if self._disposed:
+                return
+            self._disposed = True
+            to_run = list(reversed(self._inverses))
+            self._inverses.clear()
+            for _, disp_async in to_run:
+                try:
+                    await disp_async()
                 except Exception:
                     pass
 
@@ -233,6 +340,15 @@ class Context:
             self._notify(key, value, "provided")
 
             def _inverse():
+                # Theorem 63 Provider Withdrawal Guard:
+                # A provider cannot withdraw until all dependent active fibers deactivate.
+                for fiber in list(self._registry.values()):
+                    if key in fiber.dependencies and fiber.state == LifecycleState.ACTIVE:
+                        try:
+                            fiber.deactivate()
+                        except Exception:
+                            pass
+
                 if old_val is not None:
                     self._store[realm] = old_val
                     self._notify(key, old_val, "restored")
@@ -283,6 +399,23 @@ class Context:
             except Exception:
                 pass
 
+        # Wire dynamic fiber lifecycle reactions:
+        # Check registered fibers depending on `key`
+        for fiber in list(self._registry.values()):
+            if key in fiber.dependencies and not fiber.retired:
+                if action == "withdrawn" or not fiber.is_satisfied():
+                    if fiber.state == LifecycleState.ACTIVE:
+                        try:
+                            fiber.deactivate()
+                        except Exception:
+                            pass
+                elif action in ("provided", "restored") and fiber.is_satisfied():
+                    if fiber.state == LifecycleState.INACTIVE:
+                        try:
+                            fiber.activate()
+                        except Exception:
+                            pass
+
 
 # ---------------------------------------------------------------------------
 # 3. Fiber Lifecycle State Machine (10 Operational Rules)
@@ -317,6 +450,9 @@ class Fiber:
         self.error: Exception | None = None
         self._dispose_handle: Callable[[], Any] | None = None
         self._unsub_listeners: list[Callable[[], None]] = []
+
+        # Register fiber into the context hierarchy
+        self.ctx._registry[self.uid] = self
 
     def is_satisfied(self) -> bool:
         """Evaluate the coeffect satisfaction predicate: sigma |= d."""
@@ -364,6 +500,8 @@ class Fiber:
         """O-Retire -> O-Remove: Mark fiber retired and unload it."""
         self.retired = True
         self.deactivate()
+        # Remove from registry
+        self.ctx._registry.pop(self.uid, None)
         for unsub in self._unsub_listeners:
             try:
                 unsub()

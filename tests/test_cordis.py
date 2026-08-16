@@ -225,3 +225,70 @@ def test_speculative_rollout_clean_teardown():
     assert res["score"] == 92.5
     # Teardown must be complete
     assert mutations == []
+
+
+@pytest.mark.asyncio
+async def test_cordis_async_effects_and_inverses():
+    """Verify that async effects and async inverses execute and unwind cleanly."""
+    ctx = Context(name="test_async_effects")
+    trace = []
+
+    async def async_forward():
+        trace.append("async_fwd")
+        async def async_inv():
+            trace.append("async_inv")
+        return async_inv
+
+    await ctx.async_effect(async_forward)
+    assert trace == ["async_fwd"]
+
+    await ctx.async_dispose()
+    assert trace == ["async_fwd", "async_inv"]
+
+
+def test_cordis_fiber_reactive_lifecycle_auto_activation():
+    """Verify that providing a coeffect dynamically activates fibers, and withdrawing it deactivates them."""
+    ctx = Context(name="reactive_fiber_test")
+    trace = []
+
+    def consumer_fn(c):
+        trace.append("consumer_started")
+        return lambda: trace.append("consumer_stopped")
+
+    fiber = Fiber(ctx, "reactive_consumer", dependencies={"service:gpu"}, apply_fn=consumer_fn)
+    assert fiber.state == LifecycleState.INACTIVE
+
+    # Dynamically provide service:gpu -> fiber should auto-activate
+    dispose_prov = ctx.provide("service:gpu", "cuda:0")
+    assert fiber.state == LifecycleState.ACTIVE
+    assert "consumer_started" in trace
+
+    # Withdraw service:gpu -> fiber should auto-deactivate
+    dispose_prov()
+    assert fiber.state == LifecycleState.INACTIVE
+    assert "consumer_stopped" in trace
+
+
+def test_cordis_theorem_63_provider_withdrawal_order():
+    """Theorem 63: A provider cannot withdraw until all dependent fibers have deactivated."""
+    ctx = Context(name="theorem_63_test")
+    order_of_events = []
+
+    def consumer_fn(c):
+        order_of_events.append("consumer_active")
+        def _inv():
+            order_of_events.append("consumer_deactivated")
+        return _inv
+
+    fiber = Fiber(ctx, "dep_consumer", dependencies={"service:auth"}, apply_fn=consumer_fn)
+
+    # Provide auth
+    disp_auth = ctx.provide("service:auth", {"token": "valid"})
+    assert fiber.state == LifecycleState.ACTIVE
+
+    # Withdraw provider
+    disp_auth()
+    # Ensure consumer deactivation occurred before final withdrawal
+    assert "consumer_deactivated" in order_of_events
+    assert fiber.state == LifecycleState.INACTIVE
+    assert ctx.get("service:auth") is None

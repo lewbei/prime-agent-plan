@@ -432,3 +432,74 @@ def test_search_rules_offline(tmp_path):
     assert res["best_score"] >= 0
     assert res["nodes"] >= 1
     assert "escalations" in res
+
+
+def test_plan_dag_reads_and_inputs_parsing_no_none():
+    """Verify that plan_dag parses Reads: and Inputs: cleanly without crashing or containing None."""
+    plan = """
+    1. Setup
+       Inputs: raw_data.csv
+       Reads: config.yaml
+       Output: parsed.json
+    2. Train
+       Depends on 1
+       Inputs: parsed.json
+       Output: model.bin
+    """
+    dag = plan_mode.plan_dag(plan)
+    assert dag["nodes"] == [1, 2]
+    assert dag["inputs"][1] == ["config.yaml", "raw_data.csv"]
+    assert None not in dag["inputs"][1]
+    assert dag["artifacts"][1] == ["parsed.json"]
+
+
+def test_verify_catches_non_contiguous_tasks():
+    """Verify that non-contiguous task numbers (e.g. 1, 2, 4) trigger a structural error."""
+    broken_plan = """
+    1. Step One
+       Output: a.txt
+    2. Step Two
+       Depends on 1
+       Output: b.txt
+    4. Step Four
+       Depends on 2
+       Output: c.txt
+    """
+    v = plan_mode.verify(broken_plan)
+    assert not v["ok"]
+    assert any("non-contiguous" in err for err in v["errors"])
+
+
+def test_start_resumes_active_session_by_objective(tmp_path):
+    """Calling start(objective) without session_id resumes the active session for that objective."""
+    s1 = plan_mode.start("Automate end-to-end testing pipeline", plans_dir=tmp_path)
+    s1_id = s1["session_id"]
+
+    # Assess round 1
+    plan_mode.assess(s1, "1. Task 1\nOutput: out.txt", plans_dir=tmp_path)
+
+    # Call start with same objective
+    s2 = plan_mode.start("Automate end-to-end testing pipeline", plans_dir=tmp_path)
+    assert s2["session_id"] == s1_id
+    assert len(s2["rounds"]) == 1
+
+
+def test_release_respects_custom_plans_dir_and_binds_judge_version(tmp_path):
+    """Verify release() reads plans_dir from session dict and binds judge verdict by round."""
+    s = plan_mode.start("Custom session for release test", plans_dir=tmp_path)
+
+    # Assess round 1
+    plan_text = "1. Setup\nOutput: a.txt\n2. Run\nDepends on 1\nOutput: b.txt"
+    plan_mode.assess(s, plan_text, plans_dir=tmp_path)
+    s["status"] = "converged"
+    s["best_score"] = 95.0
+
+    # Record judge verdict bound to round 1
+    plan_mode.record_judge(s, {"ok": True, "verdict": "go", "falsifiable_criteria": True, "feasibility_0_100": 95},
+                           round_version=1, plans_dir=tmp_path)
+
+    # Run release on session dict without passing plans_dir explicitly
+    rel = plan_mode.release(s, min_score=90.0, require_judge=True)
+    # Judge check should pass because round 1 judge verdict exists
+    judge_check = next(c for c in rel["checks"] if c["name"] == "judge")
+    assert judge_check["ok"] is True

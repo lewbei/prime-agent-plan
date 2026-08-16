@@ -24,7 +24,9 @@ checks, so "better and better" is a recorded, auditable fact, not a vibe.
 """
 from __future__ import annotations
 
+import asyncio
 import difflib
+import inspect
 import json
 import hashlib
 import shutil
@@ -370,7 +372,27 @@ def start(objective: str, *, plans_dir: str | Path | None = None, max_rounds: in
     """Create (or resume) a plan session for an objective."""
     plans_dir = Path(plans_dir) if plans_dir else DEFAULT_PLANS_DIR
     plans_dir.mkdir(parents=True, exist_ok=True)
-    sid = session_id or f"{_slugify(objective)}-{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%S')}"
+    if session_id:
+        sid = session_id
+        p = _session_path(plans_dir, sid)
+        if p.exists():
+            return _load_session(plans_dir, sid)
+    else:
+        # Resume existing active session for this objective if present
+        slug = _slugify(objective)
+        matching: list[tuple[float, str]] = []
+        for sess_file in plans_dir.glob(f"{slug}*.json"):
+            try:
+                data = json.loads(sess_file.read_text(encoding="utf-8"))
+                if data.get("objective") == objective and data.get("status") not in ("finished", "abandoned"):
+                    matching.append((sess_file.stat().st_mtime, data.get("session_id", sess_file.stem)))
+            except Exception:
+                continue
+        if matching:
+            matching.sort(reverse=True)
+            return _load_session(plans_dir, matching[0][1])
+        sid = f"{slug}-{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%S')}"
+
     p = _session_path(plans_dir, sid)
     if p.exists():
         return _load_session(plans_dir, sid)  # resume; keeps improving existing plan
@@ -656,8 +678,12 @@ def release(session: dict[str, Any] | str, *, min_score: float = 90.0,
     criteria. Until then the plan keeps looping. Returns the gate report;
     the plan must NOT be reported as done while ok is False.
     """
-    plans_dir = Path(plans_dir) if plans_dir else DEFAULT_PLANS_DIR
-    s = _load_session(plans_dir, session) if isinstance(session, str) else session
+    if isinstance(session, str):
+        plans_dir = Path(plans_dir) if plans_dir else DEFAULT_PLANS_DIR
+        s = _load_session(plans_dir, session)
+    else:
+        s = session
+        plans_dir = Path(plans_dir) if plans_dir else Path(s.get("plans_dir") or DEFAULT_PLANS_DIR)
     checks: list[dict[str, Any]] = []
     problems: list[str] = []
     historical: dict[str, Any] = {}
@@ -700,10 +726,17 @@ def release(session: dict[str, Any] | str, *, min_score: float = 90.0,
     judge_ok = False
     judge_detail = "no judge verdict recorded"
     judges = s.get("judge_log", [])
+    best_ver = s.get("best_version")
+    matching_judge = None
     if judges:
-        j = judges[-1]
+        for j_entry in reversed(judges):
+            if j_entry.get("round_version") == best_ver or j_entry.get("round_version") is None:
+                matching_judge = j_entry
+                break
+    if matching_judge:
+        j = matching_judge
         judge_ok = bool(j.get("ok") and j.get("verdict") == "go" and j.get("falsifiable_criteria"))
-        judge_detail = f"verdict={j.get('verdict')} feasibility={j.get('feasibility_0_100')} falsifiable={j.get('falsifiable_criteria')}"
+        judge_detail = f"round={j.get('round_version')} verdict={j.get('verdict')} feasibility={j.get('feasibility_0_100')} falsifiable={j.get('falsifiable_criteria')}"
     checks.append({"name": "judge", "ok": judge_ok or not require_judge, "detail": judge_detail})
     if require_judge and not judge_ok:
         problems.append("external judge has not returned go/falsifiable; run plan.judge + record_judge, fix blockers, re-assess")
@@ -954,6 +987,10 @@ def verify(plan_text: str) -> dict[str, Any]:
         end = markers[i + 1].start() if i + 1 < len(markers) else len(plan_text)
         tasks.append((int(m.group(1)), plan_text[start:end].strip()))
     nums = [n for n, _ in tasks]
+    if nums:
+        expected = list(range(1, len(nums) + 1))
+        if nums != expected:
+            errors.append(f"non-contiguous task numbering: found {nums}, expected {expected}")
     graph: dict[int, list[int]] = {}
     for n, body in tasks:
         refs: list[int] = []
@@ -1103,6 +1140,7 @@ async def judge(plan_text: str, objective: str = "", *,
 
 
 def record_judge(session: dict[str, Any] | str, verdict: dict[str, Any], *,
+                 round_version: int | None = None,
                  plans_dir: str | Path | None = None) -> dict[str, Any]:
     """Persist an external judge verdict (from plan_mode.judge) into the
     session so feasibility audits are part of the recorded history."""
@@ -1112,7 +1150,8 @@ def record_judge(session: dict[str, Any] | str, verdict: dict[str, Any], *,
     else:
         s = session
         plans_dir = Path(plans_dir) if plans_dir else Path(s.get("plans_dir") or DEFAULT_PLANS_DIR)
-    entry = {"ts": _now(), **{k: v for k, v in verdict.items()}}
+    ver = round_version if round_version is not None else s.get("best_version") or len(s.get("rounds", []))
+    entry = {"ts": _now(), "round_version": ver, **{k: v for k, v in verdict.items()}}
     s.setdefault("judge_log", []).append(entry)
     _save_session(plans_dir, s)
     return entry
@@ -1150,11 +1189,15 @@ def plan_dag(plan_text: str) -> dict[str, Any]:
         edges[n] = sorted(set(refs))
         outs: list[str] = []
         for m in re.finditer(r"(?:output|produces?|writes?|deliverable)\s*[:(]?\s*([\w./-]+\.\w{1,8})", body, re.I):
-            outs.append(m.group(1))
+            val = m.group(1)
+            if val:
+                outs.append(val.strip())
         artifacts[n] = sorted(set(outs))
         ins: list[str] = []
         for m in re.finditer(r"(?:requires?|inputs?|needs|consumes)\s*[:(]?\s*([\w./-]+\.\w{1,8})|\breads?\b\s*[:(]?\s*([\w./-]+\.\w{1,8})", body, re.I):
-            ins.append(m.group(1))
+            val = m.group(1) or m.group(2)
+            if val:
+                ins.append(val.strip())
         inputs[n] = sorted(set(ins))
     return {"nodes": [n for n, _ in tasks], "edges": edges,
             "artifacts": artifacts, "inputs": inputs}
@@ -1504,6 +1547,12 @@ def execute_plan(plan_text: str,
             if not dry_run:
                 if handler:
                     res = handler(task_ctx)
+                    if inspect.isawaitable(res):
+                        try:
+                            loop = asyncio.get_running_loop()
+                            res = asyncio.run_coroutine_threadsafe(res, loop).result(timeout=10)
+                        except RuntimeError:
+                            res = asyncio.run(res)
                 else:
                     res = {"status": "success", "task": t}
                 task_results[t] = res

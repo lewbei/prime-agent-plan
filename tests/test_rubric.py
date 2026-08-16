@@ -65,6 +65,7 @@ def test_all_11_new_checks_present():
         assert name in checks, f"missing new check {name}"
 
 
+@pytest.mark.skipif(not (CORPUS / "txts").exists(), reason="Corpus txts directory not found (set PLANNING_CORPUS)")
 def test_every_cited_id_exists_in_corpus():
     txts = set(os.listdir(CORPUS / "txts"))
     for name, c in _checks(_rubric()).items():
@@ -117,6 +118,7 @@ def test_positive_and_negative_samples():
     assert rejected / total >= 0.9, f"only {rejected}/{total} negatives rejected"
 
 
+@pytest.mark.skipif(not (CORPUS / "digests").exists(), reason="Corpus digests directory not found (set PLANNING_CORPUS)")
 def test_corpus_excerpts_do_not_overmatch():
     """20 corpus excerpts: at least 90% must NOT match each new check regex."""
     checks = _checks(_rubric())
@@ -136,6 +138,7 @@ def test_corpus_excerpts_do_not_overmatch():
         assert rejected[n] / total >= 0.9, f"{n} overmatches: {rejected[n]}/{total}"
 
 
+@pytest.mark.skipif(not (CORPUS / "plan_improvements").exists(), reason="Corpus plan_improvements directory not found (set PLANNING_CORPUS)")
 def test_s7_drift_bounded():
     """Re-score the two archived reference candidates: drift vs golden <= 3."""
     golden = json.loads((CORPUS / "plan_improvements/backup/golden/golden.json").read_text())
