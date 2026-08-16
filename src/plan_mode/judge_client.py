@@ -186,6 +186,8 @@ async def judge(plan_text: str, objective: str = "", *,
         parsed = _anchor_verdict(parsed, mech)
         parsed["ok"] = True
         parsed["mechanical"] = mech
+        parsed["source"] = "external_llm"
+        parsed["external"] = True
         return parsed
     except Exception as e:  # network/parse errors must not crash plan mode
         return {"ok": False, "error": f"judge failed: {e}"}

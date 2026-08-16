@@ -594,3 +594,40 @@ def test_release_gate_distinguishes_external_judge(tmp_path):
     gate_strict = plan_mode.release(s, min_score=90.0, require_judge=True, require_external_judge=True, plans_dir=tmp_path)
     judge_check_strict = next(c for c in gate_strict["checks"] if c["name"] == "judge")
     assert judge_check_strict["ok"] is False
+
+
+def test_search_expand_and_select_respect_custom_plans_dir(tmp_path):
+    """Verify search_expand() and search_select() work with live session dict with custom plans_dir."""
+    s = plan_mode.start("Search expand select test", plans_dir=tmp_path)
+    plan_mode.assess(s, "1. Init\nOutput: a.txt", plans_dir=tmp_path)
+
+    # Expand with custom plans_dir session dict
+    exp = plan_mode.search_expand(s, ["1. Task 1\nOutput: out1.txt", "1. Task 2\nOutput: out2.txt"], plans_dir=tmp_path)
+    assert len(exp["node_ids"]) == 2
+    assert exp["best_score"] > 0
+
+    # Select with custom plans_dir session dict
+    sel = plan_mode.search_select(s, plans_dir=tmp_path)
+    assert sel["node_id"] is not None
+    assert (tmp_path / f"{s['session_id']}.json").exists()
+
+
+def test_strict_external_judge_requires_explicit_external_llm(tmp_path):
+    """Verify require_external_judge=True strictly requires source == 'external_llm' and external == True."""
+    s = plan_mode.start("Strict external judge test", plans_dir=tmp_path)
+    plan_mode.assess(s, "1. Setup\nOutput: a.txt", plans_dir=tmp_path)
+    s["status"] = "converged"
+    s["best_score"] = 95.0
+
+    # Untagged or non-external verdict
+    plan_mode.record_judge(s, {"ok": True, "verdict": "go", "falsifiable_criteria": True}, round_version=1, plans_dir=tmp_path)
+    gate1 = plan_mode.release(s, min_score=90.0, require_judge=True, require_external_judge=True, plans_dir=tmp_path)
+    assert gate1["ok"] is False
+
+    # Tagged genuine external LLM verdict
+    plan_mode.record_judge(s, {
+        "ok": True, "verdict": "go", "falsifiable_criteria": True,
+        "source": "external_llm", "external": True
+    }, round_version=1, plans_dir=tmp_path)
+    gate2 = plan_mode.release(s, min_score=90.0, require_judge=True, require_external_judge=True, plans_dir=tmp_path)
+    assert gate2["ok"] is True

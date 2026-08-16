@@ -73,37 +73,38 @@ only scores (rubric + verify + simulation), selects (UCB), and gates
    `plan_mode/RUBRIC.md` (weights/checks JSON block) so future planning is
    stricter. Optionally record the session with `rlm.harness.record_refinement`.
 
-## Engine API (v0.13.0)
+## Engine API (v0.14.0)
 
-- `plan_mode.start(objective, plans_dir=None, max_rounds=8)` -> session dict
+- `plan_mode.start(objective, plans_dir=None, max_rounds=8)` -> session dict; resumes existing active session for the objective if present
 - `plan_mode.assess(session_or_id, plan_text, note=None, addressed=None)` -> {version, score, delta, critiques, status, continue}
   - `addressed=[...]` = critique ids this revision claims to fix; unaddressed ids are re-emitted next round
-  - mechanical critiques (mech:*: task numbering, dependency refs, past deadlines, duplicates, near-identical revisions) block convergence until resolved
-- `plan_mode.execute_plan(plan_text, task_handlers=...)` -> transactional plan execution engine with Cordis Revertible Fibers (Theorem 61): executes tasks in child contexts; automatically rolls back all intermediate mutations in LIFO order on failure (Corollary 62).
+  - mechanical critiques (mech:*: contiguous task numbering, dependency refs, past deadlines, duplicates, near-identical revisions) block convergence until resolved
+- `await plan_mode.execute_plan(plan_text, task_handlers=...)` -> async transactional plan execution engine with Cordis Revertible Fibers (Theorem 61): executes tasks in child contexts (supports async and sync handlers); automatically rolls back all intermediate mutations in LIFO order via `async_dispose()` on failure (Corollary 62).
+- `plan_mode.execute_plan_sync(plan_text, task_handlers=...)` -> synchronous wrapper for `execute_plan`.
 - `plan_mode.speculative_rollout(plan_text, eval_fn)` -> isolated speculative MCTS rollouts; evaluates candidate execution in temporary fiber realm with guaranteed 100% clean state recovery.
 - `plan_mode.create_subagent_context(name)` -> derives an isolated child context (Gamma_infinity) with a private scratch realm for subagent sandboxing (no parent pollution).
 - `plan_mode.provide_tool(key, value)` -> registers an ephemeral tool/verifier fiber into the root harness context with automatic lifecycle disposal.
-- `plan_mode.Context` / `Fiber` / `LifecycleState` -> foundational Cordis Spatiotemporal Composability primitives (recursive context, 10-rule lifecycle calculus, reactive coeffects).
+- `plan_mode.Context` / `Fiber` / `LifecycleState` -> foundational Cordis Spatiotemporal Composability primitives (recursive context, 10-rule lifecycle calculus, reactive coeffects, `async_effect`, `async_dispose`).
 - `plan_mode.log_progress(session, task, status, evidence=...)` records execution; a failed/blocked step arms a replan trigger -> next assess demands the smallest-scope repair
 - `plan_mode.suggest(session)` emits rubric self-evolution suggestions (too-easy/too-strict checks) and writes `<session>.suggestions.md`
-- `plan_mode.verify(plan_text)` -> {"ok", "errors", "warnings", "graph", "tasks"} deterministic structural audit (dependency graph, artifacts, milestones, time arithmetic)
-- `plan_mode.plan_dag(plan_text)` -> explicit task graph {nodes, edges, artifacts, inputs} extracted from the plan
-- `plan_mode.edit_file(path, content)` -> revertible effect (Cordis): applies a file mutation and journals its inverse automatically; `plan_mode.rollback(n)` applies the n most recent inverses in reverse order (twisted composition). No more hand-rolled backups.
-- `plan_mode.deps_check()` -> reactive coeffects (Cordis notify): classifies every feature dependency (llm_expansion, api_judge, pytest, corpus, pdftotext) as satisfied/unsatisfied; search() and judge degrade gracefully per the spec instead of hard-coded key checks.
-- `plan_mode.template()` -> the template bank: function inventory + sample plan skeleton + section templates (every planner gets concrete names, not prose)
-- `plan_mode.selfcheck(plans_dir=None, run_pytest=True)` -> MANDATORY re-evaluation after ANY engine/rubric change: rubric compiles + corpus IDs verified + every finished session's best plan re-verifies/re-simulates/re-ground-checks + pytest green. Historical sessions (pre-0.11) are reported, not blocking.
+- `plan_mode.verify(plan_text)` -> {"ok", "errors", "warnings", "graph", "tasks"} deterministic structural audit (contiguous task sequence, dependency graph, artifacts, milestones, time arithmetic)
+- `plan_mode.plan_dag(plan_text)` -> explicit task graph {nodes, edges, artifacts, inputs} extracted from the plan (handles `Reads: ` and `Inputs: ` cleanly)
+- `plan_mode.edit_file(path, content)` -> revertible effect (Cordis): applies a file mutation and journals its inverse automatically; `plan_mode.rollback(n)` applies the n most recent inverses in reverse order (twisted composition).
+- `plan_mode.deps_check()` -> reactive coeffects (Cordis notify): classifies every feature dependency as satisfied/unsatisfied.
+- `plan_mode.template()` -> the template bank: function inventory + sample plan skeleton + section templates.
+- `plan_mode.selfcheck(plans_dir=None, run_pytest=True)` -> MANDATORY re-evaluation after ANY engine/rubric change: rubric compiles + corpus IDs verified + every finished session's best plan re-verifies/re-simulates/re-ground-checks + pytest green.
 - `plan_mode.ground_check(plan_text, cwd=None)` -> grounded feasibility: every declared environment input must resolve to an existing file (zero tolerance); internal handoffs are exempt; returns {ok, missing, verified, internal}
 - `plan_mode.fold_history(session)` -> fold superseded round texts into one-line summaries at convergence, keeping the best round and the last two in full (HIPIF 2606.10507); legacy sessions (pre-v0.6.0) are never mutated
-- `await plan_mode.judge_ensemble(session, plan_text, objective, n=3)` -> ensemble judgment: collects the API judge plus falsifiable recorded votes and a mechanical verify+simulate baseline, records the lower-median-feasibility verdict (2510.03469, 2601.17942)
-- `plan_mode.simulate(plan_text, initial_state=...)` -> STRIPS-style execution against a state model (SymPlanner 2505.01479 / PyPDDLEngine 2603.06064): walks tasks in order, blocks tasks whose deps/inputs are unsatisfied, returns {executable_plan, trace, problems, dead_artifacts, final_state}. Simulation blockers are injected into assess() as mech:sim:* critiques.
+- `await plan_mode.judge_ensemble(session, plan_text, objective, n=3)` -> ensemble judgment: collects the API judge (`source: "external_llm"`) plus falsifiable recorded votes and a mechanical verify+simulate baseline, records the lower-median-feasibility verdict (2510.03469, 2601.17942)
+- `plan_mode.simulate(plan_text, initial_state=...)` -> STRIPS-style execution against a state model (SymPlanner 2505.01479 / PyPDDLEngine 2603.06064): walks tasks in order, blocks tasks whose deps/inputs are unsatisfied, returns {executable_plan, trace, problems, dead_artifacts, final_state}.
 - `plan_mode.plan_quality(plan_text, objective, initial_state=...)` -> combined verdict: structural + simulation + coverage closure (2607.12986), returned as executable / structurally-broken / simulation-blocked / incomplete-criteria
-- `plan_mode.assess_candidates(session, drafts, notes=None)` -> best-of-N plan selection (2601.17942 ensembles): scores all candidates, records each, keeps the best as this round's version
-- `await plan_mode.search(session, iterations=4, width=2, mode="mcts", expansion="llm")` -> FULL PLAN-SPACE SEARCH (v0.7.0: adaptive search effort — width escalates on 2-expansion plateaus, LFS 2506.05213 — plus evaluator-driven plan recombination between close-value siblings, 2509.22613 / Mind Evolution 2501.09891): MCTS with UCB1 selection + backprop (LATS 2310.04406, SYMPHONY 2601.22623), LLM-proposer expansion (DeepSeek generates critique-addressing revisions) with deterministic rule-mutation fallback, rollout = rubric + verify + simulation (SymPlanner 2505.01479), transposition table (GATS 2607.08894), cost tracking (2505.14656), confidence-gated pruning (2602.08948). mode="beam" runs level-wise best-of-N (2601.17942). Returns best plan + tree report.
-- `plan_mode.search_expand(session, drafts, parent_node=None)` -> expand the plan search tree with scored candidate versions (SYMPHONY 2601.22623 multi-candidate expansion; rollout = rubric + verify + simulation; backprop = LATS 2310.04406)
-- `plan_mode.search_select(session, exploration=1.4)` -> UCB1 selection of the next node to expand (SYMPHONY 2601.22623, cost penalty from 2505.14656)
-- `plan_mode.search_backtrack(session, node_id)` -> abandon a plateaued branch and re-expand from an ancestor (LATS 2310.04406)
-- `plan_mode.search_report(session)` -> tree audit: nodes, depth, leaves, best node (GATS 2607.08894)
-- `plan_mode.release(session, min_score=90, require_judge=True)` -> RELEASE GATE (2602.08948 confidence-gated checkpoints, 2608.10729 acceptance thresholds): a plan is only releasable when ALL hold: converged + best score >= min_score + verify() clean + simulate() executes end-to-end + external judge returned "go" with falsifiable criteria. Until then the loop keeps going.
+- `plan_mode.assess_candidates(session, drafts, notes=None)` -> best-of-N plan selection (2601.17942 ensembles): scores all candidates with full pipeline (rubric + mechanical + verify + feasibility + simulation), ranks by effective executable score, and selects the best valid candidate.
+- `await plan_mode.search(session, iterations=4, width=2, mode="mcts", expansion="llm")` -> FULL PLAN-SPACE SEARCH: MCTS with UCB1 selection + backprop, LLM-proposer expansion with rule fallback, rollout = rubric + verify + simulation, transposition table, cost tracking. mode="beam" runs level-wise best-of-N.
+- `plan_mode.search_expand(session, drafts, parent_node=None)` -> expand the plan search tree with scored candidate versions (honors session `plans_dir`)
+- `plan_mode.search_select(session, exploration=1.4)` -> UCB1 selection of the next node to expand (honors session `plans_dir`)
+- `plan_mode.search_backtrack(session, node_id)` -> abandon a plateaued branch and re-expand from an ancestor
+- `plan_mode.search_report(session)` -> tree audit: nodes, depth, leaves, best node
+- `plan_mode.release(session, min_score=90, require_judge=True, require_external_judge=False)` -> RELEASE GATE (2602.08948 confidence-gated checkpoints, 2608.10729 acceptance thresholds): a plan is only releasable when ALL hold: converged + best score >= min_score + canonical mechanical checks clean (deadlines/dates/tasks) + verify() clean + ground_check() feasibility satisfied + simulate() executes end-to-end + judge returned "go" with falsifiable criteria (with `require_external_judge=True` requiring external LLM judge verification).
 - `plan_mode.finish(s, require_release=True, min_score=90)` -> raises RuntimeError if the release gate has not passed, so a weak plan cannot be shipped early (loop before release)
 - `await plan_mode.judge(plan_text, objective)` -> external LLM feasibility verdict {"verdict", "feasibility_0_100", "blockers", "contradictions", "missing", "falsifiable_criteria"}; returns ok=False with "error" if no API key/network
 - `plan_mode.record_judge(session, verdict)` persists the judge verdict into `session["judge_log"]`

@@ -170,8 +170,8 @@ class Context:
             if self._disposed:
                 raise RuntimeError("Cannot execute effect on a disposed context")
 
-            if inspect.iscoroutinefunction(callback):
-                raise TypeError("Cannot pass an async function/coroutine to sync ctx.effect(). Use 'await ctx.async_effect(...)' instead.")
+            if inspect.iscoroutinefunction(callback) or inspect.iscoroutine(callback) or inspect.isawaitable(callback):
+                raise TypeError("Cannot pass an async function, coroutine, or awaitable to sync ctx.effect(). Use 'await ctx.async_effect(...)' instead.")
 
             armed = [True]
             inverses_collected: list[Callable[[], Any]] = []

@@ -748,9 +748,9 @@ def release(session: dict[str, Any] | str, *, min_score: float = 90.0,
         j = matching_judge
         is_go = bool(j.get("ok") and j.get("verdict") == "go" and j.get("falsifiable_criteria"))
         if require_external_judge:
-            is_external = bool(j.get("external", True) and j.get("source") != "mechanical_baseline")
+            is_external = bool(j.get("external") is True and j.get("source") == "external_llm")
             judge_ok = is_go and is_external
-            judge_detail = f"round={j.get('round_version')} verdict={j.get('verdict')} source={j.get('source', 'external')} external={is_external}"
+            judge_detail = f"round={j.get('round_version')} verdict={j.get('verdict')} source={j.get('source', 'unknown')} external={is_external}"
         else:
             judge_ok = is_go
             judge_detail = f"round={j.get('round_version')} verdict={j.get('verdict')} source={j.get('source', 'unknown')} feasibility={j.get('feasibility_0_100')}"
@@ -1448,8 +1448,12 @@ def search_expand(session: dict[str, Any] | str, drafts: list[str],
     rubric + verify + simulation (the rollout), added as a child of
     parent_node, and the best score is back-propagated up the tree
     (MCTS backprop, LATS 2310.04406). Returns the ranked node list."""
-    plans_dir = Path(plans_dir) if plans_dir else DEFAULT_PLANS_DIR
-    s = _load_session(plans_dir, session) if isinstance(session, str) else session
+    if isinstance(session, str):
+        plans_dir = Path(plans_dir) if plans_dir else DEFAULT_PLANS_DIR
+        s = _load_session(plans_dir, session)
+    else:
+        s = session
+        plans_dir = Path(plans_dir) if plans_dir else Path(s.get("plans_dir") or DEFAULT_PLANS_DIR)
     st = _search_state(s)
     rubric = s.get("rubric_snapshot") or _load_rubric()
     if parent_node is None:
@@ -1494,8 +1498,12 @@ def search_select(session: dict[str, Any] | str, *, exploration: float = 1.4,
     node to expand next as argmax(mean_score + exploration*sqrt(ln N / visits)),
     minus a per-expansion cost penalty (cost-aware tree search 2505.14656).
     Returns the selected node; the agent expands it with search_expand."""
-    plans_dir = Path(plans_dir) if plans_dir else DEFAULT_PLANS_DIR
-    s = _load_session(plans_dir, session) if isinstance(session, str) else session
+    if isinstance(session, str):
+        plans_dir = Path(plans_dir) if plans_dir else DEFAULT_PLANS_DIR
+        s = _load_session(plans_dir, session)
+    else:
+        s = session
+        plans_dir = Path(plans_dir) if plans_dir else Path(s.get("plans_dir") or DEFAULT_PLANS_DIR)
     st = _search_state(s)
     nodes = st["nodes"]
     if not nodes:
