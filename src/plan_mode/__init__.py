@@ -430,22 +430,24 @@ def fold_history(session: dict[str, Any] | str, *, plans_dir: str | Path | None 
     uses ContextBudgeter to keep the best round and latest rounds in full,
     compressing older rounds to honor max_context_tokens. Legacy sessions (pre-v0.6.0)
     are never mutated (read-only compat)."""
-    if isinstance(session, str):
-        plans_dir = Path(plans_dir) if plans_dir else DEFAULT_PLANS_DIR
-        s = _load_session(plans_dir, session)
-    else:
-        s = session
-        plans_dir = Path(plans_dir) if plans_dir else Path(s.get("plans_dir") or DEFAULT_PLANS_DIR)
-    if s.get("engine_version", "0.0.0") < "0.6.0" or s.get("history_folded"):
-        return s
-    rounds = s.get("rounds") or []
-    if len(rounds) <= keep_last + 1:
-        return s
+    plans_dir = Path(plans_dir) if plans_dir else (Path(session.get("plans_dir")) if isinstance(session, dict) and session.get("plans_dir") else DEFAULT_PLANS_DIR)
+    sid = session if isinstance(session, str) else session.get("session_id", "default")
 
-    s = ContextBudgeter.compress_history(s, max_context_tokens=max_context_tokens)
-    s["history_folded"] = True
-    _save_session(plans_dir, s)
-    return s
+    with session_lock(plans_dir, sid):
+        if isinstance(session, str):
+            s = _load_session(plans_dir, session)
+        else:
+            s = session
+        if s.get("engine_version", "0.0.0") < "0.6.0" or s.get("history_folded"):
+            return s
+        rounds = s.get("rounds") or []
+        if len(rounds) <= keep_last + 1:
+            return s
+
+        s = ContextBudgeter.compress_history(s, max_context_tokens=max_context_tokens)
+        s["history_folded"] = True
+        _save_session(plans_dir, s)
+        return s
 
 
 def start(objective: str, *, plans_dir: str | Path | None = None, max_rounds: int = DEFAULT_MAX_ROUNDS,
@@ -517,208 +519,208 @@ def assess(session: dict[str, Any] | str, plan_text: str, *, note: str | None = 
     with session_lock(plans_dir, sid):
         if isinstance(session, str):
             session = _load_session(plans_dir, session)
-    if session["status"] in ("finished",):
-        raise RuntimeError(f"session {session['session_id']} is finished; start a new objective to continue")
-    rubric = session.get("rubric_snapshot") or _load_rubric()
-    result = _score(plan_text, rubric)
-    result["critiques"] = result["critiques"] + _mechanical_checks(plan_text)
-    # verify-on-mismatch (2410.00079, 2605.07248): reuse cached structural
-    # results when the exact same text was checked before (lazy re-verification)
-    _cache = session.setdefault("verify_cache", {})
-    _h = hashlib.md5(plan_text.encode("utf-8")).hexdigest()
-    # structural validity: a plan whose task graph is broken cannot converge
-    # even if every regex fires (PlanBench 2409.13373: structure beats prose)
-    v = _cache.get(_h)
-    if v is None:
-        v = verify(plan_text)
-        _cache[_h] = v
-        if len(_cache) > 32:
-            _cache.pop(next(iter(_cache)))
-    for err in v["errors"]:
-        result["critiques"].append({"id": f"mech:verify:{err[:40]}", "section": "mechanical",
-                                    "hint": err})
-    result["verify"] = v
-    # grounded feasibility (2402.11489): declared environment inputs must
-    # exist; verified inputs seed the simulation's initial state so real
-    # resources satisfy the simulator instead of blocking it
-    cc = constraint_check(plan_text)
-    for p_ in cc["problems"]:
-        result["critiques"].append({"id": f"mech:constraint:{p_[:40]}",
-                                    "section": "mechanical",
-                                    "hint": f"[solver] {p_}"})
-    result["constraint_check"] = cc
-    gc = ground_check(plan_text)
-    for m in gc["missing"]:
-        result["critiques"].append({"id": f"mech:feasibility:{m[:40]}",
-                                    "section": "mechanical",
-                                    "hint": f"[grounding] declared input does not exist: {m}"})
-    result["ground_check"] = gc
-    # planning simulation (SymPlanner 2505.01479): execute the plan against
-    # an explicit state model; a blocked task is a hard structural critique
-    sim = simulate(plan_text, initial_state=set(gc["verified"]))
-    if not sim["executable_plan"]:
-        for prob in sim["problems"]:
-            result["critiques"].append({"id": f"mech:sim:{prob[:40]}", "section": "mechanical",
-                                        "hint": f"[simulation] {prob}"})
-    result["simulation"] = sim
-    # RoT memory (2404.05449): distill negative rules from causal flaws and
-    # enforce them on subsequent candidate plans for this session.
-    rot_path = Path(plans_dir) / f"{session['session_id']}.rot.json"
-    rot_base = RoTRuleBase(storage_path=rot_path)
-    causal_flaws = (v.get("causal_validation") or {}).get("flaws", [])
-    rot_base.distill_from_flaws(causal_flaws, context_tag=session.get("objective", "general"))
-    ast_parsed = PlanParser.parse_plan(plan_text, session.get("objective", ""))
-    rot_violations = rot_base.check_plan_violations(plan_text, ast=ast_parsed)
-    for viol in rot_violations:
-        result["critiques"].append({"id": f"mech:rot:{viol['rule_id']}", "section": "mechanical",
-                                    "hint": f"[learned rule] {viol['remedy']}"})
-    result["rot_rules"] = {
-        "learned": len(rot_base.rules),
-        "violations": [v["rule_id"] for v in rot_violations],
-    }
-    # external judge: re-emit unresolved blockers from the last judge verdict
-    # so the loop keeps revising until the judge says "go" (2510.03469)
-    last_judge = session.get("judge_log", [{}])[-1] if session.get("judge_log") else None
-    if last_judge and last_judge.get("ok") and last_judge.get("verdict") != "go":
-        for b in (last_judge.get("blockers") or [])[:5]:
-            result["critiques"].append({"id": f"judge:blocker:{b[:40]}", "section": "judge",
-                                        "hint": f"[external judge] {b}"})
-        for c in (last_judge.get("contradictions") or [])[:3]:
-            result["critiques"].append({"id": f"judge:contradiction:{c[:40]}", "section": "judge",
-                                        "hint": f"[external judge] {c}"})
-        if not last_judge.get("falsifiable_criteria", True):
-            result["critiques"].append({"id": "judge:unfalsifiable", "section": "judge",
-                                        "hint": "[external judge] success criteria are not falsifiable"})
+        if session["status"] in ("finished",):
+            raise RuntimeError(f"session {session['session_id']} is finished; start a new objective to continue")
+        rubric = session.get("rubric_snapshot") or _load_rubric()
+        result = _score(plan_text, rubric)
+        result["critiques"] = result["critiques"] + _mechanical_checks(plan_text)
+        # verify-on-mismatch (2410.00079, 2605.07248): reuse cached structural
+        # results when the exact same text was checked before (lazy re-verification)
+        _cache = session.setdefault("verify_cache", {})
+        _h = hashlib.md5(plan_text.encode("utf-8")).hexdigest()
+        # structural validity: a plan whose task graph is broken cannot converge
+        # even if every regex fires (PlanBench 2409.13373: structure beats prose)
+        v = _cache.get(_h)
+        if v is None:
+            v = verify(plan_text)
+            _cache[_h] = v
+            if len(_cache) > 32:
+                _cache.pop(next(iter(_cache)))
+        for err in v["errors"]:
+            result["critiques"].append({"id": f"mech:verify:{err[:40]}", "section": "mechanical",
+                                        "hint": err})
+        result["verify"] = v
+        # grounded feasibility (2402.11489): declared environment inputs must
+        # exist; verified inputs seed the simulation's initial state so real
+        # resources satisfy the simulator instead of blocking it
+        cc = constraint_check(plan_text)
+        for p_ in cc["problems"]:
+            result["critiques"].append({"id": f"mech:constraint:{p_[:40]}",
+                                        "section": "mechanical",
+                                        "hint": f"[solver] {p_}"})
+        result["constraint_check"] = cc
+        gc = ground_check(plan_text)
+        for m in gc["missing"]:
+            result["critiques"].append({"id": f"mech:feasibility:{m[:40]}",
+                                        "section": "mechanical",
+                                        "hint": f"[grounding] declared input does not exist: {m}"})
+        result["ground_check"] = gc
+        # planning simulation (SymPlanner 2505.01479): execute the plan against
+        # an explicit state model; a blocked task is a hard structural critique
+        sim = simulate(plan_text, initial_state=set(gc["verified"]))
+        if not sim["executable_plan"]:
+            for prob in sim["problems"]:
+                result["critiques"].append({"id": f"mech:sim:{prob[:40]}", "section": "mechanical",
+                                            "hint": f"[simulation] {prob}"})
+        result["simulation"] = sim
+        # RoT memory (2404.05449): distill negative rules from causal flaws and
+        # enforce them on subsequent candidate plans for this session.
+        rot_path = Path(plans_dir) / f"{session['session_id']}.rot.json"
+        rot_base = RoTRuleBase(storage_path=rot_path)
+        causal_flaws = (v.get("causal_validation") or {}).get("flaws", [])
+        rot_base.distill_from_flaws(causal_flaws, context_tag=session.get("objective", "general"))
+        ast_parsed = PlanParser.parse_plan(plan_text, session.get("objective", ""))
+        rot_violations = rot_base.check_plan_violations(plan_text, ast=ast_parsed)
+        for viol in rot_violations:
+            result["critiques"].append({"id": f"mech:rot:{viol['rule_id']}", "section": "mechanical",
+                                        "hint": f"[learned rule] {viol['remedy']}"})
+        result["rot_rules"] = {
+            "learned": len(rot_base.rules),
+            "violations": [v["rule_id"] for v in rot_violations],
+        }
+        # external judge: re-emit unresolved blockers from the last judge verdict
+        # so the loop keeps revising until the judge says "go" (2510.03469)
+        last_judge = session.get("judge_log", [{}])[-1] if session.get("judge_log") else None
+        if last_judge and last_judge.get("ok") and last_judge.get("verdict") != "go":
+            for b in (last_judge.get("blockers") or [])[:5]:
+                result["critiques"].append({"id": f"judge:blocker:{b[:40]}", "section": "judge",
+                                            "hint": f"[external judge] {b}"})
+            for c in (last_judge.get("contradictions") or [])[:3]:
+                result["critiques"].append({"id": f"judge:contradiction:{c[:40]}", "section": "judge",
+                                            "hint": f"[external judge] {c}"})
+            if not last_judge.get("falsifiable_criteria", True):
+                result["critiques"].append({"id": "judge:unfalsifiable", "section": "judge",
+                                            "hint": "[external judge] success criteria are not falsifiable"})
 
-    # root-cause grouping (2509.25370): order misses by section score ascending
-    # and, when several checks miss, name the lowest-scoring section first.
-    sections = result.get("sections") or {}
-    score_by = {str(v.get("label", k)): float(v.get("section_score", 0)) for k, v in sections.items()}
-    non_mech = [c for c in result["critiques"] if not c["id"].startswith(("mech:", "judge:"))]
-    if non_mech:
-        non_mech.sort(key=lambda c: score_by.get(str(c.get("section", "")), 1e9))
-        result["critiques"] = [c for c in result["critiques"]
-                               if c["id"].startswith(("mech:", "judge:"))] + non_mech
-        if len(non_mech) >= 3 and sections:
-            weakest = min(sections, key=lambda k: sections[k].get("section_score", 0))
-            result["critiques"].append({"id": f"root_cause:{weakest}",
-                                        "section": sections[weakest].get("label", weakest),
-                                        "hint": f"Root cause: section '{sections[weakest].get('label', weakest)}' "
-                                                f"scores lowest ({sections[weakest].get('section_score')}); "
-                                                "fix it before symptom-level edits."})
+        # root-cause grouping (2509.25370): order misses by section score ascending
+        # and, when several checks miss, name the lowest-scoring section first.
+        sections = result.get("sections") or {}
+        score_by = {str(v.get("label", k)): float(v.get("section_score", 0)) for k, v in sections.items()}
+        non_mech = [c for c in result["critiques"] if not c["id"].startswith(("mech:", "judge:"))]
+        if non_mech:
+            non_mech.sort(key=lambda c: score_by.get(str(c.get("section", "")), 1e9))
+            result["critiques"] = [c for c in result["critiques"]
+                                   if c["id"].startswith(("mech:", "judge:"))] + non_mech
+            if len(non_mech) >= 3 and sections:
+                weakest = min(sections, key=lambda k: sections[k].get("section_score", 0))
+                result["critiques"].append({"id": f"root_cause:{weakest}",
+                                            "section": sections[weakest].get("label", weakest),
+                                            "hint": f"Root cause: section '{sections[weakest].get('label', weakest)}' "
+                                                    f"scores lowest ({sections[weakest].get('section_score')}); "
+                                                    "fix it before symptom-level edits."})
 
-    # 1) similarity guard: a "revision" that barely changes the text is not an
-    #    improvement round (SRDrone 2508.15501: refinement must be substantive).
-    prev_round = session["rounds"][-1] if session["rounds"] else None
-    changed = True
-    if prev_round is not None:
-        ratio = difflib.SequenceMatcher(None, prev_round["plan_text"], plan_text).ratio()
-        if ratio > 0.97:
-            result["critiques"].append({"id": "mech:barely-changed", "section": "mechanical",
-                                        "hint": "Revision is nearly identical to the previous version "
-                                                "(similarity > 0.97); make a substantive change."})
-            changed = False
+        # 1) similarity guard: a "revision" that barely changes the text is not an
+        #    improvement round (SRDrone 2508.15501: refinement must be substantive).
+        prev_round = session["rounds"][-1] if session["rounds"] else None
+        changed = True
+        if prev_round is not None:
+            ratio = difflib.SequenceMatcher(None, prev_round["plan_text"], plan_text).ratio()
+            if ratio > 0.97:
+                result["critiques"].append({"id": "mech:barely-changed", "section": "mechanical",
+                                            "hint": "Revision is nearly identical to the previous version "
+                                                    "(similarity > 0.97); make a substantive change."})
+                changed = False
 
-    # 2) critique-addressing audit: re-emit previous critiques not claimed fixed.
-    addressed_set = {a.lower() for a in (addressed or [])}
-    unaddressed: list[str] = []
-    if prev_round is not None:
-        unaddressed = [c["id"] for c in prev_round["critiques"]
-                       if c["id"].lower() not in addressed_set and not c["id"].startswith("mech:barely")]
-        if unaddressed:
-            result["critiques"].insert(0, {"id": "mech:unaddressed", "section": "mechanical",
-                                           "hint": f"Previous critiques still unaddressed: "
-                                                   f"{', '.join(unaddressed[:6])}"})
+        # 2) critique-addressing audit: re-emit previous critiques not claimed fixed.
+        addressed_set = {a.lower() for a in (addressed or [])}
+        unaddressed: list[str] = []
+        if prev_round is not None:
+            unaddressed = [c["id"] for c in prev_round["critiques"]
+                           if c["id"].lower() not in addressed_set and not c["id"].startswith("mech:barely")]
+            if unaddressed:
+                result["critiques"].insert(0, {"id": "mech:unaddressed", "section": "mechanical",
+                                               "hint": f"Previous critiques still unaddressed: "
+                                                       f"{', '.join(unaddressed[:6])}"})
 
-    # 3) replan trigger: a failed execution step forces a smallest-scope revision
-    #    (RePLan 2401.04157, hierarchical recovery 2606.20487).
-    if session.get("replan_pending"):
-        failed = session.get("replan_task") or "unknown task"
-        # tiered replanning ladder (2605.25851): escalate across three levels
-        tier = session.get("replan_tier", 1)
-        scope = session.get("replan_scope")
-        if scope and scope.get("description"):
-            hint = scope["description"]
-        else:
-            ladder = {
-                1: f"Execution failed on '{failed}': level 1 subgoal audit — re-check that task's deps and outputs before anything else.",
-                2: f"Execution failed on '{failed}' again: level 2 structured search — locate the failing resource/step and repair it specifically.",
-                3: f"Execution failed on '{failed}' again: level 3 preemptive global replan — redraft the affected phase, not just the step.",
-            }
-            hint = ladder[min(tier, 3)]
-        result["critiques"].insert(0, {"id": "mech:replan", "section": "mechanical",
-                                       "hint": hint})
-        session["replan_tier"] = min(tier + 1, 3)
-        if "mech:replan" in addressed_set:
-            session["replan_pending"] = False
-            session["replan_tier"] = 1
+        # 3) replan trigger: a failed execution step forces a smallest-scope revision
+        #    (RePLan 2401.04157, hierarchical recovery 2606.20487).
+        if session.get("replan_pending"):
+            failed = session.get("replan_task") or "unknown task"
+            # tiered replanning ladder (2605.25851): escalate across three levels
+            tier = session.get("replan_tier", 1)
+            scope = session.get("replan_scope")
+            if scope and scope.get("description"):
+                hint = scope["description"]
+            else:
+                ladder = {
+                    1: f"Execution failed on '{failed}': level 1 subgoal audit — re-check that task's deps and outputs before anything else.",
+                    2: f"Execution failed on '{failed}' again: level 2 structured search — locate the failing resource/step and repair it specifically.",
+                    3: f"Execution failed on '{failed}' again: level 3 preemptive global replan — redraft the affected phase, not just the step.",
+                }
+                hint = ladder[min(tier, 3)]
+            result["critiques"].insert(0, {"id": "mech:replan", "section": "mechanical",
+                                           "hint": hint})
+            session["replan_tier"] = min(tier + 1, 3)
+            if "mech:replan" in addressed_set:
+                session["replan_pending"] = False
+                session["replan_tier"] = 1
 
-    version = len(session["rounds"]) + 1
-    best = session.get("best_score")
-    delta = round(result["score"] - best, 2) if best is not None else None
-    session["rounds"].append({
-        "version": version,
-        "ts": _now(),
-        "score": result["score"],
-        "delta": delta,
-        "critiques": result["critiques"],
-        "sections": result["sections"],
-        "note": note,
-        "addressed": addressed or [],
-        "unaddressed": unaddressed,
-        "substantive": changed,
-        "plan_text": plan_text,
-    })
-    if not changed and best is not None:
-        # a non-substantive round never improves; count it as a plateau
-        session["rounds"][-1]["delta"] = 0.0
-    if best is None or result["score"] > best:
-        session["best_version"] = version
-        session["best_score"] = result["score"]
-    if best is None:
-        session["status"] = "improving"
-    if version >= session.get("max_rounds", DEFAULT_MAX_ROUNDS):
-        session["status"] = "converged"
-        fold_history(session, plans_dir=plans_dir)
+        version = len(session["rounds"]) + 1
+        best = session.get("best_score")
+        delta = round(result["score"] - best, 2) if best is not None else None
+        session["rounds"].append({
+            "version": version,
+            "ts": _now(),
+            "score": result["score"],
+            "delta": delta,
+            "critiques": result["critiques"],
+            "sections": result["sections"],
+            "note": note,
+            "addressed": addressed or [],
+            "unaddressed": unaddressed,
+            "substantive": changed,
+            "plan_text": plan_text,
+        })
+        if not changed and best is not None:
+            # a non-substantive round never improves; count it as a plateau
+            session["rounds"][-1]["delta"] = 0.0
+        if best is None or result["score"] > best:
+            session["best_version"] = version
+            session["best_score"] = result["score"]
+        if best is None:
+            session["status"] = "improving"
+        if version >= session.get("max_rounds", DEFAULT_MAX_ROUNDS):
+            session["status"] = "converged"
+            fold_history(session, plans_dir=plans_dir)
+            _save_session(plans_dir, session)
+            return {"version": version, "score": result["score"], "delta": delta,
+                    "critiques": result["critiques"], "status": "converged",
+                    "continue": False, "verify": result.get("verify"),
+                    "simulation": result.get("simulation"), "rot_rules": result.get("rot_rules")}
+        # convergence rule: score must keep improving; allow MAX_PLATEAU_ROUNDS
+        # non-improving rounds in a row before declaring convergence.
+        recent = [r["score"] for r in session["rounds"]]
+        plateau = 0
+        for i in range(len(recent) - 1, 0, -1):
+            if recent[i] >= recent[i - 1] + MIN_DELTA_TO_CONTINUE:
+                break
+            plateau += 1
+        open_mech = [c for c in result["critiques"] if c["id"].startswith("mech:")]
+        if open_mech:
+            # objective errors block convergence; only convergence with a clean plan
+            _save_session(plans_dir, session)
+            return {"version": version, "score": result["score"], "delta": delta,
+                    "critiques": result["critiques"], "status": "improving",
+                    "continue": True, "verify": result.get("verify"),
+                    "simulation": result.get("simulation"), "rot_rules": result.get("rot_rules")}
+        if plateau >= MAX_PLATEAU_ROUNDS and version >= 2:
+            if len(_task_blocks(plan_text)) <= 3:
+                result["critiques"].append({"id": "hint:over-refinement",
+                                            "section": "escalation",
+                                            "hint": "Short stepwise plan: refinement over-corrects on small horizons (2606.04874); "
+                                                    "accept the best version instead of more rounds."})
+            session["status"] = "converged"
+            fold_history(session, plans_dir=plans_dir)
+            _save_session(plans_dir, session)
+            return {"version": version, "score": result["score"], "delta": delta,
+                    "critiques": result["critiques"], "status": "converged",
+                    "continue": False, "verify": result.get("verify"),
+                    "simulation": result.get("simulation"), "rot_rules": result.get("rot_rules")}
         _save_session(plans_dir, session)
         return {"version": version, "score": result["score"], "delta": delta,
-                "critiques": result["critiques"], "status": "converged",
-                "continue": False, "verify": result.get("verify"),
-                "simulation": result.get("simulation"), "rot_rules": result.get("rot_rules")}
-    # convergence rule: score must keep improving; allow MAX_PLATEAU_ROUNDS
-    # non-improving rounds in a row before declaring convergence.
-    recent = [r["score"] for r in session["rounds"]]
-    plateau = 0
-    for i in range(len(recent) - 1, 0, -1):
-        if recent[i] >= recent[i - 1] + MIN_DELTA_TO_CONTINUE:
-            break
-        plateau += 1
-    open_mech = [c for c in result["critiques"] if c["id"].startswith("mech:")]
-    if open_mech:
-        # objective errors block convergence; only convergence with a clean plan
-        _save_session(plans_dir, session)
-        return {"version": version, "score": result["score"], "delta": delta,
-                "critiques": result["critiques"], "status": "improving",
+                "critiques": result["critiques"], "status": session["status"],
                 "continue": True, "verify": result.get("verify"),
                 "simulation": result.get("simulation"), "rot_rules": result.get("rot_rules")}
-    if plateau >= MAX_PLATEAU_ROUNDS and version >= 2:
-        if len(_task_blocks(plan_text)) <= 3:
-            result["critiques"].append({"id": "hint:over-refinement",
-                                        "section": "escalation",
-                                        "hint": "Short stepwise plan: refinement over-corrects on small horizons (2606.04874); "
-                                                "accept the best version instead of more rounds."})
-        session["status"] = "converged"
-        fold_history(session, plans_dir=plans_dir)
-        _save_session(plans_dir, session)
-        return {"version": version, "score": result["score"], "delta": delta,
-                "critiques": result["critiques"], "status": "converged",
-                "continue": False, "verify": result.get("verify"),
-                "simulation": result.get("simulation"), "rot_rules": result.get("rot_rules")}
-    _save_session(plans_dir, session)
-    return {"version": version, "score": result["score"], "delta": delta,
-            "critiques": result["critiques"], "status": session["status"],
-            "continue": True, "verify": result.get("verify"),
-            "simulation": result.get("simulation"), "rot_rules": result.get("rot_rules")}
 
 
 def run(objective: str, draft_plan: str, *, plans_dir: str | Path | None = None,

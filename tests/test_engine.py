@@ -762,3 +762,25 @@ def test_session_lock_timeout_raises_error(tmp_path):
     finally:
         fcntl.flock(f.fileno(), fcntl.LOCK_UN)
         f.close()
+
+
+@pytest.mark.asyncio
+async def test_search_ast_mode_with_custom_cwd(tmp_path):
+    """Verify search(mode='ast', cwd=tmp_path) correctly grounds relative disk inputs."""
+    data_file = tmp_path / "raw_input.csv"
+    data_file.write_text("col1,col2\n1,2")
+
+    s = plan_mode.start("AST Search CWD Test", plans_dir=tmp_path / "plans")
+    plan_text = """
+    1. Extract
+       Inputs: raw_input.csv
+       Output: extracted.json
+    2. Transform
+       Depends on 1
+       Inputs: extracted.json
+       Output: transformed.json
+    """
+    plan_mode.assess(s, plan_text, plans_dir=tmp_path / "plans")
+    res = await plan_mode.search(s, iterations=2, width=2, mode="ast", cwd=tmp_path, plans_dir=tmp_path / "plans")
+    assert res["nodes"] >= 1
+    assert res["best_score"] > 0

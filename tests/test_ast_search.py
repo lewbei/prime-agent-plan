@@ -115,3 +115,37 @@ Goal: Test clean rendering
     assert member.plan_text.count("## Tasks") == 1
     # Must have clean task action name
     assert "1. Clean Task" in member.plan_text
+
+
+def test_ast_search_with_pre_task_sections_no_duplication():
+    """Verify that plans with pre-task sections (e.g. ## Risks before ## Tasks) render without duplication."""
+    plan_with_pre_risks = """# Objective
+Goal: Test pre-task sections
+
+## Risks
+- Risk 1: High memory usage
+
+## Tasks
+1. Task Alpha
+   Output: alpha.json
+2. Task Beta
+   Depends on 1
+   Inputs: alpha.json
+   Output: beta.json
+
+## Post Verification
+- Step V1: Verify beta.json
+"""
+    engine = ASTSearchEngine(objective="Test pre-task sections", source_plan_text=plan_with_pre_risks)
+    ast = PlanParser.parse_plan(plan_with_pre_risks)
+    member = engine.evaluate_ast(ast, source_plan_text=plan_with_pre_risks)
+
+    rendered = member.plan_text
+    # ## Risks should appear exactly once (in header)
+    assert rendered.count("## Risks") == 1
+    # ## Tasks should appear exactly once
+    assert rendered.count("## Tasks") == 1
+    # ## Post Verification should appear in footer
+    assert "## Post Verification" in rendered
+    assert "Task Alpha" in rendered
+    assert "Task Beta" in rendered
