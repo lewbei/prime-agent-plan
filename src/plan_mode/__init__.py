@@ -1903,10 +1903,19 @@ def speculative_rollout(plan_text: str,
         # Guarantee 100% clean teardown
         ctx.dispose()
 
-__all__ = ["start", "assess", "assess_candidates", "run", "status", "history", "best", "finish",
-           "log_progress", "suggest", "list_sessions", "rubric", "verify", "judge", "record_judge",
-           "plan_dag", "simulate", "plan_quality", "edit_file", "rollback", "deps_check",
-           "search_expand", "search_select", "search_backtrack", "search_report", "search",
-           "Context", "Fiber", "LifecycleState", "TwistedMonoid", "get_root_context", "reset_root_context",
-           "create_subagent_context", "provide_tool", "execute_plan", "session_lock", "RoTRuleBase", "RoTRule", "ReplanningLadder", "ContextBudgeter", "mutate_flaw_directed", "mutate_exploratory", "crossover_ast", "ast_distance", "PopulationMember", "ASTSearchEngine", "Proposition", "PlanParser", "PlanAST", "CausalValidator", "CausalLink", "CausalFlaw", "ActionSchema", "execute_plan_sync", "speculative_rollout", "speculative_rollout_async",
-           "DEFAULT_PLANS_DIR", "RUBRIC_PATH", "REPO_ROOT", "__version__"]
+__all__ = [
+    "__version__", "start", "assess", "assess_candidates", "run", "status", "history", "best", "finish",
+    "log_progress", "suggest", "list_sessions", "rubric", "verify", "judge", "record_judge",
+    "release", "plan_dag", "simulate", "plan_quality", "edit_file", "rollback", "deps_check",
+    "ground_check", "constraint_check", "fold_history", "judge_ensemble", "template", "selfcheck",
+    "search_expand", "search_select", "search_backtrack", "search_report", "search",
+    "Context", "Fiber", "LifecycleState", "TwistedMonoid", "get_root_context", "reset_root_context",
+    "create_subagent_context", "provide_tool", "execute_plan", "execute_plan_sync",
+    "speculative_rollout", "speculative_rollout_async", "session_lock",
+    "RoTRuleBase", "RoTRule", "ReplanningLadder", "ContextBudgeter",
+    "mutate_flaw_directed", "mutate_exploratory", "crossover_ast", "ast_distance",
+    "PopulationMember", "ASTSearchEngine", "Proposition", "PlanParser", "PlanAST",
+    "CausalValidator", "CausalLink", "CausalFlaw", "ActionSchema",
+    "DEFAULT_PLANS_DIR", "RUBRIC_PATH", "REPO_ROOT", "DEFAULT_MAX_ROUNDS",
+    "MAX_PLATEAU_ROUNDS", "MIN_DELTA_TO_CONTINUE", "JOURNAL_PATH", "DEFAULT_RUBRIC",
+]
