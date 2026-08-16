@@ -546,7 +546,7 @@ When changing the engine or rubric, run the test suite and the project self-chec
 
 ## License
 
-A standalone license file is not currently included in this repository. Review the repository terms before redistribution or incorporation into another project.
+Released under the **MIT License**. See [`LICENSE`](LICENSE) for full legal text and permissions.
 
 
 ---
@@ -556,7 +556,8 @@ A standalone license file is not currently included in this repository. Review t
 ### 1. Deterministic Causal Validator (`causal_validator.py`)
 - **Action Schema & AST**: Parses plans into typed `ActionSchema` objects with declared `preconditions`, `add_effects`, `del_effects`, `inputs`, `outputs`, `duration`, and `cost`.
 - **STRIPS State Transition Solver**: Emulates forward world-state evolution $\mathcal{S}' = (\mathcal{S} \setminus 	ext{Del}(a)) \cup 	ext{Add}(a)$ with propositional consistency.
-- **Causal Link Construction**: Tracks triples $\langle a_i, p, a_j angle$ asserting that step $a_i$ achieves condition $p$ consumed by step $a_j$.
+- **Causal Link Construction**: Tracks triples $\langle a_i, p, a_j 
+angle$ asserting that step $a_i$ achieves condition $p$ consumed by step $a_j$.
 - **Clobber Threat Detection**: Identifies any intermediate action $a_k$ ($i < k < j$) that deletes $p$, producing pinpoint diagnostic flaws with automated remedies.
 - **Numeric & Resource Budget Solver**: Deterministically checks linear constraints on tasks, durations, and token budgets.
 

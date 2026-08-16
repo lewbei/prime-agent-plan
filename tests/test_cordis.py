@@ -378,3 +378,50 @@ def test_cordis_declarative_component_use():
 
     ctx.dispose()
     assert db.active is False
+
+
+def test_cordis_theorem_63_multi_level_topological_dfs_deactivation():
+    """Theorem 63: Transitive dependent fibers (F3 -> F2 -> F1) deactivate in strict topological order."""
+    ctx = Context(name="thm63_chain")
+    deact_trace = []
+
+    # Root provider provides service:a
+    disp_a = ctx.provide("service:a", "val_a")
+    # F2 consumes service:a, provides service:b
+    f2 = Fiber(ctx, "f2_bridge", dependencies={"service:a"}, provisions={"service:b"}, apply_fn=lambda c: (deact_trace.append("f2_up"), c.provide("service:b", "val_b"))[0])
+    # F3 consumes service:b
+    f3 = Fiber(ctx, "f3_leaf", dependencies={"service:b"}, apply_fn=lambda c: deact_trace.append("f3_up"))
+
+    f2.activate()
+    assert f2.state == LifecycleState.ACTIVE
+    f3.activate()
+    assert f3.state == LifecycleState.ACTIVE
+
+    # Withdraw root provider service:a -> F3 must deactivate, then F2, before provider clears
+    disp_a()
+    assert f3.state == LifecycleState.INACTIVE
+    assert f2.state == LifecycleState.INACTIVE
+
+
+def test_cordis_hash_journal_drift_detection(tmp_path):
+    """Verify hash journal detects external content drift prior to rollback."""
+    test_file = tmp_path / "drifting_config.yaml"
+    test_file.write_text("initial_state")
+
+    ctx = Context(name="drift_ctx")
+    entry = ctx.journal_mutation(
+        target=str(test_file),
+        pre_content="initial_state",
+        post_content="mutation_v1",
+        inverse=lambda: test_file.write_text("initial_state"),
+        description="Write v1"
+    )
+    test_file.write_text("mutation_v1")
+
+    # Simulate external unauthorized drift
+    test_file.write_text("corrupted_state_by_external_process")
+
+    # Rollback
+    ctx.dispose()
+    assert entry.drift_detected is True
+    assert test_file.read_text() == "initial_state"

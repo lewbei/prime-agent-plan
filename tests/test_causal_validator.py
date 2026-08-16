@@ -87,3 +87,35 @@ def test_causal_validator_success_on_sound_plan():
     assert res["ok"] is True
     assert len(res["causal_links"]) >= 2
     assert res["dead_artifacts"] == ["server.log"]
+
+
+def test_causal_validator_closed_world_negation():
+    """Verify that deleting a proposition satisfies a subsequent 'not p' precondition under closed-world semantics."""
+    plan_text = """
+    1. Clean Cache
+       Deletes: dirty(cache)
+       Output: clean.log
+    2. Build Fast
+       Preconditions: not dirty(cache)
+       Output: build.bin
+    """
+    ast = PlanParser.parse_plan(plan_text)
+    # Start with dirty(cache) in initial state
+    res = CausalValidator.validate(ast, initial_state={"dirty(cache)"})
+    assert res["ok"] is True
+    assert "dirty(cache)" not in res["final_state"]
+
+
+def test_verify_grounded_input_seeding(tmp_path):
+    """Verify that verify() seeds CausalValidator with ground_check() verified files."""
+    real_file = tmp_path / "existing_config.yaml"
+    real_file.write_text("env: prod")
+
+    plan_text = f"""
+    1. Task One
+       Inputs: {real_file}
+       Output: result.json
+    """
+    v = verify(plan_text, cwd=tmp_path)
+    assert v["ok"] is True
+    assert not any("unsatisfied_precondition" in err for err in v["errors"])

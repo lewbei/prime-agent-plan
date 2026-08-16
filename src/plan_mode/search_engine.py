@@ -367,7 +367,26 @@ async def search(session: dict[str, Any] | str, *,
     model = model or os.environ.get("PLAN_SEARCH_MODEL", "").strip() or _DEFAULT_MODEL
     t0 = time.time()
 
-    if mode == "beam":
+    if mode in ("ast", "evolutionary"):
+        from .ast_search import ASTSearchEngine, PlanParser
+        engine = ASTSearchEngine(objective=s.get("objective", ""), initial_state=set())
+        root_ast = PlanParser.parse_plan(root_plan, objective=s.get("objective", ""))
+        root_member = engine.evaluate_ast(root_ast, lambda pt: _rollout(pt, rubric)["score"])
+        engine.population = [root_member]
+
+        for iter_idx in range(iterations):
+            evolved = engine.evolve_step(population_size=max(2, width), rubric_score_fn=lambda pt: _rollout(pt, rubric)["score"])
+            for member in evolved:
+                if len(nodes) >= max_nodes:
+                    break
+                ro = _rollout(member.plan_text, rubric)
+                nid = _new_node(t, member.plan_text, t["root"], 1, f"ast_evolve_iter_{iter_idx}", ro)
+                t["rollouts"] += 1
+                if ro["value"] > t["best_value"]:
+                    t["best_value"] = ro["value"]
+                    t["best_node"] = nid
+
+    elif mode == "beam":
         frontier = [t["root"]]
         for level in range(depth):
             next_frontier: list[str] = []

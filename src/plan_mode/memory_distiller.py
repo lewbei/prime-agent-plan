@@ -58,7 +58,6 @@ class RoTRuleBase:
             detail = flaw.get("detail", "")
             remedy = flaw.get("remedy", "")
 
-            # Generate unique deterministic rule id
             rule_id = f"rot:{flaw_type}:{hashlib.sha256(detail.encode('utf-8')).hexdigest()[:8]}"
             if rule_id in self.rules:
                 self.rules[rule_id].hit_count += 1
@@ -83,7 +82,6 @@ class RoTRuleBase:
         """Check if a candidate plan violates any active distilled rules."""
         violations = []
         for rule_id, rule in self.rules.items():
-            # Check if forbidden pattern is present
             if rule.forbidden_pattern and rule.forbidden_pattern.lower() in plan_text.lower():
                 violations.append({
                     "rule_id": rule.rule_id,
@@ -127,7 +125,7 @@ class RoTRuleBase:
 # ---------------------------------------------------------------------------
 
 class ContextBudgeter:
-    """Budgets token usage and compresses superseded history while preserving causal lineage."""
+    """Budgets token usage and compresses superseded history to strictly honor max_context_tokens."""
 
     @staticmethod
     def estimate_tokens(text: str) -> int:
@@ -135,37 +133,50 @@ class ContextBudgeter:
         return max(1, len(text) // 4)
 
     @classmethod
-    def compress_history(cls, session: dict[str, Any], max_context_tokens: int = 4000) -> dict[str, Any]:
-        """Compress old superseded planning rounds into concise semantic diffs."""
+    def session_token_count(cls, session: dict[str, Any]) -> int:
+        """Estimate total tokens across all rounds in a session."""
+        total = 0
+        for r in session.get("rounds", []):
+            total += cls.estimate_tokens(r.get("plan_text", ""))
+            total += cls.estimate_tokens(str(r.get("critiques", [])))
+        return total
+
+    @classmethod
+    def compress_history(cls, session: dict[str, Any], max_context_tokens: int = 4000, keep_last: int = 2) -> dict[str, Any]:
+        """Compress old superseded planning rounds into concise semantic diffs until tokens <= max_context_tokens."""
         rounds = session.get("rounds", [])
-        if len(rounds) <= 3:
+        if len(rounds) <= 2:
             return session
 
         best_ver = session.get("best_version")
-        compressed_rounds = []
-        for r in rounds:
-            v = r.get("version")
+        last_ver = rounds[-1].get("version")
+
+        # 1. Primary pass: fold all superseded rounds older than keep_last
+        for i, r in enumerate(rounds):
+            v = r.get("version", i + 1)
             is_best = (v == best_ver)
-            is_recent = (v >= len(rounds) - 1)
+            is_recent = (i >= len(rounds) - keep_last)
+            if is_best or is_recent or r.get("folded"):
+                continue
 
-            if is_best or is_recent:
-                # Keep full content
-                compressed_rounds.append(r)
-            else:
-                # Fold into compact one-line summary
-                summary_text = f"Round {v}: Score {r.get('score')} | Critiques: {len(r.get('critiques', []))} | Note: {r.get('note')}"
-                folded_round = {
-                    "version": v,
-                    "ts": r.get("ts"),
-                    "score": r.get("score"),
-                    "delta": r.get("delta"),
-                    "folded": True,
-                    "summary": summary_text,
-                    "plan_text": summary_text
-                }
-                compressed_rounds.append(folded_round)
+            crit_ids = ", ".join([(c.get("id", str(c)) if isinstance(c, dict) else str(c)) for c in r.get("critiques", [])][:3]) or "none"
+            summary_text = f"[folded: version {v}, score {r.get('score')}, delta {r.get('delta')}, critiques {crit_ids}]"
+            r["folded"] = True
+            r["summary"] = summary_text
+            r["plan_text"] = summary_text
 
-        session["rounds"] = compressed_rounds
+        # 2. Budget pass: if total tokens still exceed max_context_tokens, fold intermediate rounds (except best and latest)
+        for i, r in enumerate(rounds):
+            v = r.get("version", i + 1)
+            if v == best_ver or v == last_ver or r.get("folded"):
+                continue
+            if cls.session_token_count(session) > max_context_tokens:
+                crit_ids = ", ".join([(c.get("id", str(c)) if isinstance(c, dict) else str(c)) for c in r.get("critiques", [])][:3]) or "none"
+                summary_text = f"[folded: version {v}, score {r.get('score')}, delta {r.get('delta')}, critiques {crit_ids}]"
+                r["folded"] = True
+                r["summary"] = summary_text
+                r["plan_text"] = summary_text
+
         return session
 
 
@@ -180,8 +191,7 @@ class ReplanningLadder:
     def determine_replan_tier(failed_task_id: int, error_message: str,
                               total_tasks: int, retry_count: int) -> dict[str, Any]:
         """Classify failure and return optimal replan scope (Tier 1 -> Tier 2 -> Tier 3)."""
-        # Tier 1: Local task parameter / timeout fix
-        if retry_count == 0 and ("timeout" in error_message.lower() or "retry" in error_message.lower()):
+        if retry_count == 0 and ("timeout" in error_message.lower() or "retry" in error_message.lower() or "rate_limit" in error_message.lower()):
             return {
                 "tier": 1,
                 "scope": "local_task",
@@ -190,7 +200,6 @@ class ReplanningLadder:
                 "description": f"Tier 1 Replan: Adjust task {failed_task_id} parameters without modifying DAG"
             }
 
-        # Tier 2: Subgraph / Milestone Replan
         if retry_count <= 2 and failed_task_id < total_tasks:
             return {
                 "tier": 2,
@@ -200,7 +209,6 @@ class ReplanningLadder:
                 "description": f"Tier 2 Replan: Preserve validated prefix (Tasks 1..{failed_task_id-1}), replan from Task {failed_task_id} onwards"
             }
 
-        # Tier 3: Global Strategy De-composition (SERP Upgrade)
         return {
             "tier": 3,
             "scope": "global_strategy_replan",

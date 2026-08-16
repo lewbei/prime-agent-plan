@@ -1,14 +1,14 @@
 """Deterministic Causal Validator & Symbolic Planning Engine.
 
-Replaces shallow regex matching with formal STRIPS/PDDL-style action semantics,
-causal link tracking, threat/clobber detection, and localized constraint solving.
+Formal STRIPS/PDDL-style action semantics, causal link construction,
+closed-world negation, threat/clobber detection, and localized flaw diagnosis.
 
 Literature grounding:
 - SymPlanner (2505.01479): Symbolic state simulation with explicit precondition/effect transitions.
 - LLM-Modulo (2502.12435, 2512.09629): Deterministic non-LLM verifier in the loop.
 - GNNVerifier & Grounded Diagnosis (2603.14730): Localized structural flaw localization.
 - SafeRun & Constraint Solvers (2606.09027, 2605.20873): Hard numeric/resource budget solver.
-- Representation Invariance (PlanBench 2409.13373): Validation based on action semantics rather than prose.
+- Representation Invariance (PlanBench 2409.13373): Validation based on action semantics.
 """
 from __future__ import annotations
 
@@ -17,7 +17,6 @@ import hashlib
 import json
 import re
 from dataclasses import dataclass, field
-from enum import Enum
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Set, Tuple
 
@@ -28,10 +27,16 @@ from typing import Any, Callable, Dict, List, Optional, Set, Tuple
 
 @dataclass
 class Proposition:
-    """Atomic state predicate: e.g. 'file_exists(out.txt)', 'service_ready(db)', 'verified(model)'."""
+    """Atomic state predicate: e.g. 'file_exists(out.txt)', 'service_ready(db)', 'dirty(cache)'."""
     name: str
     args: tuple[str, ...] = field(default_factory=tuple)
     negated: bool = False
+
+    @property
+    def positive_key(self) -> str:
+        """Normalized positive representation: name(arg1, arg2)."""
+        arg_str = f"({', '.join(self.args)})" if self.args else ""
+        return f"{self.name}{arg_str}".lower()
 
     def __str__(self) -> str:
         arg_str = f"({', '.join(self.args)})" if self.args else ""
@@ -39,14 +44,14 @@ class Proposition:
 
     @classmethod
     def parse(cls, text: str) -> Proposition:
-        text = text.strip()
+        text = text.strip().rstrip(".,;")
         negated = False
         if text.startswith("not ") or text.startswith("!"):
             negated = True
             text = text[4:] if text.startswith("not ") else text[1:]
         m = re.match(r"^([\w:-]+)(?:\((.*?)\))?$", text)
         if m:
-            name = m.group(1)
+            name = m.group(1).strip()
             raw_args = m.group(2)
             args = tuple(a.strip() for a in raw_args.split(",") if a.strip()) if raw_args else ()
             return cls(name=name, args=args, negated=negated)
@@ -82,7 +87,7 @@ class CausalLink:
 @dataclass
 class CausalFlaw:
     """Pinpointed diagnostic structural flaw in a plan."""
-    flaw_type: str        # 'unsatisfied_precondition', 'clobber_threat', 'dead_artifact', 'cyclic_dependency', 'resource_budget_exceeded', 'type_mismatch'
+    flaw_type: str        # 'unsatisfied_precondition', 'clobber_threat', 'dead_artifact', 'cyclic_dependency', 'resource_budget_exceeded', 'type_mismatch', 'unreachable_goal'
     task_id: int
     detail: str
     remedy_hint: str
@@ -119,14 +124,28 @@ class PlanParser:
     """Extracts formal action schemas, preconditions, effects, and bounds from plan text."""
 
     @classmethod
+    def _clean_token(cls, token: str) -> str:
+        t = token.strip()
+        t = re.split(r"(?:\.\s+|\n|(?:\s+(?:output|inputs?|effects?|depends|time|cost)\s*:))", t, flags=re.I)[0]
+        return t.strip().rstrip(".,;")
+
+    @classmethod
     def parse_plan(cls, plan_text: str, objective: str = "") -> PlanAST:
         actions: list[ActionSchema] = []
 
-        # 1. Parse Goal
+        # 1. Parse Goal & Explicit Desired State
         goal = objective
-        goal_m = re.search(r"(?:Goal|Objective)\s*[:(]?\s*(.+)", plan_text, re.I)
+        goal_m = re.search(r"(?:Goal|Objective)\s*[:(]?\s*([^\n]+)", plan_text, re.I)
         if goal_m and not goal:
-            goal = goal_m.group(1).split("\n")[0].strip()
+            goal = goal_m.group(1).strip()
+
+        target_props: list[Proposition] = []
+        targets_m = re.search(r"(?:Desired State|Target Propositions?|Final State)\s*[:(]?\s*([^\n]+)", plan_text, re.I)
+        if targets_m:
+            for tok in re.split(r"[,;]\s*", targets_m.group(1)):
+                clean_tok = cls._clean_token(tok)
+                if clean_tok:
+                    target_props.append(Proposition.parse(clean_tok))
 
         # 2. Extract Tasks
         markers = [m for m in re.finditer(r"^\s*(\d+)[.)]\s+(.+)$", plan_text, re.M)]
@@ -140,7 +159,7 @@ class PlanParser:
 
             # Depends on
             deps: list[int] = []
-            for dep_m in re.finditer(r"depends?\s+on\s+([^.(]+)", full_task_text, re.I):
+            for dep_m in re.finditer(r"depends?\s+on\s+([^.(;\n]+)", full_task_text, re.I):
                 deps.extend(int(x) for x in re.findall(r"\d+", dep_m.group(1)))
             deps = sorted(set(deps))
 
@@ -160,29 +179,39 @@ class PlanParser:
                     ins.append(val.strip())
             ins = sorted(set(ins))
 
-            # Preconditions
+            # Preconditions (Preconditions: or Precondition:)
             preconds: list[Proposition] = []
-            for pre_m in re.finditer(r"(?:precondition|requires_state|requires_condition)\s*[:(]?\s*([^\n;]+)", full_task_text, re.I):
+            for pre_m in re.finditer(r"(?:preconditions?|requires_state|requires_condition)\s*[:(]?\s*([^\n]+)", full_task_text, re.I):
                 raw_pre = pre_m.group(1).strip()
                 for token in re.split(r"[,;]\s*", raw_pre):
-                    if token.strip():
-                        preconds.append(Proposition.parse(token.strip()))
+                    clean = cls._clean_token(token)
+                    if clean:
+                        preconds.append(Proposition.parse(clean))
 
             for input_file in ins:
                 preconds.append(Proposition(name="exists", args=(input_file,)))
 
-            # Effects
+            # Effects (Effects: or Effect:)
             add_effects: list[Proposition] = []
             del_effects: list[Proposition] = []
-            for eff_m in re.finditer(r"(?:effects?|postcondition|produces_state)\s*[:(]?\s*([^\n;]+)", full_task_text, re.I):
+            for eff_m in re.finditer(r"(?:effects?|postconditions?|produces_state)\s*[:(]?\s*([^\n]+)", full_task_text, re.I):
                 raw_eff = eff_m.group(1).strip()
                 for token in re.split(r"[,;]\s*", raw_eff):
-                    if token.strip():
-                        p = Proposition.parse(token.strip())
+                    clean = cls._clean_token(token)
+                    if clean:
+                        p = Proposition.parse(clean)
                         if p.negated:
                             del_effects.append(p)
                         else:
                             add_effects.append(p)
+
+            for del_m in re.finditer(r"(?:deletes?|removes?)\s*[:(]?\s*([^\n]+)", full_task_text, re.I):
+                raw_del = del_m.group(1).strip()
+                for token in re.split(r"[,;]\s*", raw_del):
+                    clean = cls._clean_token(token)
+                    if clean:
+                        p = Proposition.parse(clean)
+                        del_effects.append(p)
 
             for out_file in outs:
                 add_effects.append(Proposition(name="exists", args=(out_file,)))
@@ -229,12 +258,13 @@ class PlanParser:
         return PlanAST(
             goal=goal or "Execute multi-step plan",
             actions=actions,
+            target_propositions=target_props,
             constraints=constraints
         )
 
 
 # ---------------------------------------------------------------------------
-# 3. Deterministic Causal Validator
+# 3. Deterministic Causal Validator (Closed-World Semantics)
 # ---------------------------------------------------------------------------
 
 class CausalValidator:
@@ -242,13 +272,22 @@ class CausalValidator:
 
     @classmethod
     def validate(cls, ast: PlanAST, initial_state: Optional[Set[str]] = None) -> dict[str, Any]:
-        """Perform comprehensive causal and symbolic validation of the PlanAST."""
-        state: set[str] = set(initial_state or ast.initial_state)
+        """Perform comprehensive causal and symbolic validation of the PlanAST with closed-world negation."""
+        state: set[str] = set()
+        raw_init = set(initial_state or ast.initial_state)
+        for s in raw_init:
+            state.add(s.strip().lower())
+            p = Proposition.parse(s)
+            state.add(p.positive_key)
+            if p.name == "exists" and p.args:
+                state.add(p.args[0].lower())
+            elif "." in s:
+                state.add(f"exists({s.lower()})")
+
         flaws: list[CausalFlaw] = []
         causal_links: list[CausalLink] = []
         task_execution_order: list[int] = []
-        produced_propositions: dict[str, int] = {}
-        consumed_propositions: set[str] = set()
+        produced_propositions: dict[str, int] = {k: 0 for k in state}
 
         actions = sorted(ast.actions, key=lambda a: a.id)
         action_ids = [a.id for a in actions]
@@ -265,7 +304,35 @@ class CausalValidator:
                     involved_tasks=action_ids
                 ))
 
-        # 2. Forward execution simulation
+        # 2. Cycle Detection
+        adj: dict[int, list[int]] = {a.id: a.depends_on for a in actions}
+        visited: set[int] = set()
+        rec_stack: set[int] = set()
+
+        def _dfs_cycle(u: int, path: list[int]) -> bool:
+            visited.add(u)
+            rec_stack.add(u)
+            for v in adj.get(u, []):
+                if v not in visited:
+                    if _dfs_cycle(v, path + [v]):
+                        return True
+                elif v in rec_stack:
+                    flaws.append(CausalFlaw(
+                        flaw_type="cyclic_dependency",
+                        task_id=u,
+                        detail=f"Dependency cycle detected involving task chain: {path + [v]}",
+                        remedy_hint="Eliminate cyclic dependency edges in task DAG",
+                        involved_tasks=path + [v]
+                    ))
+                    return True
+            rec_stack.discard(u)
+            return False
+
+        for a in actions:
+            if a.id not in visited:
+                _dfs_cycle(a.id, [a.id])
+
+        # 3. Forward execution simulation
         for action in actions:
             t = action.id
             task_execution_order.append(t)
@@ -281,70 +348,128 @@ class CausalValidator:
                         involved_tasks=[t, dep]
                     ))
 
-            # B. Precondition satisfaction & Causal Link Construction
+            # B. Precondition satisfaction & Causal Links
             for prec in action.preconditions:
-                prec_str = str(prec)
-                consumed_propositions.add(prec_str)
-                if prec_str not in state and not (prec.name == "exists" and prec.args and prec.args[0] in state):
-                    producer = produced_propositions.get(prec_str)
-                    if producer is None and prec.name == "exists" and prec.args:
-                        producer = produced_propositions.get(str(Proposition(name="exists", args=prec.args)))
+                pkey = prec.positive_key
+                raw_target = prec.args[0].lower() if (prec.name == "exists" and prec.args) else pkey
 
-                    if producer is not None and producer in task_execution_order:
-                        causal_links.append(CausalLink(producer=producer, condition=prec, consumer=t))
-                    else:
+                producer = produced_propositions.get(pkey, produced_propositions.get(raw_target))
+
+                if producer is not None and producer in task_execution_order:
+                    causal_links.append(CausalLink(producer=producer, condition=prec, consumer=t))
+
+                if prec.negated:
+                    if pkey in state or raw_target in state:
                         flaws.append(CausalFlaw(
                             flaw_type="unsatisfied_precondition",
                             task_id=t,
-                            detail=f"Task {t} requires precondition '{prec_str}' which is unsatisfied in world state",
-                            remedy_hint=f"Add an earlier action producing '{prec_str}' or supply it in initial environment inputs",
+                            detail=f"Task {t} requires '{prec}', but '{pkey}' currently holds in world state",
+                            remedy_hint=f"Add a preceding action to delete/clean '{pkey}' before Task {t}",
                             involved_tasks=[t],
                             involved_proposition=prec
                         ))
                 else:
-                    producer = produced_propositions.get(prec_str, 0)
-                    causal_links.append(CausalLink(producer=producer, condition=prec, consumer=t))
+                    # Positive precondition: check for clobber threats first
+                    if producer is not None:
+                        clobberers = [a.id for a in actions if producer < a.id < t and any(d.positive_key == pkey for d in a.del_effects)]
+                        if clobberers:
+                            flaws.append(CausalFlaw(
+                                flaw_type="clobber_threat",
+                                task_id=clobberers[0],
+                                detail=f"Task {clobberers[0]} deletes '{prec}', destroying causal link from Task {producer} to Task {t}",
+                                remedy_hint=f"Reorder Task {clobberers[0]} after Task {t} or preserve condition '{prec}'",
+                                involved_tasks=[producer, clobberers[0], t],
+                                involved_proposition=prec
+                            ))
+                            continue
+
+                    satisfied = (pkey in state or raw_target in state or str(prec).lower() in state)
+                    if not satisfied:
+                        flaws.append(CausalFlaw(
+                            flaw_type="unsatisfied_precondition",
+                            task_id=t,
+                            detail=f"Task {t} requires precondition '{prec}' which is unsatisfied in world state",
+                            remedy_hint=f"Add an earlier action producing '{prec}' or supply it in initial environment inputs",
+                            involved_tasks=[t],
+                            involved_proposition=prec
+                        ))
 
             # C. Apply Delete Effects
             for del_prop in action.del_effects:
-                del_str = str(del_prop)
-                state.discard(del_str)
+                dkey = del_prop.positive_key
+                state.discard(dkey)
+                if del_prop.name == "exists" and del_prop.args:
+                    state.discard(del_prop.args[0].lower())
+                state.discard(str(del_prop).lower())
 
             # D. Apply Add Effects
             for add_prop in action.add_effects:
-                add_str = str(add_prop)
-                state.add(add_str)
-                produced_propositions[add_str] = t
+                akey = add_prop.positive_key
+                state.add(akey)
+                produced_propositions[akey] = t
                 if add_prop.name == "exists" and add_prop.args:
-                    state.add(add_prop.args[0])
-                    produced_propositions[add_prop.args[0]] = t
+                    arg_val = add_prop.args[0].lower()
+                    state.add(arg_val)
+                    produced_propositions[arg_val] = t
+                state.add(str(add_prop).lower())
 
             for out_file in action.outputs:
-                state.add(out_file)
-                produced_propositions[out_file] = t
+                out_low = out_file.lower()
+                state.add(out_low)
+                state.add(f"exists({out_low})")
+                produced_propositions[out_low] = t
+                produced_propositions[f"exists({out_low})"] = t
 
-                # 3. Threat / Clobber detection on established causal links (producer < k < consumer)
-        for link in causal_links:
-            cond_str = str(link.condition)
-            for action in actions:
-                k = action.id
-                if link.producer < k < link.consumer:
-                    if any(str(d) == cond_str for d in action.del_effects):
+        # 4. Type Mismatch Diagnosis
+        by_stem: dict[str, list[tuple[str, int]]] = {}
+        for a in actions:
+            for out in a.outputs:
+                stem = Path(out).stem.lower()
+                ext = Path(out).suffix.lower()
+                by_stem.setdefault(stem, []).append((ext, a.id))
+
+        for a in actions:
+            for inp in a.inputs:
+                stem = Path(inp).stem.lower()
+                ext = Path(inp).suffix.lower()
+                for prod_ext, prod_id in by_stem.get(stem, []):
+                    if prod_ext and ext and prod_ext != ext:
                         flaws.append(CausalFlaw(
-                            flaw_type="clobber_threat",
-                            task_id=k,
-                            detail=f"Task {k} deletes '{cond_str}', destroying causal link from Task {link.producer} to Task {link.consumer}",
-                            remedy_hint=f"Reorder Task {k} after Task {link.consumer} or preserve condition '{cond_str}'",
-                            involved_tasks=[link.producer, k, link.consumer],
-                            involved_proposition=link.condition
+                            flaw_type="type_mismatch",
+                            task_id=a.id,
+                            detail=f"Type mismatch: Task {a.id} consumes '{inp}' ({ext}) but Task {prod_id} produces '{stem}{prod_ext}'",
+                            remedy_hint=f"Align file extensions: change '{inp}' to '{stem}{prod_ext}'",
+                            involved_tasks=[prod_id, a.id]
                         ))
 
-        # 4. Dead Artifacts
+        # 5. Explicit Target Proposition Reachability
+        for target in ast.target_propositions:
+            tkey = target.positive_key
+            if target.negated:
+                if tkey in state:
+                    flaws.append(CausalFlaw(
+                        flaw_type="unreachable_goal",
+                        task_id=0,
+                        detail=f"Target goal '{target}' unmet: '{tkey}' remains in final world state",
+                        remedy_hint=f"Add a concluding action to delete '{tkey}'",
+                        involved_tasks=[]
+                    ))
+            else:
+                if tkey not in state and str(target).lower() not in state:
+                    flaws.append(CausalFlaw(
+                        flaw_type="unreachable_goal",
+                        task_id=0,
+                        detail=f"Target goal '{target}' unmet: not achieved in final world state",
+                        remedy_hint=f"Add an action to produce '{target}'",
+                        involved_tasks=[]
+                    ))
+
+        # 6. Dead Artifacts
         all_outputs = {out for a in actions for out in a.outputs}
         all_inputs = {inp for a in actions for inp in a.inputs}
         dead_artifacts = sorted(all_outputs - all_inputs)
 
-        # 5. Global Resource & Budget Constraints Validation
+        # 7. Global Resource Constraints
         total_cost = sum(a.cost for a in actions)
         total_duration = sum(a.duration_minutes for a in actions)
 
@@ -369,14 +494,6 @@ class CausalValidator:
                         task_id=0,
                         detail=f"Plan violates constraint: {ctype} {limit} {unit} (actual: {actual:g} {unit})",
                         remedy_hint=f"Reduce task count or resource consumption below {limit} {unit}",
-                        involved_tasks=[]
-                    ))
-                elif ("at least" in ctype or "minimum of" in ctype) and actual < limit:
-                    flaws.append(CausalFlaw(
-                        flaw_type="resource_budget_exceeded",
-                        task_id=0,
-                        detail=f"Plan violates constraint: {ctype} {limit} {unit} (actual: {actual:g} {unit})",
-                        remedy_hint=f"Expand tasks to meet minimum {limit} {unit}",
                         involved_tasks=[]
                     ))
 

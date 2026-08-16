@@ -364,11 +364,11 @@ def _auth_key() -> str:
 
 
 def fold_history(session: dict[str, Any] | str, *, plans_dir: str | Path | None = None,
-                 keep_last: int = 2) -> dict[str, Any]:
+                 keep_last: int = 2, max_context_tokens: int = 4000) -> dict[str, Any]:
     """Fold superseded round texts into one-line summaries (HIPIF 2606.10507):
-    keep the best round and the last `keep_last` rounds in full; older rounds'
-    plan_text is replaced by a folded summary. Sessions created before engine
-    v0.6.0 (no engine_version marker) are never mutated (read-only compat)."""
+    uses ContextBudgeter to keep the best round and latest rounds in full,
+    compressing older rounds to honor max_context_tokens. Legacy sessions (pre-v0.6.0)
+    are never mutated (read-only compat)."""
     if isinstance(session, str):
         plans_dir = Path(plans_dir) if plans_dir else DEFAULT_PLANS_DIR
         s = _load_session(plans_dir, session)
@@ -380,14 +380,8 @@ def fold_history(session: dict[str, Any] | str, *, plans_dir: str | Path | None 
     rounds = s.get("rounds") or []
     if len(rounds) <= keep_last + 1:
         return s
-    best_idx = (s.get("best_version") - 1) if s.get("best_version") else (len(rounds) - 1)
-    keep_idx = {best_idx} | set(range(max(0, len(rounds) - keep_last), len(rounds)))
-    for i, r in enumerate(rounds):
-        if i in keep_idx or not r.get("plan_text"):
-            continue
-        crit_ids = ", ".join([c.get("id", "") for c in r.get("critiques", [])][:3]) or "none"
-        r["plan_text"] = (f"[folded: version {r.get('version')}, score {r.get('score')}, "
-                          f"delta {r.get('delta')}, critiques {crit_ids}]")
+
+    s = ContextBudgeter.compress_history(s, max_context_tokens=max_context_tokens)
     s["history_folded"] = True
     _save_session(plans_dir, s)
     return s
@@ -1006,7 +1000,8 @@ def _all_check_ids(rubric: dict[str, dict[str, Any]]) -> list[str]:
 
 
 
-def verify(plan_text: str) -> dict[str, Any]:
+def verify(plan_text: str, *, initial_state: set[str] | list[str] | None = None,
+           cwd: str | Path | None = None) -> dict[str, Any]:
     """Deterministic plan-validity audit (no LLM).
 
     Goes beyond the regex rubric: parses the task/dependency/artifact
@@ -1159,8 +1154,11 @@ def verify(plan_text: str) -> dict[str, Any]:
                     errors.append(f"criterion {lab} has no covering task (no landmark chain)")
 
     # --- Formal Causal & Symbolic Validation (SymPlanner 2505.01479, GNNVerifier 2603.14730) ---
+    gc = ground_check(plan_text, cwd=cwd)
+    dag_artifacts = {out for outs in dag["artifacts"].values() for out in outs}
+    init_state = set(gc.get("verified", [])) | set(initial_state or []) | dag_artifacts
     ast = PlanParser.parse_plan(plan_text)
-    causal_res = CausalValidator.validate(ast)
+    causal_res = CausalValidator.validate(ast, initial_state=init_state)
     for flaw in causal_res.get("flaws", []):
         errors.append(f"causal flaw [{flaw['type']}]: {flaw['detail']}")
 

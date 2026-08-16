@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import pytest
 from plan_mode.ast_search import ASTSearchEngine, ast_distance, crossover_ast, mutate_flaw_directed
-from plan_mode.causal_validator import ActionSchema, PlanAST, PlanParser, Proposition
+from plan_mode.causal_validator import ActionSchema, CausalValidator, PlanAST, PlanParser, Proposition
 
 
 def test_ast_distance_computation():
@@ -51,3 +51,17 @@ def test_ast_search_engine_evolution():
     evolved = engine.evolve_step(population_size=2)
     assert len(evolved) >= 2
     assert all(m.diversity_score >= 0.0 for m in evolved)
+
+
+def test_ast_crossover_semantic_dependency_remapping():
+    """Verify that crossover correctly remaps dependencies from parent B to new child indices."""
+    p1 = PlanParser.parse_plan("1. Step A1\nOutput: a1.txt\n2. Step A2\nDepends on 1\nOutput: a2.txt")
+    p2 = PlanParser.parse_plan("1. Step B1\nOutput: b1.txt\n2. Step B2\nDepends on 1\nOutput: b2.txt\n3. Step B3\nDepends on 2\nOutput: b3.txt")
+
+    child = crossover_ast(p1, p2)
+    # Child must have actions with valid causal dependencies pointing to strictly earlier indices
+    for action in child.actions:
+        assert all(d < action.id for d in action.depends_on)
+    # Suffix action (B3) should depend on new renumbered B2 index
+    val = CausalValidator.validate(child)
+    assert not any(f["type"] == "unsatisfied_dependency" for f in val["flaws"])

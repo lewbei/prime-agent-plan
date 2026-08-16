@@ -1,3 +1,4 @@
+from plan_mode.memory_distiller import ContextBudgeter
 import pytest
 """Engine v0.6 tests: folding, root-cause grouping, compat load, adaptive search."""
 import json
@@ -631,3 +632,31 @@ def test_strict_external_judge_requires_explicit_external_llm(tmp_path):
     }, round_version=1, plans_dir=tmp_path)
     gate2 = plan_mode.release(s, min_score=90.0, require_judge=True, require_external_judge=True, plans_dir=tmp_path)
     assert gate2["ok"] is True
+
+
+@pytest.mark.asyncio
+async def test_search_ast_mode_evolution(tmp_path):
+    """Verify plan.search(mode='ast') evolves candidates using ASTSearchEngine."""
+    s = plan_mode.start("AST Search Mode Test", plans_dir=tmp_path)
+    plan_mode.assess(s, "1. Init\nOutput: a.txt\n2. Process\nDepends on 1\nOutput: b.txt", plans_dir=tmp_path)
+
+    res = await plan_mode.search(s, iterations=2, width=2, mode="ast", plans_dir=tmp_path)
+    assert res["nodes"] >= 1
+    assert res["best_score"] > 0
+
+
+def test_context_budgeter_obeys_max_tokens():
+    """Verify ContextBudgeter compresses history when token limit is exceeded."""
+    session = {
+        "best_version": 1,
+        "rounds": [
+            {"version": 1, "ts": "2026-08-01", "score": 90.0, "plan_text": "A" * 2000, "critiques": []},
+            {"version": 2, "ts": "2026-08-02", "score": 70.0, "plan_text": "B" * 2000, "critiques": ["err"]},
+            {"version": 3, "ts": "2026-08-03", "score": 75.0, "plan_text": "C" * 2000, "critiques": ["err2"]},
+            {"version": 4, "ts": "2026-08-04", "score": 80.0, "plan_text": "D" * 2000, "critiques": []}
+        ]
+    }
+    compressed = ContextBudgeter.compress_history(session, max_context_tokens=1500)
+    # Rounds 2 and 3 should be compressed to meet the budget
+    assert compressed["rounds"][1].get("folded") is True
+    assert compressed["rounds"][2].get("folded") is True

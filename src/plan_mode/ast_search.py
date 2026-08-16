@@ -1,7 +1,7 @@
 """Structural AST-Level Evolutionary & MCTS Search Engine.
 
-Implements structural plan crossover, flaw-directed mutation operators,
-population diversity maintenance, and state-graph transposition tables.
+Implements structural plan crossover with causal dependency remapping,
+flaw-directed mutation operators, population diversity maintenance, and state-graph transposition tables.
 
 Literature grounding:
 - Mind Evolution (2501.09891): Evaluator-driven recombination of structured plan subgraphs.
@@ -46,7 +46,7 @@ def ast_distance(ast_a: PlanAST, ast_b: PlanAST) -> float:
 
 
 def crossover_ast(parent_a: PlanAST, parent_b: PlanAST) -> PlanAST:
-    """Crossover two plan ASTs by recombining valid causal subgraphs."""
+    """Crossover two plan ASTs with exact semantic dependency remapping."""
     if not parent_a.actions or not parent_b.actions:
         return copy.deepcopy(parent_a if parent_a.actions else parent_b)
 
@@ -54,12 +54,37 @@ def crossover_ast(parent_a: PlanAST, parent_b: PlanAST) -> PlanAST:
     prefix = [copy.deepcopy(a) for a in parent_a.actions[:cut_a]]
 
     prefix_names = {a.name.lower() for a in prefix}
-    suffix = [copy.deepcopy(b) for b in parent_b.actions if b.name.lower() not in prefix_names]
+    # Track mapping from old parent_b action id to new combined action id
+    b_id_map: dict[int, int] = {}
+    suffix: list[ActionSchema] = []
+
+    current_new_id = len(prefix) + 1
+    for b_action in parent_b.actions:
+        if b_action.name.lower() not in prefix_names:
+            copied = copy.deepcopy(b_action)
+            b_id_map[b_action.id] = current_new_id
+            copied.id = current_new_id
+            suffix.append(copied)
+            current_new_id += 1
+
+    # Remap dependencies of suffix actions:
+    # If dep was in parent_b and present in child, map to b_id_map[dep].
+    # If dep was in parent_b prefix (replaced by parent_a prefix), map to boundary step of parent_a prefix.
+    for action in suffix:
+        remapped_deps: list[int] = []
+        for old_dep in action.depends_on:
+            if old_dep in b_id_map:
+                remapped_deps.append(b_id_map[old_dep])
+            else:
+                # Dep was in parent_b's dropped prefix; anchor to the boundary of parent_a's prefix
+                remapped_deps.append(len(prefix))
+        # Ensure deps only point to earlier steps (no forward references)
+        action.depends_on = sorted(set(d for d in remapped_deps if d < action.id))
 
     combined_actions = prefix + suffix
-    for i, action in enumerate(combined_actions, 1):
-        action.id = i
-        action.depends_on = [d for d in action.depends_on if d < i]
+    for i, a in enumerate(combined_actions, 1):
+        a.id = i
+        a.depends_on = sorted(set(d for d in a.depends_on if d < i))
 
     child = PlanAST(
         goal=parent_a.goal,
@@ -109,9 +134,15 @@ def mutate_flaw_directed(ast: PlanAST, validation_result: dict[str, Any]) -> Pla
             mutated.actions.remove(action)
             mutated.actions.append(action)
 
+    elif flaw_type == "type_mismatch":
+        action = mutated.get_action(task_id)
+        if action and action.inputs:
+            # Align input extension with declared producer output
+            action.inputs = [re.sub(r"\.\w+$", ".json", inp) for inp in action.inputs]
+
     for i, a in enumerate(mutated.actions, 1):
         a.id = i
-        a.depends_on = [d for d in a.depends_on if d < i]
+        a.depends_on = sorted(set(d for d in a.depends_on if d < i))
 
     return mutated
 

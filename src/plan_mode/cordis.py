@@ -7,15 +7,15 @@ Formal runtime realization of 'A Programming Paradigm for Spatiotemporal Composa
    - Every context mutation carries an explicit left inverse g: Gamma -> Gamma.
    - Twisted composition monoid T_Gamma: (f1, g1) o (f2, g2) = (f1 o f2, g2 o g1).
    - Accumulator phi rolls up inverses in LIFO order for complete context recovery.
-   - Async Generator Effect Iterators with Step-Boundary Guards & Cancellation Inertia (Algorithm 1).
-   - Content Hash-Verified Journaling for verifiable state rollback.
+   - Async Generator Effect Iterators with Step-Boundary Guards & Cancellation Tokens (Algorithm 1).
+   - Content Hash-Verified Journaling & Drift Detection for verifiable rollback.
 
 2. Reactive Coeffects (Section 3.2):
    - Partial dependent coeffect context Sigma: (k: K) -> V_k.
-   - Provider-Aware Resolution & Binding: key -> ProviderRef -> Value.
+   - Provider-Aware Resolution: key -> ProviderRef -> Value.
    - Reactive notification: activating / deactivating / neutral state transitions.
-   - Theorem 63 Provider Withdrawal Guard: Topological deactivation of dependent fibers
-     prior to provider unmounting.
+   - Theorem 63 Topological Provider Withdrawal: Exact reverse-topological DFS deactivation
+     of transitive dependent fibers before provider unmounting.
    - Scoped Realm Isolation (isolate): 2-layer resolution key -> rho(k) -> sigma(rho(k)).
    - Metadata Interception (intercept): capability mediation without triggering reloads.
 
@@ -23,7 +23,7 @@ Formal runtime realization of 'A Programming Paradigm for Spatiotemporal Composa
    - Fibers <d, p, e, pi, sigma, tau, theta> spanning 10 formal operational rules:
      Orchestration: O-Insert, O-Retire, O-Remove
      Lifecycle: L-Begin, L-Iter, L-Finish, L-Divert, L-Raise, L-Leave, L-Unload
-   - Dynamic state transitions (INACTIVE, RELOADING, ACTIVE, UNLOADING, FAILED).
+   - Dual sync (activate) and async (async_activate) lifecycle execution.
 
 4. Declarative Component Loader (Section 5):
    - ctx.use(ComponentClass, config): declarative lifecycle loader with schema reconciliation.
@@ -86,6 +86,7 @@ class JournalEntry:
     post_hash: str
     inverse: Callable[[], Any]
     context_uid: str
+    drift_detected: bool = False
 
 
 class CancellationToken:
@@ -306,10 +307,11 @@ class Context:
         return _dispose
 
     def journal_mutation(self, target: str, pre_content: str, post_content: str,
-                         inverse: Callable[[], Any], description: str = "") -> None:
-        """Record a hash-verified mutation into the context journal."""
+                         inverse: Callable[[], Any], description: str = "") -> JournalEntry:
+        """Record a hash-verified mutation into the context journal with drift detection on rollback."""
         pre_hash = hashlib.sha256(pre_content.encode("utf-8")).hexdigest() if pre_content else ""
         post_hash = hashlib.sha256(post_content.encode("utf-8")).hexdigest() if post_content else ""
+
         entry = JournalEntry(
             ts=time.time(),
             description=description,
@@ -320,7 +322,21 @@ class Context:
             context_uid=self.uid
         )
         self._journal.append(entry)
-        self.effect(lambda: inverse)
+
+        def _verified_inverse():
+            # Check target content drift if target is a reachable file
+            p = Path(target)
+            if p.exists() and post_hash:
+                try:
+                    curr_hash = hashlib.sha256(p.read_bytes()).hexdigest()
+                    if curr_hash != post_hash:
+                        entry.drift_detected = True
+                except Exception:
+                    pass
+            return inverse()
+
+        self.effect(lambda: _verified_inverse)
+        return entry
 
     def dispose(self):
         """Recover all effects executed under this context in LIFO order (sync)."""
@@ -368,7 +384,7 @@ class Context:
         return val
 
     def provide(self, key: str, value: Any, *, provider_id: Optional[str] = None) -> Callable[[], Any]:
-        """Provide a service binding under key as a revertible effect with Theorem 63 withdrawal order."""
+        """Provide a service binding with Theorem 63 topological DFS deactivation."""
         realm = self._get_realm(key)
         old_val = self._store.get(realm)
         old_provider = self._providers.get(realm)
@@ -380,10 +396,30 @@ class Context:
             self._notify(key, value, "provided")
 
             def _inverse():
-                # Theorem 63 Topological Withdrawal Order:
-                # Dependents must deactivate completely in reverse dependency order before provider unmounts.
-                dependent_fibers = [f for f in self._registry.values() if key in f.dependencies and f.state == LifecycleState.ACTIVE]
-                for fiber in dependent_fibers:
+                # Theorem 63 Topological Reverse Deactivation:
+                # 1. Build dependency graph among active fibers
+                active_fibers = {f.uid: f for f in self._registry.values() if f.state == LifecycleState.ACTIVE}
+                # Topological sort via DFS of fibers depending on this key
+                visited: set[str] = set()
+                deactivation_order: list[Fiber] = []
+
+                def _dfs(f_uid: str):
+                    visited.add(f_uid)
+                    fiber = active_fibers.get(f_uid)
+                    if not fiber:
+                        return
+                    # Check any fibers that depend on what this fiber provides
+                    for other in active_fibers.values():
+                        if other.uid not in visited and any(p in other.dependencies for p in fiber.provisions):
+                            _dfs(other.uid)
+                    deactivation_order.append(fiber)
+
+                for f in list(active_fibers.values()):
+                    if key in f.dependencies and f.uid not in visited:
+                        _dfs(f.uid)
+
+                # Deactivate in topological reverse order (leaves first)
+                for fiber in deactivation_order:
                     try:
                         fiber.deactivate()
                     except Exception:
@@ -470,7 +506,6 @@ class Context:
         else:
             instance = plugin_callable_or_class
 
-        # Register teardown if instance has dispose/deactivate
         if hasattr(instance, "dispose") and callable(instance.dispose):
             self.effect(lambda: instance.dispose)
         return instance
@@ -503,6 +538,9 @@ class Fiber:
         # Register fiber into the context hierarchy
         self.ctx._registry[self.uid] = self
 
+        # Register fiber into the context hierarchy
+        self.ctx._registry[self.uid] = self
+
     def is_satisfied(self) -> bool:
         """Evaluate the coeffect satisfaction predicate: sigma |= d."""
         for dep in self.dependencies:
@@ -511,12 +549,10 @@ class Fiber:
         return True
 
     def activate(self) -> bool:
-        """L-Begin -> L-Iter -> L-Finish: Activate the fiber if dependencies are satisfied."""
+        """L-Begin -> L-Iter -> L-Finish: Synchronous fiber activation."""
         if self.state == LifecycleState.ACTIVE:
             return True
-        if self.retired:
-            return False
-        if not self.is_satisfied():
+        if self.retired or not self.is_satisfied():
             return False
 
         self.state = LifecycleState.RELOADING
@@ -532,6 +568,26 @@ class Fiber:
             self.ctx.dispose()
             return False
 
+    async def async_activate(self) -> bool:
+        """L-Begin -> L-Iter -> L-Finish: Asynchronous fiber activation."""
+        if self.state == LifecycleState.ACTIVE:
+            return True
+        if self.retired or not self.is_satisfied():
+            return False
+
+        self.state = LifecycleState.RELOADING
+        try:
+            if self.apply_fn:
+                self._dispose_handle = await self.ctx.async_effect(lambda: self.apply_fn(self.ctx))
+            self.state = LifecycleState.ACTIVE
+            self.error = None
+            return True
+        except Exception as err:
+            self.state = LifecycleState.FAILED
+            self.error = err
+            await self.ctx.async_dispose()
+            return False
+
     def deactivate(self) -> None:
         """L-Leave -> L-Unload: Deactivate the fiber and recover all side effects."""
         if self.state in (LifecycleState.INACTIVE, LifecycleState.UNLOADING):
@@ -540,6 +596,17 @@ class Fiber:
         self.state = LifecycleState.UNLOADING
         try:
             self.ctx.dispose()
+        finally:
+            self.state = LifecycleState.INACTIVE
+
+    async def async_deactivate(self) -> None:
+        """L-Leave -> L-Unload: Asynchronously deactivate the fiber and recover all side effects."""
+        if self.state in (LifecycleState.INACTIVE, LifecycleState.UNLOADING):
+            return
+
+        self.state = LifecycleState.UNLOADING
+        try:
+            await self.ctx.async_dispose()
         finally:
             self.state = LifecycleState.INACTIVE
 
