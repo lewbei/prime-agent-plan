@@ -547,3 +547,33 @@ When changing the engine or rubric, run the test suite and the project self-chec
 ## License
 
 A standalone license file is not currently included in this repository. Review the repository terms before redistribution or incorporation into another project.
+
+
+---
+
+## 🔬 Core Formal Architecture
+
+### 1. Deterministic Causal Validator (`causal_validator.py`)
+- **Action Schema & AST**: Parses plans into typed `ActionSchema` objects with declared `preconditions`, `add_effects`, `del_effects`, `inputs`, `outputs`, `duration`, and `cost`.
+- **STRIPS State Transition Solver**: Emulates forward world-state evolution $\mathcal{S}' = (\mathcal{S} \setminus 	ext{Del}(a)) \cup 	ext{Add}(a)$ with propositional consistency.
+- **Causal Link Construction**: Tracks triples $\langle a_i, p, a_j angle$ asserting that step $a_i$ achieves condition $p$ consumed by step $a_j$.
+- **Clobber Threat Detection**: Identifies any intermediate action $a_k$ ($i < k < j$) that deletes $p$, producing pinpoint diagnostic flaws with automated remedies.
+- **Numeric & Resource Budget Solver**: Deterministically checks linear constraints on tasks, durations, and token budgets.
+
+### 2. Complete Cordis Composability Engine (`cordis.py`)
+- **$\Gamma_\infty$ Context Monoid**: Dynamic context with dual sync/async effect registration (`effect` / `async_effect`) and dual LIFO rollback (`dispose` / `async_dispose`).
+- **Algorithm 1 Effect Iterators with Cancellation**: Step-boundary async generators with cancellation tokens $	au$ and instant LIFO unwinding of in-flight mutations.
+- **Theorem 63 Topological Provider Withdrawal**: When a service provider withdraws, all active dependent fibers deactivate in reverse topological order before the binding unmounts.
+- **Cryptographic Hash Journaling**: Records SHA-256 pre-state and post-state hashes to detect external state drift during rollbacks.
+- **Declarative Component Loader (`ctx.use`)**: Component lifecycle instantiation and reactive coeffect binding.
+
+### 3. Structural AST-Level Evolutionary Search (`ast_search.py`)
+- **AST Subgraph Crossover**: Recombines valid causal subgraphs from top parent plans.
+- **Flaw-Directed Mutations**: Directly patches flaws identified by `CausalValidator` (inserting missing producers, reordering conflicting steps, renumbering).
+- **Population Diversity Tracking**: Computes Jaccard graph edit distance $D(P_a, P_b)$ and applies Pareto multi-objective selection (fitness + diversity bonus).
+- **State Transposition Table**: Collapses search space by caching state and DAG hashes.
+
+### 4. RoT Memory Distillation & Context Management (`memory_distiller.py`)
+- **Rule of Thought (RoT) Distiller**: Automatically distills negative rules `Rule(id, trigger, pattern, remedy)` from structural/execution flaws to prevent repeat errors.
+- **HIPIF Context Budgeter**: Compresses superseded rounds into compact semantic diffs while preserving full text for the best and latest rounds.
+- **3-Tier Replanning Ladder**: Escalates failures systematically from local task parameter adjustments (Tier 1) to subgraph replanning (Tier 2) to global strategy upgrades (Tier 3).

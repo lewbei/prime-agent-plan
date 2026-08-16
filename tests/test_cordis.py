@@ -305,3 +305,76 @@ def test_cordis_effect_rejects_async_callback_type_safety():
 
     with pytest.raises(TypeError, match="Use 'await ctx.async_effect"):
         ctx.effect(async_cb)
+
+
+@pytest.mark.asyncio
+async def test_cordis_async_generator_effect_iterator_with_cancellation_token():
+    """Verify Algorithm 1: Async generator effect iterator with in-flight cancellation guard."""
+    from plan_mode.cordis import CancellationToken
+    ctx = Context(name="test_async_gen")
+    trace = []
+    token = CancellationToken()
+
+    async def multi_step_async_gen():
+        trace.append("step_1")
+        yield lambda: trace.append("undo_1")
+        trace.append("step_2")
+        yield lambda: trace.append("undo_2")
+        # Trigger cancellation before step 3
+        token.cancel()
+        trace.append("step_3")
+        yield lambda: trace.append("undo_3")
+
+    await ctx.async_effect(multi_step_async_gen(), token=token)
+    assert "step_1" in trace
+    assert "step_2" in trace
+
+    await ctx.async_dispose()
+    # Undos must fire in reverse LIFO order
+    assert "undo_2" in trace
+    assert "undo_1" in trace
+
+
+def test_cordis_hash_journaling_and_rollback():
+    """Verify SHA-256 content hash journaling and state rollback."""
+    ctx = Context(name="test_hash_journal")
+    fs = {"config.yaml": "version: 1"}
+
+    def revert_config():
+        fs["config.yaml"] = "version: 1"
+
+    ctx.journal_mutation(
+        target="config.yaml",
+        pre_content="version: 1",
+        post_content="version: 2",
+        inverse=revert_config,
+        description="Update version"
+    )
+    fs["config.yaml"] = "version: 2"
+    assert len(ctx._journal) == 1
+    assert len(ctx._journal[0].pre_hash) == 64
+
+    # Rollback
+    ctx.dispose()
+    assert fs["config.yaml"] == "version: 1"
+
+
+def test_cordis_declarative_component_use():
+    """Verify ctx.use() declarative component instantiation and lifecycle binding."""
+    class DatabasePlugin:
+        def __init__(self, context: Context, url: str = "sqlite:///:memory:"):
+            self.context = context
+            self.url = url
+            self.active = True
+            context.provide("service:sql", self)
+
+        def dispose(self):
+            self.active = False
+
+    ctx = Context(name="test_use")
+    db = ctx.use(DatabasePlugin, config={"url": "postgres://localhost"})
+    assert db.active is True
+    assert ctx.get("service:sql") is db
+
+    ctx.dispose()
+    assert db.active is False

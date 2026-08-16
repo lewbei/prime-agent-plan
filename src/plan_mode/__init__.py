@@ -1,3 +1,4 @@
+
 """plan_mode - iterative self-improving planning engine for the ai_funded repo.
 
 Plan mode contract
@@ -23,6 +24,30 @@ The engine is pure Python and deterministic: scores come only from rubric
 checks, so "better and better" is a recorded, auditable fact, not a vibe.
 """
 from __future__ import annotations
+
+from .causal_validator import (
+    ActionSchema,
+    CausalFlaw,
+    CausalLink,
+    CausalValidator,
+    PlanAST,
+    PlanParser,
+    Proposition,
+)
+from .ast_search import (
+    ASTSearchEngine,
+    PopulationMember,
+    ast_distance,
+    crossover_ast,
+    mutate_exploratory,
+    mutate_flaw_directed,
+)
+from .memory_distiller import (
+    ContextBudgeter,
+    ReplanningLadder,
+    RoTRule,
+    RoTRuleBase,
+)
 
 import asyncio
 import difflib
@@ -1133,8 +1158,14 @@ def verify(plan_text: str) -> dict[str, Any]:
                 if not covered:
                     errors.append(f"criterion {lab} has no covering task (no landmark chain)")
 
+    # --- Formal Causal & Symbolic Validation (SymPlanner 2505.01479, GNNVerifier 2603.14730) ---
+    ast = PlanParser.parse_plan(plan_text)
+    causal_res = CausalValidator.validate(ast)
+    for flaw in causal_res.get("flaws", []):
+        errors.append(f"causal flaw [{flaw['type']}]: {flaw['detail']}")
+
     return {"ok": not errors, "errors": errors, "warnings": warnings,
-            "graph": graph, "tasks": len(nums)}
+            "graph": graph, "tasks": len(nums), "causal_validation": causal_res}
 
 
 async def search(session: dict[str, Any] | str, **kwargs) -> dict[str, Any]:
@@ -1698,5 +1729,5 @@ __all__ = ["start", "assess", "assess_candidates", "run", "status", "history", "
            "plan_dag", "simulate", "plan_quality", "edit_file", "rollback", "deps_check",
            "search_expand", "search_select", "search_backtrack", "search_report", "search",
            "Context", "Fiber", "LifecycleState", "TwistedMonoid", "get_root_context", "reset_root_context",
-           "create_subagent_context", "provide_tool", "execute_plan", "execute_plan_sync", "speculative_rollout",
+           "create_subagent_context", "provide_tool", "execute_plan", "RoTRuleBase", "RoTRule", "ReplanningLadder", "ContextBudgeter", "mutate_flaw_directed", "mutate_exploratory", "crossover_ast", "ast_distance", "PopulationMember", "ASTSearchEngine", "Proposition", "PlanParser", "PlanAST", "CausalValidator", "CausalLink", "CausalFlaw", "ActionSchema", "execute_plan_sync", "speculative_rollout",
            "DEFAULT_PLANS_DIR", "RUBRIC_PATH", "REPO_ROOT", "__version__"]

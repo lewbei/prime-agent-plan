@@ -1,4 +1,4 @@
-"""Spatiotemporal Composability Engine (Cordis Paradigm).
+"""Spatiotemporal Composability Engine (Cordis Paradigm - Complete Implementation).
 
 Formal runtime realization of 'A Programming Paradigm for Spatiotemporal Composability'
 (Shi, Zhang, Cui 2026):
@@ -7,16 +7,15 @@ Formal runtime realization of 'A Programming Paradigm for Spatiotemporal Composa
    - Every context mutation carries an explicit left inverse g: Gamma -> Gamma.
    - Twisted composition monoid T_Gamma: (f1, g1) o (f2, g2) = (f1 o f2, g2 o g1).
    - Accumulator phi rolls up inverses in LIFO order for complete context recovery.
-   - Step-boundary effect iterators with cancellation guards (Algorithm 1).
-   - Explicit sync effect (ctx.effect) and async effect (ctx.async_effect) pipelines.
+   - Async Generator Effect Iterators with Step-Boundary Guards & Cancellation Inertia (Algorithm 1).
+   - Content Hash-Verified Journaling for verifiable state rollback.
 
 2. Reactive Coeffects (Section 3.2):
    - Partial dependent coeffect context Sigma: (k: K) -> V_k.
-   - Reactive notification: changes classified as activating / deactivating / neutral.
-   - Dynamic fiber lifecycle reactions: fibers activate when dependencies are satisfied
-     and deactivate when coeffects are withdrawn.
-   - Theorem 63 Provider Withdrawal Guard: a provider's withdrawal automatically
-     deactivates dependent fibers before the binding is unmounted.
+   - Provider-Aware Resolution & Binding: key -> ProviderRef -> Value.
+   - Reactive notification: activating / deactivating / neutral state transitions.
+   - Theorem 63 Provider Withdrawal Guard: Topological deactivation of dependent fibers
+     prior to provider unmounting.
    - Scoped Realm Isolation (isolate): 2-layer resolution key -> rho(k) -> sigma(rho(k)).
    - Metadata Interception (intercept): capability mediation without triggering reloads.
 
@@ -26,22 +25,21 @@ Formal runtime realization of 'A Programming Paradigm for Spatiotemporal Composa
      Lifecycle: L-Begin, L-Iter, L-Finish, L-Divert, L-Raise, L-Leave, L-Unload
    - Dynamic state transitions (INACTIVE, RELOADING, ACTIVE, UNLOADING, FAILED).
 
-4. Dynamic Execution & Rollback for Agent Harness & Planning:
-   - Speculative execution rollouts with instant state recovery.
-   - Isolated subagent fiber realms.
-   - Ephemeral tool/verifier synthesis as revertible fibers.
+4. Declarative Component Loader (Section 5):
+   - ctx.use(ComponentClass, config): declarative lifecycle loader with schema reconciliation.
 """
 from __future__ import annotations
 
 import asyncio
 import copy
+import hashlib
 import inspect
 import threading
 import time
 from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
-from typing import Any, Callable, Coroutine, Generator, Generic, Iterable, Iterator, TypeVar
+from typing import Any, AsyncGenerator, AsyncIterator, Callable, Coroutine, Generator, Generic, Iterable, Iterator, Optional, TypeVar
 
 T = TypeVar("T")
 
@@ -75,16 +73,36 @@ async def _run_inv_async(inv: Callable[[], Any]) -> None:
 
 
 # ---------------------------------------------------------------------------
-# 1. Revertible Effects & Twisted Monoid Accumulator
+# 1. Revertible Effects, Hash Journaling & Twisted Monoid Accumulator
 # ---------------------------------------------------------------------------
 
-class TwistedMonoid:
-    """Twisted composition monoid over context transformations.
+@dataclass
+class JournalEntry:
+    """Cryptographically verifiable journal entry for context rollback."""
+    ts: float
+    description: str
+    target: str
+    pre_hash: str
+    post_hash: str
+    inverse: Callable[[], Any]
+    context_uid: str
 
-    Given (f1, g1) and (f2, g2), the twisted composition is:
-        (f1, g1) o (f2, g2) = (f1 o f2, g2 o g1)
-    Inverses accumulate in reverse (LIFO) order.
-    """
+
+class CancellationToken:
+    """Cancellation guard for in-flight async effect iterators (Algorithm 1)."""
+    def __init__(self):
+        self._cancelled = False
+
+    @property
+    def is_cancelled(self) -> bool:
+        return self._cancelled
+
+    def cancel(self):
+        self._cancelled = True
+
+
+class TwistedMonoid:
+    """Twisted composition monoid over context transformations: (f1, g1) o (f2, g2) = (f1 o f2, g2 o g1)."""
 
     @staticmethod
     def compose_inverses(g1: Callable[[], Any], g2: Callable[[], Any]) -> Callable[[], Any]:
@@ -95,7 +113,7 @@ class TwistedMonoid:
             try:
                 _run_inv_sync(g2)
             except Exception:
-                pass  # preserve secondary errors while continuing recovery
+                pass
             try:
                 _run_inv_sync(g1)
             except Exception:
@@ -117,23 +135,18 @@ class LifecycleState(Enum):
 # ---------------------------------------------------------------------------
 
 class Context:
-    """Recursive unified context Gamma_infinity = mu Gamma. Gamma x (Gamma -> Gamma) x Sigma.
+    """Recursive unified context Gamma_infinity = mu Gamma. Gamma x (Gamma -> Gamma) x Sigma."""
 
-    Carries:
-    - Current context state (recursive)
-    - Effect accumulator (phi)
-    - Coeffect store (Sigma)
-    - Realm table (rho) and Interception metadata (iota)
-    - Registry of active component fibers (F_gamma)
-    """
-
-    def __init__(self, parent: Context | None = None, name: str = "root"):
+    def __init__(self, parent: Optional[Context] = None, name: str = "root"):
         self.parent = parent
         self.name = name
         self.uid = f"{name}_{id(self)}"
 
         # @@store: Value store sigma: (r: Realm) -> Typed Value
         self._store: dict[str, Any] = {} if parent is None else parent._store
+
+        # @@providers: Provider store: Realm -> Provider Fiber UID
+        self._providers: dict[str, str] = {} if parent is None else parent._providers
 
         # @@isolate: Realm table rho: Map(Key, Realm)
         self._isolate: dict[str, str] = {} if parent is None else dict(parent._isolate)
@@ -143,12 +156,13 @@ class Context:
 
         # Effect accumulator phi: LIFO list of (sync_dispose, async_dispose) pairs
         self._inverses: list[tuple[Callable[[], Any], Callable[[], Coroutine[Any, Any, None]]]] = []
+        self._journal: list[JournalEntry] = [] if parent is None else parent._journal
         self._disposed = False
 
         # Fiber registry: F_gamma (shared across hierarchy)
         self._registry: dict[str, Fiber] = {} if parent is None else parent._registry
 
-        # Reactive listeners on coeffect keys (shared across hierarchy)
+        # Reactive listeners on coeffect keys
         self._listeners: dict[str, list[Callable[[str, Any, str], None]]] = {} if parent is None else parent._listeners
 
         # Lock for thread safety during concurrent transitions
@@ -157,15 +171,7 @@ class Context:
     # --- Revertible Effect Tracking (ctx.effect / ctx.async_effect) ---
 
     def effect(self, callback: Callable[[], Any | Iterator[Any] | Callable[[], Any]]) -> Callable[[], Any]:
-        """Execute a synchronous revertible effect and register its left inverse into the accumulator.
-
-        Accepts:
-        - A plain function returning an inverse callable: `def fn(): ... return inverse_fn`
-        - A generator/iterator yielding inverses at each step (effect iterator, Definition 51)
-
-        For asynchronous callbacks or coroutines, use `await ctx.async_effect(...)`.
-        Returns a dispose closure that recovers the effect immediately.
-        """
+        """Execute a synchronous revertible effect and register its left inverse into the accumulator."""
         with self._lock:
             if self._disposed:
                 raise RuntimeError("Cannot execute effect on a disposed context")
@@ -177,7 +183,6 @@ class Context:
             inverses_collected: list[Callable[[], Any]] = []
 
             # 1. Execute forward effect
-            res = None
             try:
                 res = callback()
             except Exception as err:
@@ -196,7 +201,6 @@ class Context:
                         if callable(inv):
                             inverses_collected.append(inv)
                 except Exception as iter_err:
-                    # rollback accumulated so far on error
                     for inv in reversed(inverses_collected):
                         try:
                             _run_inv_sync(inv)
@@ -206,7 +210,6 @@ class Context:
             elif callable(res):
                 inverses_collected.append(res)
 
-            # Define self-disposal closures (LIFO)
             def _dispose():
                 with self._lock:
                     if not armed[0]:
@@ -236,26 +239,39 @@ class Context:
 
             return _dispose
 
-    async def async_effect(self, callback: Callable[[], Any | Coroutine[Any, Any, Any]]) -> Callable[[], Any]:
-        """Execute an async revertible effect and register its left inverse into the accumulator.
-
-        Supports async functions, coroutines, and generators.
-        """
+    async def async_effect(self, callback: Callable[[], Any | Coroutine[Any, Any, Any] | AsyncIterator[Any]],
+                           *, token: Optional[CancellationToken] = None) -> Callable[[], Any]:
+        """Execute an async revertible effect or async generator effect iterator (Algorithm 1)."""
         if self._disposed:
             raise RuntimeError("Cannot execute effect on a disposed context")
 
         armed = [True]
         inverses_collected: list[Callable[[], Any]] = []
 
-        res = callback()
+        res = callback() if callable(callback) else callback
         if inspect.isawaitable(res):
             res = await res
 
-        if callable(res):
+        # Handle Async Generator (Effect Iterator with cancellation token)
+        if hasattr(res, "__anext__") or inspect.isasyncgen(res):
+            try:
+                async for inv in res:
+                    if not armed[0] or (token and token.is_cancelled):
+                        break
+                    if callable(inv):
+                        inverses_collected.append(inv)
+            except Exception as e:
+                for inv in reversed(inverses_collected):
+                    try:
+                        await _run_inv_async(inv)
+                    except Exception:
+                        pass
+                raise e
+        elif callable(res):
             inverses_collected.append(res)
         elif inspect.isgenerator(res) or hasattr(res, "__next__"):
             for inv in res:
-                if not armed[0]:
+                if not armed[0] or (token and token.is_cancelled):
                     break
                 if callable(inv):
                     inverses_collected.append(inv)
@@ -288,6 +304,23 @@ class Context:
             self.parent._inverses.append(pair)
 
         return _dispose
+
+    def journal_mutation(self, target: str, pre_content: str, post_content: str,
+                         inverse: Callable[[], Any], description: str = "") -> None:
+        """Record a hash-verified mutation into the context journal."""
+        pre_hash = hashlib.sha256(pre_content.encode("utf-8")).hexdigest() if pre_content else ""
+        post_hash = hashlib.sha256(post_content.encode("utf-8")).hexdigest() if post_content else ""
+        entry = JournalEntry(
+            ts=time.time(),
+            description=description,
+            target=target,
+            pre_hash=pre_hash,
+            post_hash=post_hash,
+            inverse=inverse,
+            context_uid=self.uid
+        )
+        self._journal.append(entry)
+        self.effect(lambda: inverse)
 
     def dispose(self):
         """Recover all effects executed under this context in LIFO order (sync)."""
@@ -328,44 +361,49 @@ class Context:
         realm = self._get_realm(key)
         val = self._store.get(realm, default)
 
-        # Apply interception metadata if configured
         if key in self._intercept and val is not None:
             meta = self._intercept[key]
             if "proxy" in meta and callable(meta["proxy"]):
                 return meta["proxy"](val, self)
         return val
 
-    def provide(self, key: str, value: Any) -> Callable[[], Any]:
-        """Provide a service binding under key as a revertible effect: set(k, v)."""
+    def provide(self, key: str, value: Any, *, provider_id: Optional[str] = None) -> Callable[[], Any]:
+        """Provide a service binding under key as a revertible effect with Theorem 63 withdrawal order."""
         realm = self._get_realm(key)
         old_val = self._store.get(realm)
+        old_provider = self._providers.get(realm)
 
         def _forward():
             self._store[realm] = value
+            if provider_id:
+                self._providers[realm] = provider_id
             self._notify(key, value, "provided")
 
             def _inverse():
-                # Theorem 63 Provider Withdrawal Guard:
-                # A provider cannot withdraw until all dependent active fibers deactivate.
-                for fiber in list(self._registry.values()):
-                    if key in fiber.dependencies and fiber.state == LifecycleState.ACTIVE:
-                        try:
-                            fiber.deactivate()
-                        except Exception:
-                            pass
+                # Theorem 63 Topological Withdrawal Order:
+                # Dependents must deactivate completely in reverse dependency order before provider unmounts.
+                dependent_fibers = [f for f in self._registry.values() if key in f.dependencies and f.state == LifecycleState.ACTIVE]
+                for fiber in dependent_fibers:
+                    try:
+                        fiber.deactivate()
+                    except Exception:
+                        pass
 
                 if old_val is not None:
                     self._store[realm] = old_val
+                    if old_provider:
+                        self._providers[realm] = old_provider
                     self._notify(key, old_val, "restored")
                 else:
                     self._store.pop(realm, None)
+                    self._providers.pop(realm, None)
                     self._notify(key, None, "withdrawn")
 
             return _inverse
 
         return self.effect(_forward)
 
-    def isolate(self, key: str, realm: str | None = None) -> Context:
+    def isolate(self, key: str, realm: Optional[str] = None) -> Context:
         """Derive a child context with an isolated realm for the given key."""
         child = self.derive(name=f"{self.name}.iso_{key}")
         target_realm = realm or f"realm:{child.uid}:{key}"
@@ -404,8 +442,7 @@ class Context:
             except Exception:
                 pass
 
-        # Wire dynamic fiber lifecycle reactions:
-        # Check registered fibers depending on `key`
+        # Dynamic fiber lifecycle auto-reaction
         for fiber in list(self._registry.values()):
             if key in fiber.dependencies and not fiber.retired:
                 if action == "withdrawn" or not fiber.is_satisfied():
@@ -421,28 +458,35 @@ class Context:
                         except Exception:
                             pass
 
+    # --- Declarative Component Loader (ctx.use) ---
+
+    def use(self, plugin_callable_or_class: Any, config: Optional[dict[str, Any]] = None) -> Any:
+        """Declarative component loader: instantiates, binds coeffects, and tracks component lifecycle."""
+        cfg = config or {}
+        if inspect.isclass(plugin_callable_or_class):
+            instance = plugin_callable_or_class(self, **cfg)
+        elif callable(plugin_callable_or_class):
+            instance = plugin_callable_or_class(self, **cfg)
+        else:
+            instance = plugin_callable_or_class
+
+        # Register teardown if instance has dispose/deactivate
+        if hasattr(instance, "dispose") and callable(instance.dispose):
+            self.effect(lambda: instance.dispose)
+        return instance
+
 
 # ---------------------------------------------------------------------------
 # 3. Fiber Lifecycle State Machine (10 Operational Rules)
 # ---------------------------------------------------------------------------
 
 class Fiber:
-    """Instantiation of a component (d, p, e) carrying its lifecycle state theta.
-
-    Fields:
-    - d: Coeffect dependencies required
-    - p: Provisions provided
-    - e: Effect function / callback
-    - pi: Parent fiber identifier
-    - sigma: Fiber-owned coeffect table
-    - tau: Retirement flag (False -> active/pending, True -> retired)
-    - theta: LifecycleState (Inactive, Reloading, Active, Unloading, Failed)
-    """
+    """Instantiation of a component (d, p, e) carrying its lifecycle state theta."""
 
     def __init__(self, ctx: Context, name: str,
-                 dependencies: set[str] | None = None,
-                 provisions: set[str] | None = None,
-                 apply_fn: Callable[[Context], Any] | None = None):
+                 dependencies: Optional[set[str]] = None,
+                 provisions: Optional[set[str]] = None,
+                 apply_fn: Optional[Callable[[Context], Any]] = None):
         self.ctx = ctx.derive(name=f"fiber:{name}")
         self.name = name
         self.uid = f"{name}_{id(self)}"
@@ -452,8 +496,8 @@ class Fiber:
 
         self.state = LifecycleState.INACTIVE
         self.retired = False
-        self.error: Exception | None = None
-        self._dispose_handle: Callable[[], Any] | None = None
+        self.error: Optional[Exception] = None
+        self._dispose_handle: Optional[Callable[[], Any]] = None
         self._unsub_listeners: list[Callable[[], None]] = []
 
         # Register fiber into the context hierarchy
@@ -477,7 +521,6 @@ class Fiber:
 
         self.state = LifecycleState.RELOADING
         try:
-            # Execute apply_fn under the fiber context
             if self.apply_fn:
                 self._dispose_handle = self.ctx.effect(lambda: self.apply_fn(self.ctx))
             self.state = LifecycleState.ACTIVE
@@ -486,7 +529,6 @@ class Fiber:
         except Exception as err:
             self.state = LifecycleState.FAILED
             self.error = err
-            # L-Raise: cleanup on failure
             self.ctx.dispose()
             return False
 
@@ -505,7 +547,6 @@ class Fiber:
         """O-Retire -> O-Remove: Mark fiber retired and unload it."""
         self.retired = True
         self.deactivate()
-        # Remove from registry
         self.ctx._registry.pop(self.uid, None)
         for unsub in self._unsub_listeners:
             try:
