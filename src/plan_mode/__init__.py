@@ -38,7 +38,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-__version__ = "0.13.0"
+__version__ = "0.14.0"
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 DEFAULT_PLANS_DIR = Path(os.environ.get("PLAN_PLANS_DIR") or (Path.cwd() / "plans"))
@@ -185,7 +185,8 @@ async def judge_ensemble(session: dict[str, Any] | str, plan_text: str, objectiv
     baseline = {"ok": True,
                 "verdict": "go" if (v["ok"] and si["executable_plan"]) else "rework",
                 "feasibility_0_100": 100 if (v["ok"] and si["executable_plan"]) else 40,
-                "falsifiable_criteria": True, "judge_path": "local-deterministic-fallback"}
+                "falsifiable_criteria": True, "judge_path": "local-deterministic-fallback",
+                "source": "mechanical_baseline", "external": False}
     votes: list[dict[str, Any]] = [baseline]
     try:
         j = await judge(plan_text, objective)
@@ -669,14 +670,16 @@ def best(session: dict[str, Any] | str, *, plans_dir: str | Path | None = None) 
 
 def release(session: dict[str, Any] | str, *, min_score: float = 90.0,
             require_judge: bool = True,
+            require_external_judge: bool = False,
             plans_dir: str | Path | None = None) -> dict[str, Any]:
     """Release gate (2602.08948 confidence-gated checkpoints, 2608.10729
     acceptance thresholds): a plan may only be released to execution after
     ALL of: (1) the assess loop has converged, (2) best score >= min_score,
-    (3) verify() is clean, (4) the simulation executes end-to-end, and
-    (5) the external judge has returned verdict "go" with falsifiable
-    criteria. Until then the plan keeps looping. Returns the gate report;
-    the plan must NOT be reported as done while ok is False.
+    (3) mechanical checks are clean (dates, deadlines, duplicates),
+    (4) verify() is clean, (5) ground_check() feasibility is satisfied,
+    (6) the simulation executes end-to-end, and (7) the judge has returned
+    verdict "go" with falsifiable criteria. Until then the plan keeps looping.
+    Returns the gate report; the plan must NOT be reported as done while ok is False.
     """
     if isinstance(session, str):
         plans_dir = Path(plans_dir) if plans_dir else DEFAULT_PLANS_DIR
@@ -704,6 +707,14 @@ def release(session: dict[str, Any] | str, *, min_score: float = 90.0,
     if s.get("best_version") and s.get("rounds"):
         best_round = s["rounds"][s["best_version"] - 1]
         best_text = best_round.get("plan_text", "")
+
+    # Re-run canonical mechanical checks (deadlines, dates, task numbering, duplicates)
+    mech = _mechanical_checks(best_text) if best_text else [{"id": "mech:empty", "hint": "no best plan yet"}]
+    checks.append({"name": "mechanical", "ok": not mech,
+                   "detail": str([c["hint"] for c in mech])[:120]})
+    if mech:
+        problems.extend([c["hint"] for c in mech])
+
     v = verify(best_text) if best_text else {"ok": False, "errors": ["no best plan yet"]}
     checks.append({"name": "verify", "ok": v["ok"], "detail": str(v["errors"])[:120]})
     if not v["ok"]:
@@ -735,11 +746,17 @@ def release(session: dict[str, Any] | str, *, min_score: float = 90.0,
                 break
     if matching_judge:
         j = matching_judge
-        judge_ok = bool(j.get("ok") and j.get("verdict") == "go" and j.get("falsifiable_criteria"))
-        judge_detail = f"round={j.get('round_version')} verdict={j.get('verdict')} feasibility={j.get('feasibility_0_100')} falsifiable={j.get('falsifiable_criteria')}"
+        is_go = bool(j.get("ok") and j.get("verdict") == "go" and j.get("falsifiable_criteria"))
+        if require_external_judge:
+            is_external = bool(j.get("external", True) and j.get("source") != "mechanical_baseline")
+            judge_ok = is_go and is_external
+            judge_detail = f"round={j.get('round_version')} verdict={j.get('verdict')} source={j.get('source', 'external')} external={is_external}"
+        else:
+            judge_ok = is_go
+            judge_detail = f"round={j.get('round_version')} verdict={j.get('verdict')} source={j.get('source', 'unknown')} feasibility={j.get('feasibility_0_100')}"
     checks.append({"name": "judge", "ok": judge_ok or not require_judge, "detail": judge_detail})
     if require_judge and not judge_ok:
-        problems.append("external judge has not returned go/falsifiable; run plan.judge + record_judge, fix blockers, re-assess")
+        problems.append("judge gate not passed; run plan.judge + record_judge, fix blockers, re-assess")
 
     ok = all(c["ok"] for c in checks)
     report = {"ok": ok, "checks": checks, "problems": problems}
@@ -1345,17 +1362,21 @@ def assess_candidates(session: dict[str, Any] | str, drafts: list[str],
                       *, notes: list[str] | None = None,
                       plans_dir: str | Path | None = None) -> dict[str, Any]:
     """Best-of-N plan selection (2601.17942 plan ensembles, 2509.00084
-    candidate comparison): score every candidate draft, record each, and
-    keep the best as this round's version. Returns the assess result of the
-    winning candidate plus the full ranking."""
-    plans_dir = Path(plans_dir) if plans_dir else DEFAULT_PLANS_DIR
-    s = _load_session(plans_dir, session) if isinstance(session, str) else session
+    candidate comparison): score every candidate draft against the full
+    pipeline (rubric + mechanical + verify + feasibility + simulation),
+    and keep the best executable plan as this round's version.
+    Returns the assess result of the winning candidate plus the full ranking."""
+    if isinstance(session, str):
+        plans_dir = Path(plans_dir) if plans_dir else DEFAULT_PLANS_DIR
+        s = _load_session(plans_dir, session)
+    else:
+        s = session
+        plans_dir = Path(plans_dir) if plans_dir else Path(s.get("plans_dir") or DEFAULT_PLANS_DIR)
     if not drafts:
         raise ValueError("drafts must be non-empty")
     scored = []
     for i, d in enumerate(drafts):
         note = (notes or [None] * len(drafts))[i]
-        # score without committing: reuse _score + mech + verify logic inline
         rubric = s.get("rubric_snapshot") or _load_rubric()
         res = _score(d, rubric)
         res["critiques"] = res["critiques"] + _mechanical_checks(d)
@@ -1363,12 +1384,45 @@ def assess_candidates(session: dict[str, Any] | str, drafts: list[str],
         for err in v["errors"]:
             res["critiques"].append({"id": f"mech:verify:{err[:40]}", "section": "mechanical",
                                      "hint": err})
-        scored.append({"candidate": i, "note": note, "score": res["score"],
-                       "critiques": res["critiques"], "verify": v})
-    scored.sort(key=lambda x: -x["score"])
+        gc = ground_check(d)
+        sim = simulate(d, initial_state=set(gc.get("verified", [])))
+        for prob in sim.get("problems", []):
+            res["critiques"].append({"id": f"mech:sim:{prob[:40]}", "section": "mechanical",
+                                     "hint": f"Simulation failure: {prob}"})
+
+        # Calculate effective executable score: penalize simulation blocks and structural failures
+        effective_score = res["score"]
+        if not sim["executable_plan"]:
+            effective_score -= 30.0
+        if not v["ok"]:
+            effective_score -= 15.0 * len(v["errors"])
+        if not gc["ok"]:
+            effective_score -= 15.0
+
+        scored.append({
+            "candidate": i,
+            "note": note,
+            "score": res["score"],
+            "effective_score": round(max(0.0, effective_score), 2),
+            "sim_ok": sim["executable_plan"],
+            "verify_ok": v["ok"],
+            "feasibility_ok": gc["ok"],
+            "critiques": res["critiques"],
+            "verify": v,
+            "simulation": sim
+        })
+
+    # Sort primarily by effective_score (executable plans win over broken ones)
+    scored.sort(key=lambda x: -x["effective_score"])
     best_i = scored[0]["candidate"]
-    winner = assess(s, drafts[best_i], note=(notes or [None] * len(drafts))[best_i])
-    winner["ranking"] = [{"candidate": x["candidate"], "score": x["score"]} for x in scored]
+    winner = assess(s, drafts[best_i], note=(notes or [None] * len(drafts))[best_i], plans_dir=plans_dir)
+    winner["ranking"] = [{
+        "candidate": x["candidate"],
+        "score": x["score"],
+        "effective_score": x["effective_score"],
+        "sim_ok": x["sim_ok"],
+        "verify_ok": x["verify_ok"]
+    } for x in scored]
     winner["candidates_scored"] = len(drafts)
     return winner
 
@@ -1462,8 +1516,12 @@ def search_backtrack(session: dict[str, Any] | str, node_id: str,
     """Backtrack to an earlier node (LATS 2310.04406): mark it as the active
     expansion frontier so a plateaued branch is abandoned and the tree
     re-expands from the ancestor."""
-    plans_dir = Path(plans_dir) if plans_dir else DEFAULT_PLANS_DIR
-    s = _load_session(plans_dir, session) if isinstance(session, str) else session
+    if isinstance(session, str):
+        plans_dir = Path(plans_dir) if plans_dir else DEFAULT_PLANS_DIR
+        s = _load_session(plans_dir, session)
+    else:
+        s = session
+        plans_dir = Path(plans_dir) if plans_dir else Path(s.get("plans_dir") or DEFAULT_PLANS_DIR)
     st = _search_state(s)
     nodes = st["nodes"]
     if node_id not in nodes:
@@ -1477,8 +1535,12 @@ def search_backtrack(session: dict[str, Any] | str, node_id: str,
 def search_report(session: dict[str, Any] | str,
                   plans_dir: str | Path | None = None) -> dict[str, Any]:
     """Tree state summary (GATS 2607.08894: explicit world-model/tree audit)."""
-    plans_dir = Path(plans_dir) if plans_dir else DEFAULT_PLANS_DIR
-    s = _load_session(plans_dir, session) if isinstance(session, str) else session
+    if isinstance(session, str):
+        plans_dir = Path(plans_dir) if plans_dir else DEFAULT_PLANS_DIR
+        s = _load_session(plans_dir, session)
+    else:
+        s = session
+        plans_dir = Path(plans_dir) if plans_dir else Path(s.get("plans_dir") or DEFAULT_PLANS_DIR)
     st = _search_state(s)
     nodes = st["nodes"]
     depth = {}
@@ -1512,11 +1574,11 @@ def provide_tool(key: str, value: Any) -> Callable[[], Any]:
     return get_root_context().provide(key, value)
 
 
-def execute_plan(plan_text: str,
-                 task_handlers: dict[int, Callable[[Context], Any]] | None = None,
-                 *, dry_run: bool = False,
-                 continue_on_error: bool = False,
-                 context: Context | None = None) -> dict[str, Any]:
+async def execute_plan(plan_text: str,
+                       task_handlers: dict[int, Callable[[Context], Any]] | None = None,
+                       *, dry_run: bool = False,
+                       continue_on_error: bool = False,
+                       context: Context | None = None) -> dict[str, Any]:
     """Execute plan tasks transactionally with Cordis Revertible Fibers (Theorem 61, 63).
 
     Each task runs inside a managed fiber context. Side effects are tracked in
@@ -1548,11 +1610,7 @@ def execute_plan(plan_text: str,
                 if handler:
                     res = handler(task_ctx)
                     if inspect.isawaitable(res):
-                        try:
-                            loop = asyncio.get_running_loop()
-                            res = asyncio.run_coroutine_threadsafe(res, loop).result(timeout=10)
-                        except RuntimeError:
-                            res = asyncio.run(res)
+                        res = await res
                 else:
                     res = {"status": "success", "task": t}
                 task_results[t] = res
@@ -1572,7 +1630,7 @@ def execute_plan(plan_text: str,
         error_msg = str(err)
         if not continue_on_error:
             # Auto-rollback all executed tasks in twisted monoid order
-            ctx.dispose()
+            await ctx.async_dispose()
             return {
                 "ok": False,
                 "error": error_msg,
@@ -1589,6 +1647,27 @@ def execute_plan(plan_text: str,
                 "executed_tasks": executed_tasks,
                 "recovered": False
             }
+
+
+def execute_plan_sync(plan_text: str,
+                      task_handlers: dict[int, Callable[[Context], Any]] | None = None,
+                      *, dry_run: bool = False,
+                      continue_on_error: bool = False,
+                      context: Context | None = None) -> dict[str, Any]:
+    """Synchronous wrapper for execute_plan."""
+    try:
+        loop = asyncio.get_running_loop()
+        import concurrent.futures
+        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+            return pool.submit(lambda: asyncio.run(execute_plan(
+                plan_text, task_handlers, dry_run=dry_run,
+                continue_on_error=continue_on_error, context=context
+            ))).result()
+    except RuntimeError:
+        return asyncio.run(execute_plan(
+            plan_text, task_handlers, dry_run=dry_run,
+            continue_on_error=continue_on_error, context=context
+        ))
 
 
 def speculative_rollout(plan_text: str,
@@ -1611,5 +1690,5 @@ __all__ = ["start", "assess", "assess_candidates", "run", "status", "history", "
            "plan_dag", "simulate", "plan_quality", "edit_file", "rollback", "deps_check",
            "search_expand", "search_select", "search_backtrack", "search_report", "search",
            "Context", "Fiber", "LifecycleState", "TwistedMonoid", "get_root_context", "reset_root_context",
-           "create_subagent_context", "provide_tool", "execute_plan", "speculative_rollout",
+           "create_subagent_context", "provide_tool", "execute_plan", "execute_plan_sync", "speculative_rollout",
            "DEFAULT_PLANS_DIR", "RUBRIC_PATH", "REPO_ROOT", "__version__"]

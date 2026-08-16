@@ -8,7 +8,7 @@ Formal runtime realization of 'A Programming Paradigm for Spatiotemporal Composa
    - Twisted composition monoid T_Gamma: (f1, g1) o (f2, g2) = (f1 o f2, g2 o g1).
    - Accumulator phi rolls up inverses in LIFO order for complete context recovery.
    - Step-boundary effect iterators with cancellation guards (Algorithm 1).
-   - Full support for sync and async effect callbacks and inverses.
+   - Explicit sync effect (ctx.effect) and async effect (ctx.async_effect) pipelines.
 
 2. Reactive Coeffects (Section 3.2):
    - Partial dependent coeffect context Sigma: (k: K) -> V_k.
@@ -154,21 +154,24 @@ class Context:
         # Lock for thread safety during concurrent transitions
         self._lock = threading.RLock()
 
-    # --- Revertible Effect Tracking (ctx.effect) ---
+    # --- Revertible Effect Tracking (ctx.effect / ctx.async_effect) ---
 
     def effect(self, callback: Callable[[], Any | Iterator[Any] | Callable[[], Any]]) -> Callable[[], Any]:
-        """Execute a revertible effect and register its left inverse into the accumulator.
+        """Execute a synchronous revertible effect and register its left inverse into the accumulator.
 
         Accepts:
         - A plain function returning an inverse callable: `def fn(): ... return inverse_fn`
         - A generator/iterator yielding inverses at each step (effect iterator, Definition 51)
-        - An async or sync callback
 
+        For asynchronous callbacks or coroutines, use `await ctx.async_effect(...)`.
         Returns a dispose closure that recovers the effect immediately.
         """
         with self._lock:
             if self._disposed:
                 raise RuntimeError("Cannot execute effect on a disposed context")
+
+            if inspect.iscoroutinefunction(callback):
+                raise TypeError("Cannot pass an async function/coroutine to sync ctx.effect(). Use 'await ctx.async_effect(...)' instead.")
 
             armed = [True]
             inverses_collected: list[Callable[[], Any]] = []
@@ -177,16 +180,12 @@ class Context:
             res = None
             try:
                 res = callback()
-                if inspect.isawaitable(res):
-                    try:
-                        loop = asyncio.get_running_loop()
-                        # If in running async loop, schedule
-                        loop.create_task(res)
-                    except RuntimeError:
-                        res = asyncio.run(res)
             except Exception as err:
                 self._disposed = False
                 raise err
+
+            if inspect.isawaitable(res):
+                raise TypeError("ctx.effect() callback returned an awaitable/coroutine. Use 'await ctx.async_effect(...)' instead.")
 
             # Handle generator / iterator (Effect Iterator)
             if inspect.isgenerator(res) or hasattr(res, "__next__"):
@@ -231,17 +230,17 @@ class Context:
                             pass
 
             pair = (_dispose, _dispose_async)
-            # Prepend to context accumulator
             self._inverses.append(pair)
-
-            # If this is a child context, chain into parent
             if self.parent is not None:
                 self.parent._inverses.append(pair)
 
             return _dispose
 
     async def async_effect(self, callback: Callable[[], Any | Coroutine[Any, Any, Any]]) -> Callable[[], Any]:
-        """Async variant of effect execution."""
+        """Execute an async revertible effect and register its left inverse into the accumulator.
+
+        Supports async functions, coroutines, and generators.
+        """
         if self._disposed:
             raise RuntimeError("Cannot execute effect on a disposed context")
 
@@ -254,6 +253,12 @@ class Context:
 
         if callable(res):
             inverses_collected.append(res)
+        elif inspect.isgenerator(res) or hasattr(res, "__next__"):
+            for inv in res:
+                if not armed[0]:
+                    break
+                if callable(inv):
+                    inverses_collected.append(inv)
 
         def _dispose():
             with self._lock:
@@ -285,7 +290,7 @@ class Context:
         return _dispose
 
     def dispose(self):
-        """Recover all effects executed under this context in LIFO order."""
+        """Recover all effects executed under this context in LIFO order (sync)."""
         with self._lock:
             if self._disposed:
                 return

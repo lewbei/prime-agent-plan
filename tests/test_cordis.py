@@ -156,7 +156,8 @@ def test_fiber_lifecycle_state_machine():
     assert isinstance(fiber_failing.error, ValueError)
 
 
-def test_execute_plan_transactional_success():
+@pytest.mark.asyncio
+async def test_execute_plan_transactional_success():
     """Verify execute_plan runs all tasks cleanly."""
     plan_text = """# Sample Plan
     1. Task One: Initialize
@@ -167,22 +168,23 @@ def test_execute_plan_transactional_success():
     """
     trace = []
 
-    def h1(c):
+    async def h1(c):
         trace.append("t1_run")
         return {"done": 1}
 
-    def h2(c):
+    async def h2(c):
         trace.append("t2_run")
         return {"done": 2}
 
-    res = execute_plan(plan_text, task_handlers={1: h1, 2: h2})
+    res = await execute_plan(plan_text, task_handlers={1: h1, 2: h2})
     assert res["ok"] is True
     assert res["executed_tasks"] == [1, 2]
     assert trace == ["t1_run", "t2_run"]
     assert res["recovered"] is False
 
 
-def test_execute_plan_transactional_rollback_on_failure():
+@pytest.mark.asyncio
+async def test_execute_plan_transactional_rollback_on_failure():
     """Verify that failure at Task 2 automatically inverts Task 1 side effects in LIFO order."""
     plan_text = """# Sample Plan
     1. Task One: Setup
@@ -193,16 +195,16 @@ def test_execute_plan_transactional_rollback_on_failure():
     """
     disk_state = []
 
-    def task1_handler(task_ctx):
+    async def task1_handler(task_ctx):
         # Register a revertible file mutation
         disk_state.append("setup.txt")
-        task_ctx.effect(lambda: lambda: disk_state.remove("setup.txt"))
+        await task_ctx.async_effect(lambda: lambda: disk_state.remove("setup.txt"))
         return {"created": "setup.txt"}
 
-    def task2_handler(task_ctx):
+    async def task2_handler(task_ctx):
         raise RuntimeError("Task 2 build error!")
 
-    res = execute_plan(plan_text, task_handlers={1: task1_handler, 2: task2_handler})
+    res = await execute_plan(plan_text, task_handlers={1: task1_handler, 2: task2_handler})
     assert res["ok"] is False
     assert res["failed_task"] == 2
     assert res["recovered"] is True
@@ -292,3 +294,14 @@ def test_cordis_theorem_63_provider_withdrawal_order():
     assert "consumer_deactivated" in order_of_events
     assert fiber.state == LifecycleState.INACTIVE
     assert ctx.get("service:auth") is None
+
+
+def test_cordis_effect_rejects_async_callback_type_safety():
+    """Verify that ctx.effect() raises TypeError if passed an async callback."""
+    ctx = Context(name="test_type_safety")
+
+    async def async_cb():
+        return lambda: None
+
+    with pytest.raises(TypeError, match="Use 'await ctx.async_effect"):
+        ctx.effect(async_cb)

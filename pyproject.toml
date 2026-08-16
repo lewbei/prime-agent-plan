@@ -1,13 +1,13 @@
 [project]
 name = "plan"
-version = "0.1.0"
+version = "0.14.0"
 description = "Plan mode - iterative self-improving plan synthesis, rubric scoring, STRIPS simulation, MCTS search, and Cordis spatiotemporal composability runtime."
 readme = "README.md"
+license = { text = "MIT" }
 requires-python = ">=3.10"
-dependencies = []
-
-[project.scripts]
-plan = "rlm.skill:cli"
+dependencies = [
+    "httpx>=0.24.0",
+]
 
 [build-system]
 requires = ["hatchling"]

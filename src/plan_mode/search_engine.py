@@ -302,8 +302,12 @@ async def search(session: dict[str, Any] | str, *,
     expansion keeping top beam_width plans per level.
     """
     from . import DEFAULT_PLANS_DIR, _load_session, _save_session
-    plans_dir = Path(plans_dir) if plans_dir else DEFAULT_PLANS_DIR
-    s = _load_session(plans_dir, session) if isinstance(session, str) else session
+    if isinstance(session, str):
+        plans_dir = Path(plans_dir) if plans_dir else DEFAULT_PLANS_DIR
+        s = _load_session(plans_dir, session)
+    else:
+        s = session
+        plans_dir = Path(plans_dir) if plans_dir else Path(s.get("plans_dir") or DEFAULT_PLANS_DIR)
     rubric = s.get("rubric_snapshot") or _engine()[0]()
     t = _tree(s)
     nodes = t["nodes"]

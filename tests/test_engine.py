@@ -1,3 +1,4 @@
+import pytest
 """Engine v0.6 tests: folding, root-cause grouping, compat load, adaptive search."""
 import json
 from pathlib import Path
@@ -503,3 +504,93 @@ def test_release_respects_custom_plans_dir_and_binds_judge_version(tmp_path):
     # Judge check should pass because round 1 judge verdict exists
     judge_check = next(c for c in rel["checks"] if c["name"] == "judge")
     assert judge_check["ok"] is True
+
+
+@pytest.mark.asyncio
+async def test_search_engine_respects_custom_plans_dir(tmp_path):
+    """Verify search() with a live session dict respects custom plans_dir."""
+    s = plan_mode.start("Search custom dir test", plans_dir=tmp_path)
+    plan_mode.assess(s, "1. Init\nOutput: a.txt", plans_dir=tmp_path)
+
+    # Run search with session dict
+    result = await plan_mode.search(s, iterations=2, width=1, mode="beam", expansion="rules", plans_dir=tmp_path)
+    assert result["nodes"] >= 1
+    # Check that session file was updated in tmp_path
+    assert (tmp_path / f"{s['session_id']}.json").exists()
+
+
+def test_assess_candidates_prioritizes_executable_over_simulation_blocked(tmp_path):
+    """Verify assess_candidates ranks an executable candidate above a simulation-blocked one."""
+    s = plan_mode.start("Candidate ranking test", plans_dir=tmp_path)
+
+    # Candidate 1: valid sequence
+    cand_valid = """# Objective
+    Goal: Build a working data pipeline.
+    1. Extract
+       Output: raw.csv
+    2. Transform
+       Depends on 1
+       Inputs: raw.csv
+       Output: clean.csv
+    """
+
+    # Candidate 2: broken forward reference (fails simulation)
+    cand_blocked = """# Objective
+    Goal: Build a working data pipeline.
+    1. Transform
+       Depends on 2
+       Inputs: raw.csv
+       Output: clean.csv
+    2. Extract
+       Output: raw.csv
+    """
+
+    winner = plan_mode.assess_candidates(s, [cand_blocked, cand_valid], plans_dir=tmp_path)
+    # The valid candidate (index 1) should win
+    assert winner["ranking"][0]["candidate"] == 1
+    assert winner["ranking"][0]["sim_ok"] is True
+    assert winner["ranking"][1]["sim_ok"] is False
+
+
+def test_release_gate_fails_on_past_deadline(tmp_path):
+    """Verify release() gate fails if the plan contains a past deadline date."""
+    s = plan_mode.start("Past deadline test", plans_dir=tmp_path)
+    plan_past = """
+    1. Task 1
+       Output: out.txt
+       Deadline: by 2020-01-01
+    """
+    plan_mode.assess(s, plan_past, plans_dir=tmp_path)
+    s["status"] = "converged"
+    s["best_score"] = 95.0
+
+    gate = plan_mode.release(s, min_score=90.0, require_judge=False, plans_dir=tmp_path)
+    assert gate["ok"] is False
+    mech_check = next(c for c in gate["checks"] if c["name"] == "mechanical")
+    assert mech_check["ok"] is False
+    assert any("in the past" in p for p in gate["problems"])
+
+
+def test_release_gate_distinguishes_external_judge(tmp_path):
+    """Verify require_external_judge=True rejects local baseline heuristic verdicts."""
+    s = plan_mode.start("Judge mode test", plans_dir=tmp_path)
+    plan_text = "1. Setup\nOutput: a.txt"
+    plan_mode.assess(s, plan_text, plans_dir=tmp_path)
+    s["status"] = "converged"
+    s["best_score"] = 95.0
+
+    # Record local baseline verdict (external = False)
+    plan_mode.record_judge(s, {
+        "ok": True, "verdict": "go", "falsifiable_criteria": True,
+        "source": "mechanical_baseline", "external": False
+    }, round_version=1, plans_dir=tmp_path)
+
+    # Default release accepts it
+    gate_default = plan_mode.release(s, min_score=90.0, require_judge=True, require_external_judge=False, plans_dir=tmp_path)
+    judge_check = next(c for c in gate_default["checks"] if c["name"] == "judge")
+    assert judge_check["ok"] is True
+
+    # Strict external release rejects it
+    gate_strict = plan_mode.release(s, min_score=90.0, require_judge=True, require_external_judge=True, plans_dir=tmp_path)
+    judge_check_strict = next(c for c in gate_strict["checks"] if c["name"] == "judge")
+    assert judge_check_strict["ok"] is False
