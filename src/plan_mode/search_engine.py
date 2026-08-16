@@ -369,7 +369,10 @@ async def search(session: dict[str, Any] | str, *,
 
     if mode in ("ast", "evolutionary"):
         from .ast_search import ASTSearchEngine, PlanParser
-        engine = ASTSearchEngine(objective=s.get("objective", ""), initial_state=set(), source_plan_text=root_plan)
+        from . import ground_check
+        gc = ground_check(root_plan, cwd=Path(plans_dir).parent if plans_dir else None)
+        initial_state = set(gc.get("verified", []))
+        engine = ASTSearchEngine(objective=s.get("objective", ""), initial_state=initial_state, source_plan_text=root_plan)
         root_ast = PlanParser.parse_plan(root_plan, objective=s.get("objective", ""))
         root_member = engine.evaluate_ast(root_ast, lambda pt: _rollout(pt, rubric)["score"], source_plan_text=root_plan)
         engine.population = [root_member]

@@ -201,12 +201,14 @@ class ASTSearchEngine:
         """Evaluate a PlanAST: validates causal consistency, computes rubric score and effective fitness."""
         src_text = source_plan_text or self.source_plan_text
         if src_text and not ast.metadata.get("header_section"):
-            m_first = re.search(r"^\s*1[.)]\s+", source_plan_text, re.M)
+            m_first = re.search(r"^\s*1[.)]\s+", src_text, re.M)
             if m_first:
-                ast.metadata["header_section"] = source_plan_text[:m_first.start()].strip()
-            m_footer = re.search(r"^##\s+(?:Risks|Milestones|Rollback|Constraints|Verification)", source_plan_text, re.M)
+                raw_header = src_text[:m_first.start()].strip()
+                # Clean trailing "## Tasks" from header to avoid cosmetic duplication
+                ast.metadata["header_section"] = re.sub(r"##\s*Tasks\s*$", "", raw_header, flags=re.I | re.M).strip()
+            m_footer = re.search(r"^##\s+(?:Risks|Milestones|Rollback|Constraints|Verification)", src_text, re.M)
             if m_footer:
-                ast.metadata["footer_section"] = source_plan_text[m_footer.start():].strip()
+                ast.metadata["footer_section"] = src_text[m_footer.start():].strip()
 
         val = CausalValidator.validate(ast, self.initial_state)
         shash = self._state_hash(ast)
@@ -234,7 +236,8 @@ class ASTSearchEngine:
 
         task_lines = ["## Tasks"]
         for a in ast.actions:
-            task_lines.append(f"{a.id}. {a.name}")
+            clean_name = re.split(r"(?:output|produces?|writes?|deliverable)\s*:", a.name, flags=re.I)[0].strip().rstrip(".")
+            task_lines.append(f"{a.id}. {clean_name}")
             if a.depends_on:
                 task_lines.append(f"   Depends on: {', '.join(str(d) for d in a.depends_on)}")
             if a.inputs:

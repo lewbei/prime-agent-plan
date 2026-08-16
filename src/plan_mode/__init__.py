@@ -182,7 +182,7 @@ def _session_path(plans_dir: Path, session_id: str) -> Path:
 
 @contextmanager
 def session_lock(plans_dir: str | Path, session_id: str, timeout: float = 10.0):
-    """Acquire a thread and process-level file lock on a session for safe read-modify-write cycles."""
+    """Acquire a thread and process-level file lock on a session with strict timeout handling."""
     p_dir = Path(plans_dir)
     p_dir.mkdir(parents=True, exist_ok=True)
     lock_file = p_dir / f".{session_id}.lock"
@@ -190,12 +190,22 @@ def session_lock(plans_dir: str | Path, session_id: str, timeout: float = 10.0):
         try:
             import fcntl
             with open(lock_file, "a", encoding="utf-8") as f:
-                fcntl.flock(f.fileno(), fcntl.LOCK_EX)
+                start_time = time.time()
+                while True:
+                    try:
+                        fcntl.flock(f.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                        break
+                    except (BlockingIOError, OSError):
+                        if time.time() - start_time >= timeout:
+                            raise TimeoutError(f"Timed out after {timeout}s waiting for session lock: {lock_file}")
+                        time.sleep(0.02)
                 try:
                     yield
                 finally:
                     fcntl.flock(f.fileno(), fcntl.LOCK_UN)
-        except (ImportError, OSError):
+        except (ImportError, OSError) as err:
+            if isinstance(err, TimeoutError) or "Timed out after" in str(err):
+                raise err
             yield
 
 
@@ -1287,18 +1297,22 @@ def record_judge(session: dict[str, Any] | str, verdict: dict[str, Any], *,
                  round_version: int | None = None,
                  plans_dir: str | Path | None = None) -> dict[str, Any]:
     """Persist an external judge verdict (from plan_mode.judge) into the
-    session so feasibility audits are part of the recorded history."""
+    session with automatic session locking for read-modify-write safety."""
     if isinstance(session, str):
         plans_dir = Path(plans_dir) if plans_dir else DEFAULT_PLANS_DIR
         s = _load_session(plans_dir, session)
+        sid = session
     else:
         s = session
+        sid = s.get("session_id", "default")
         plans_dir = Path(plans_dir) if plans_dir else Path(s.get("plans_dir") or DEFAULT_PLANS_DIR)
-    ver = round_version if round_version is not None else s.get("best_version") or len(s.get("rounds", []))
-    entry = {"ts": _now(), "round_version": ver, **{k: v for k, v in verdict.items()}}
-    s.setdefault("judge_log", []).append(entry)
-    _save_session(plans_dir, s)
-    return entry
+
+    with session_lock(plans_dir, sid):
+        ver = round_version if round_version is not None else s.get("best_version") or len(s.get("rounds", []))
+        entry = {"ts": _now(), "round_version": ver, **{k: v for k, v in verdict.items()}}
+        s.setdefault("judge_log", []).append(entry)
+        _save_session(plans_dir, s)
+        return entry
 
 
 # ---------------------------------------------------------------------------

@@ -744,3 +744,21 @@ def test_session_lock_read_modify_write_protection(tmp_path):
     assert all(results)
     final_session = plan_mode._load_session(tmp_path, s["session_id"])
     assert len(final_session["worker_log"]) == 16
+
+
+def test_session_lock_timeout_raises_error(tmp_path):
+    """Verify session_lock raises TimeoutError when lock is held beyond timeout."""
+    from plan_mode import session_lock
+    import fcntl
+    lock_file = tmp_path / ".test_session.lock"
+
+    # Hold lock
+    f = open(lock_file, "a", encoding="utf-8")
+    fcntl.flock(f.fileno(), fcntl.LOCK_EX)
+    try:
+        with pytest.raises(TimeoutError, match="Timed out after"):
+            with session_lock(tmp_path, "test_session", timeout=0.1):
+                pass
+    finally:
+        fcntl.flock(f.fileno(), fcntl.LOCK_UN)
+        f.close()

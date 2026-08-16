@@ -97,3 +97,21 @@ Goal: Build a high-throughput stream ingestion pipeline.
     assert "10k events/sec throughput" in rendered
     assert "## Risks" in rendered
     assert "Setup Kafka" in rendered
+
+
+def test_ast_render_avoids_duplicate_task_headers():
+    """Verify render_plan does not duplicate ## Tasks header."""
+    plan_text = """# Objective
+Goal: Test clean rendering
+
+## Tasks
+1. Clean Task. Output: a.txt.
+"""
+    engine = ASTSearchEngine(objective="Test clean rendering", source_plan_text=plan_text)
+    ast = PlanParser.parse_plan(plan_text)
+    member = engine.evaluate_ast(ast)
+
+    # Must not contain duplicate ## Tasks
+    assert member.plan_text.count("## Tasks") == 1
+    # Must have clean task action name
+    assert "1. Clean Task" in member.plan_text
