@@ -89,4 +89,4 @@ __all__ = ["run", "start", "assess", "assess_candidates", "status", "history",
            "search", "log_progress", "suggest",
            "Context", "Fiber", "LifecycleState", "TwistedMonoid", "get_root_context",
            "reset_root_context", "create_subagent_context", "provide_tool",
-           "execute_plan", "ReplanningLadder", "RoTRuleBase", "ASTSearchEngine", "PlanParser", "CausalValidator", "ActionSchema", "execute_plan_sync", "speculative_rollout"]
+           "execute_plan", "ReplanningLadder", "RoTRuleBase", "ASTSearchEngine", "PlanParser", "CausalValidator", "ActionSchema", "execute_plan_sync", "speculative_rollout", "speculative_rollout_async"]

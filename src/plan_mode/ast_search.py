@@ -16,6 +16,7 @@ import hashlib
 import json
 import math
 import random
+import re
 from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, List, Optional, Set, Tuple
 
@@ -54,7 +55,6 @@ def crossover_ast(parent_a: PlanAST, parent_b: PlanAST) -> PlanAST:
     prefix = [copy.deepcopy(a) for a in parent_a.actions[:cut_a]]
 
     prefix_names = {a.name.lower() for a in prefix}
-    # Track mapping from old parent_b action id to new combined action id
     b_id_map: dict[int, int] = {}
     suffix: list[ActionSchema] = []
 
@@ -67,18 +67,13 @@ def crossover_ast(parent_a: PlanAST, parent_b: PlanAST) -> PlanAST:
             suffix.append(copied)
             current_new_id += 1
 
-    # Remap dependencies of suffix actions:
-    # If dep was in parent_b and present in child, map to b_id_map[dep].
-    # If dep was in parent_b prefix (replaced by parent_a prefix), map to boundary step of parent_a prefix.
     for action in suffix:
         remapped_deps: list[int] = []
         for old_dep in action.depends_on:
             if old_dep in b_id_map:
                 remapped_deps.append(b_id_map[old_dep])
             else:
-                # Dep was in parent_b's dropped prefix; anchor to the boundary of parent_a's prefix
                 remapped_deps.append(len(prefix))
-        # Ensure deps only point to earlier steps (no forward references)
         action.depends_on = sorted(set(d for d in remapped_deps if d < action.id))
 
     combined_actions = prefix + suffix
@@ -90,7 +85,8 @@ def crossover_ast(parent_a: PlanAST, parent_b: PlanAST) -> PlanAST:
         goal=parent_a.goal,
         actions=combined_actions,
         initial_state=parent_a.initial_state | parent_b.initial_state,
-        constraints=copy.deepcopy(parent_a.constraints)
+        constraints=copy.deepcopy(parent_a.constraints),
+        metadata=copy.deepcopy(parent_a.metadata)
     )
     return child
 
@@ -137,7 +133,6 @@ def mutate_flaw_directed(ast: PlanAST, validation_result: dict[str, Any]) -> Pla
     elif flaw_type == "type_mismatch":
         action = mutated.get_action(task_id)
         if action and action.inputs:
-            # Align input extension with declared producer output
             action.inputs = [re.sub(r"\.\w+$", ".json", inp) for inp in action.inputs]
 
     for i, a in enumerate(mutated.actions, 1):
@@ -201,8 +196,16 @@ class ASTSearchEngine:
         deps = tuple((a.id, tuple(a.depends_on)) for a in ast.actions)
         return hashlib.sha256(json.dumps([action_names, deps]).encode("utf-8")).hexdigest()
 
-    def evaluate_ast(self, ast: PlanAST, rubric_score_fn: Optional[Callable[[str], float]] = None) -> PopulationMember:
+    def evaluate_ast(self, ast: PlanAST, rubric_score_fn: Optional[Callable[[str], float]] = None, source_plan_text: str = "") -> PopulationMember:
         """Evaluate a PlanAST: validates causal consistency, computes rubric score and effective fitness."""
+        if source_plan_text and not ast.metadata.get("header_section"):
+            m_first = re.search(r"^\s*1[.)]\s+", source_plan_text, re.M)
+            if m_first:
+                ast.metadata["header_section"] = source_plan_text[:m_first.start()].strip()
+            m_footer = re.search(r"^##\s+(?:Risks|Milestones|Rollback|Constraints|Verification)", source_plan_text, re.M)
+            if m_footer:
+                ast.metadata["footer_section"] = source_plan_text[m_footer.start():].strip()
+
         val = CausalValidator.validate(ast, self.initial_state)
         shash = self._state_hash(ast)
 
@@ -223,26 +226,34 @@ class ASTSearchEngine:
         return member
 
     def render_plan(self, ast: PlanAST) -> str:
-        """Render a PlanAST into formatted markdown text."""
-        lines = [f"# Plan: {ast.goal}", ""]
-        lines.append("## Objective & Goal")
-        lines.append(f"Goal: {ast.goal}")
-        lines.append("")
-        lines.append("## Step-by-Step Tasks")
+        """Render a PlanAST into formatted markdown text preserving parent rubric sections."""
+        header = ast.metadata.get("header_section")
+        footer = ast.metadata.get("footer_section")
+
+        task_lines = ["## Tasks"]
         for a in ast.actions:
-            lines.append(f"{a.id}. {a.name}")
+            task_lines.append(f"{a.id}. {a.name}")
             if a.depends_on:
-                lines.append(f"   Depends on: {', '.join(str(d) for d in a.depends_on)}")
+                task_lines.append(f"   Depends on: {', '.join(str(d) for d in a.depends_on)}")
             if a.inputs:
-                lines.append(f"   Inputs: {', '.join(a.inputs)}")
+                task_lines.append(f"   Inputs: {', '.join(a.inputs)}")
             if a.outputs:
-                lines.append(f"   Outputs: {', '.join(a.outputs)}")
+                task_lines.append(f"   Output: {', '.join(a.outputs)}")
             if a.preconditions:
-                lines.append(f"   Preconditions: {', '.join(str(p) for p in a.preconditions)}")
+                task_lines.append(f"   Preconditions: {', '.join(str(p) for p in a.preconditions)}")
             if a.add_effects:
-                lines.append(f"   Effects: {', '.join(str(p) for p in a.add_effects)}")
-            lines.append(f"   Estimated Time: {a.duration_minutes:.0f} min | Cost: {a.cost:.0f} tokens")
-            lines.append("")
+                task_lines.append(f"   Effects: {', '.join(str(p) for p in a.add_effects)}")
+            task_lines.append(f"   Time: {a.duration_minutes:.0f} min | Cost: {a.cost:.0f} tokens")
+            task_lines.append("")
+        task_block = "\n".join(task_lines)
+
+        if header:
+            full_plan = header.strip() + "\n\n" + task_block
+            if footer:
+                full_plan += "\n\n" + footer.strip()
+            return full_plan
+
+        lines = [f"# Plan: {ast.goal}", "", "## Objective & Goal", f"Goal: {ast.goal}", "", task_block]
         return "\n".join(lines)
 
     def evolve_step(self, population_size: int = 4, rubric_score_fn: Optional[Callable[[str], float]] = None) -> list[PopulationMember]:

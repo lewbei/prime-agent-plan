@@ -425,3 +425,91 @@ def test_cordis_hash_journal_drift_detection(tmp_path):
     ctx.dispose()
     assert entry.drift_detected is True
     assert test_file.read_text() == "initial_state"
+
+
+def test_cordis_provider_stack_nested_withdrawal():
+    """Verify provider stack: withdrawing top provider restores previous provider binding."""
+    ctx = Context(name="stack_test")
+
+    # Provider 1
+    disp1 = ctx.provide("db", "pg_v1", provider_id="prov1")
+    assert ctx.get("db") == "pg_v1"
+
+    # Provider 2 overrides
+    disp2 = ctx.provide("db", "pg_v2", provider_id="prov2")
+    assert ctx.get("db") == "pg_v2"
+
+    # Withdraw provider 2 -> provider 1 should be restored
+    disp2()
+    assert ctx.get("db") == "pg_v1"
+
+    # Withdraw provider 1 -> db becomes None
+    disp1()
+    assert ctx.get("db") is None
+
+
+def test_cordis_journal_drift_abort_policy(tmp_path):
+    """Verify on_drift='abort' raises RuntimeError when external drift is detected."""
+    test_file = tmp_path / "abort_config.yaml"
+    test_file.write_text("v1")
+
+    ctx = Context(name="abort_drift_ctx")
+    ctx.journal_mutation(
+        target=str(test_file),
+        pre_content="v1",
+        post_content="v2",
+        inverse=lambda: test_file.write_text("v1"),
+        on_drift="abort"
+    )
+    test_file.write_text("v2")
+    # Simulate drift
+    test_file.write_text("unauthorized_v3")
+
+    with pytest.raises(RuntimeError, match="Rollback aborted: external state drift detected"):
+        ctx.dispose()
+
+
+@pytest.mark.asyncio
+async def test_execute_plan_task_timeout_and_rollback():
+    """Verify execute_plan with timeout_per_task rolls back hanging async tasks."""
+    plan_text = """
+    1. Fast Task
+       Output: fast.txt
+    2. Slow Hanging Task
+       Depends on 1
+       Output: slow.txt
+    """
+    trace = []
+
+    async def h1(c):
+        trace.append("t1_done")
+        await c.async_effect(lambda: lambda: trace.remove("t1_done"))
+        return {"fast": True}
+
+    async def h2_hanging(c):
+        await asyncio.sleep(5.0)  # simulate hang
+        return {"slow": True}
+
+    res = await execute_plan(plan_text, task_handlers={1: h1, 2: h2_hanging}, timeout_per_task=0.1)
+    assert res["ok"] is False
+    assert res["failed_task"] == 2
+    assert res["recovered"] is True
+    # Fast task effect must be undone
+    assert trace == []
+
+
+@pytest.mark.asyncio
+async def test_speculative_rollout_async_clean():
+    """Verify speculative_rollout_async scores with async evaluation function and recovers cleanly."""
+    from plan_mode import speculative_rollout_async
+    trace = []
+
+    async def async_eval(ctx):
+        trace.append("evaluated")
+        await ctx.async_effect(lambda: lambda: trace.remove("evaluated"))
+        return 96.0
+
+    res = await speculative_rollout_async("sample plan", async_eval)
+    assert res["ok"] is True
+    assert res["score"] == 96.0
+    assert trace == []

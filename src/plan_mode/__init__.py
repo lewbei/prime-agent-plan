@@ -58,6 +58,7 @@ import shutil
 import math
 import os
 import re
+import threading
 import time
 from datetime import datetime, timezone
 from pathlib import Path
@@ -179,16 +180,47 @@ def _session_path(plans_dir: Path, session_id: str) -> Path:
     return Path(plans_dir) / f"{session_id}.json"
 
 
+_SESSION_LOCK = threading.RLock()
+
+
 def _load_session(plans_dir: Path, session_id: str) -> dict[str, Any]:
     p = _session_path(plans_dir, session_id)
     if not p.exists():
         raise FileNotFoundError(f"no plan session {session_id!r} in {plans_dir}")
-    return json.loads(p.read_text(encoding="utf-8"))
+    with _SESSION_LOCK:
+        try:
+            import fcntl
+            with open(p, "r", encoding="utf-8") as f:
+                fcntl.flock(f.fileno(), fcntl.LOCK_SH)
+                try:
+                    return json.load(f)
+                finally:
+                    fcntl.flock(f.fileno(), fcntl.LOCK_UN)
+        except (ImportError, OSError):
+            return json.loads(p.read_text(encoding="utf-8"))
 
 
 def _save_session(plans_dir: Path, session: dict[str, Any]) -> None:
+    plans_dir = Path(plans_dir)
+    plans_dir.mkdir(parents=True, exist_ok=True)
     p = _session_path(plans_dir, session["session_id"])
-    p.write_text(json.dumps(session, indent=2, ensure_ascii=False), encoding="utf-8")
+    tmp_path = plans_dir / f".{session['session_id']}.tmp.{os.getpid()}_{time.time_ns()}"
+    with _SESSION_LOCK:
+        with open(tmp_path, "w", encoding="utf-8") as f:
+            try:
+                import fcntl
+                fcntl.flock(f.fileno(), fcntl.LOCK_EX)
+            except (ImportError, OSError):
+                pass
+            json.dump(session, f, indent=2, ensure_ascii=False)
+            f.flush()
+            os.fsync(f.fileno())
+            try:
+                import fcntl
+                fcntl.flock(f.fileno(), fcntl.LOCK_UN)
+            except (ImportError, OSError):
+                pass
+        os.replace(tmp_path, p)
 
 
 async def judge_ensemble(session: dict[str, Any] | str, plan_text: str, objective: str,
@@ -422,7 +454,7 @@ def start(objective: str, *, plans_dir: str | Path | None = None, max_rounds: in
         "objective": objective,
         "created_at": _now(),
         "plans_dir": str(plans_dir),
-        "rubric_version": "v6",
+        "rubric_version": "v8",
         "engine_version": __version__,
         "rubric_snapshot": rubric,
         "max_rounds": max_rounds,
@@ -1661,6 +1693,7 @@ async def execute_plan(plan_text: str,
                        task_handlers: dict[int, Callable[[Context], Any]] | None = None,
                        *, dry_run: bool = False,
                        continue_on_error: bool = False,
+                       timeout_per_task: float | None = None,
                        context: Context | None = None) -> dict[str, Any]:
     """Execute plan tasks transactionally with Cordis Revertible Fibers (Theorem 61, 63).
 
@@ -1693,7 +1726,10 @@ async def execute_plan(plan_text: str,
                 if handler:
                     res = handler(task_ctx)
                     if inspect.isawaitable(res):
-                        res = await res
+                        if timeout_per_task is not None:
+                            res = await asyncio.wait_for(res, timeout=timeout_per_task)
+                        else:
+                            res = await res
                 else:
                     res = {"status": "success", "task": t}
                 task_results[t] = res
@@ -1753,6 +1789,20 @@ def execute_plan_sync(plan_text: str,
         ))
 
 
+async def speculative_rollout_async(plan_text: str,
+                                    eval_fn: Callable[[Context], Coroutine[Any, Any, float]],
+                                    *, context: Context | None = None) -> dict[str, Any]:
+    """Asynchronously execute a candidate plan in an isolated speculative realm and score execution."""
+    ctx = (context or get_root_context()).derive(name="speculative_rollout_async")
+    try:
+        score = await eval_fn(ctx)
+        return {"ok": True, "score": score, "error": None}
+    except Exception as e:
+        return {"ok": False, "score": 0.0, "error": str(e)}
+    finally:
+        await ctx.async_dispose()
+
+
 def speculative_rollout(plan_text: str,
                         eval_fn: Callable[[Context], float],
                         *, context: Context | None = None) -> dict[str, Any]:
@@ -1773,5 +1823,5 @@ __all__ = ["start", "assess", "assess_candidates", "run", "status", "history", "
            "plan_dag", "simulate", "plan_quality", "edit_file", "rollback", "deps_check",
            "search_expand", "search_select", "search_backtrack", "search_report", "search",
            "Context", "Fiber", "LifecycleState", "TwistedMonoid", "get_root_context", "reset_root_context",
-           "create_subagent_context", "provide_tool", "execute_plan", "RoTRuleBase", "RoTRule", "ReplanningLadder", "ContextBudgeter", "mutate_flaw_directed", "mutate_exploratory", "crossover_ast", "ast_distance", "PopulationMember", "ASTSearchEngine", "Proposition", "PlanParser", "PlanAST", "CausalValidator", "CausalLink", "CausalFlaw", "ActionSchema", "execute_plan_sync", "speculative_rollout",
+           "create_subagent_context", "provide_tool", "execute_plan", "RoTRuleBase", "RoTRule", "ReplanningLadder", "ContextBudgeter", "mutate_flaw_directed", "mutate_exploratory", "crossover_ast", "ast_distance", "PopulationMember", "ASTSearchEngine", "Proposition", "PlanParser", "PlanAST", "CausalValidator", "CausalLink", "CausalFlaw", "ActionSchema", "execute_plan_sync", "speculative_rollout", "speculative_rollout_async",
            "DEFAULT_PLANS_DIR", "RUBRIC_PATH", "REPO_ROOT", "__version__"]

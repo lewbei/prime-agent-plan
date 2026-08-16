@@ -487,7 +487,13 @@ async def search(session: dict[str, Any] | str, *,
         "best_score": best_node["score"], "best_value": round(best_node["value"], 3),
         "escalations": len(t.get("escalations", [])),
     })
-    _save_session(plans_dir, s)
+
+    # Automatically commit the best plan found by search to the session history
+    from . import assess
+    if best_node["score"] > (s.get("best_score") or 0) or best_node["plan_text"] != root_plan:
+        assess(s, best_node["plan_text"], note=f"search:{mode}:score_{best_node['score']}", plans_dir=plans_dir)
+    else:
+        _save_session(plans_dir, s)
     return {
         "best_plan": best_node["plan_text"],
         "best_score": best_node["score"],

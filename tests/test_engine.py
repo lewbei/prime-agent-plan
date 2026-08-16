@@ -660,3 +660,41 @@ def test_context_budgeter_obeys_max_tokens():
     # Rounds 2 and 3 should be compressed to meet the budget
     assert compressed["rounds"][1].get("folded") is True
     assert compressed["rounds"][2].get("folded") is True
+
+
+@pytest.mark.asyncio
+async def test_search_commits_winning_plan_to_session(tmp_path):
+    """Verify search() automatically commits the best discovered plan to session rounds."""
+    s = plan_mode.start("Search commit test", plans_dir=tmp_path)
+    initial_plan = "1. Setup\nOutput: a.txt"
+    plan_mode.assess(s, initial_plan, plans_dir=tmp_path)
+    initial_score = s["best_score"]
+
+    # Run search which finds higher-scoring variants
+    res = await plan_mode.search(s, iterations=2, width=2, mode="beam", expansion="rules", plans_dir=tmp_path)
+
+    # Session best score should be updated to search winner
+    s_reloaded = plan_mode._load_session(tmp_path, s["session_id"])
+    assert s_reloaded["best_score"] >= initial_score
+    assert len(s_reloaded["rounds"]) >= 2
+    assert "search:" in s_reloaded["rounds"][-1].get("note", "")
+
+
+def test_atomic_session_save_under_concurrent_writes(tmp_path):
+    """Verify concurrent _save_session operations do not corrupt JSON file."""
+    import concurrent.futures
+    s = plan_mode.start("Concurrent atomic test", plans_dir=tmp_path)
+
+    def writer(idx):
+        session_copy = plan_mode._load_session(tmp_path, s["session_id"])
+        session_copy[f"key_{idx}"] = f"value_{idx}"
+        plan_mode._save_session(tmp_path, session_copy)
+        return True
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=8) as pool:
+        futures = [pool.submit(writer, i) for i in range(20)]
+        results = [f.result() for f in futures]
+
+    assert all(results)
+    final_session = plan_mode._load_session(tmp_path, s["session_id"])
+    assert final_session["session_id"] == s["session_id"]

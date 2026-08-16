@@ -25,7 +25,7 @@ from .causal_validator import CausalFlaw, PlanAST
 
 
 # ---------------------------------------------------------------------------
-# 1. Rule of Thought (RoT) Distillation Engine
+# 1. Rule of Thought (RoT) Distillation Engine (Structural Matching)
 # ---------------------------------------------------------------------------
 
 @dataclass
@@ -36,6 +36,8 @@ class RoTRule:
     forbidden_pattern: str
     remedy: str
     source_flaw_type: str
+    predicate: str = ""
+    affected_resource: str = ""
     hit_count: int = 0
     confidence: float = 1.0
     created_at: float = field(default_factory=time.time)
@@ -58,9 +60,16 @@ class RoTRuleBase:
             detail = flaw.get("detail", "")
             remedy = flaw.get("remedy", "")
 
-            rule_id = f"rot:{flaw_type}:{hashlib.sha256(detail.encode('utf-8')).hexdigest()[:8]}"
+            pred_m = re.search(r"['\"]([\w:-]+(?:\(.*?\))?)['\"]", detail)
+            predicate = pred_m.group(1) if pred_m else ""
+            res_m = re.search(r"([\w./-]+\.\w{1,8})", detail)
+            resource = res_m.group(1) if res_m else ""
+
+            rule_key = f"{flaw_type}:{predicate or resource or detail[:20]}"
+            rule_id = f"rot:{flaw_type}:{hashlib.sha256(rule_key.encode('utf-8')).hexdigest()[:8]}"
             if rule_id in self.rules:
                 self.rules[rule_id].hit_count += 1
+                self.rules[rule_id].confidence = min(1.0, self.rules[rule_id].confidence + 0.1)
                 continue
 
             rule = RoTRule(
@@ -69,7 +78,10 @@ class RoTRuleBase:
                 forbidden_pattern=detail,
                 remedy=remedy,
                 source_flaw_type=flaw_type,
-                hit_count=1
+                predicate=predicate,
+                affected_resource=resource,
+                hit_count=1,
+                confidence=1.0
             )
             self.rules[rule_id] = rule
             new_rules.append(rule)
@@ -78,16 +90,46 @@ class RoTRuleBase:
             self._save()
         return new_rules
 
-    def check_plan_violations(self, plan_text: str, ast: Optional[PlanAST] = None) -> list[dict[str, str]]:
-        """Check if a candidate plan violates any active distilled rules."""
+    def check_plan_violations(self, plan_text: str, ast: Optional[PlanAST] = None) -> list[dict[str, Any]]:
+        """Check if a candidate plan violates any active distilled rules (structural matching)."""
         violations = []
         for rule_id, rule in self.rules.items():
-            if rule.forbidden_pattern and rule.forbidden_pattern.lower() in plan_text.lower():
+            violation_found = False
+
+            # 1. Structural check via AST if available
+            if ast and rule.predicate:
+                pred_clean = rule.predicate.lower().strip("'\"")
+                for action in ast.actions:
+                    if rule.source_flaw_type == "clobber_threat":
+                        if any(d.positive_key == pred_clean for d in action.del_effects):
+                            violation_found = True
+                            break
+                    elif rule.source_flaw_type == "unsatisfied_precondition":
+                        if any(p.positive_key == pred_clean for p in action.preconditions):
+                            if not any(a.id < action.id and any(eff.positive_key == pred_clean for eff in a.add_effects) for a in ast.actions):
+                                violation_found = True
+                                break
+
+            # 2. Structural resource check
+            if ast and rule.affected_resource and not violation_found:
+                res_clean = rule.affected_resource.lower().strip("'\"")
+                for action in ast.actions:
+                    if res_clean in [inp.lower() for inp in action.inputs]:
+                        if not any(a.id < action.id and res_clean in [out.lower() for out in a.outputs] for a in ast.actions):
+                            violation_found = True
+                            break
+
+            # 3. Fallback pattern match
+            if not violation_found and rule.forbidden_pattern and rule.forbidden_pattern.lower() in plan_text.lower():
+                violation_found = True
+
+            if violation_found:
                 violations.append({
                     "rule_id": rule.rule_id,
                     "flaw_type": rule.source_flaw_type,
-                    "violation": f"Violates distilled rule {rule.rule_id}: {rule.forbidden_pattern}",
-                    "remedy": rule.remedy
+                    "violation": f"Structural rule violation [{rule.rule_id}]: {rule.source_flaw_type} on '{rule.predicate or rule.affected_resource or rule.forbidden_pattern[:30]}'",
+                    "remedy": rule.remedy,
+                    "confidence": rule.confidence
                 })
         return violations
 
@@ -101,6 +143,8 @@ class RoTRuleBase:
                 "forbidden_pattern": r.forbidden_pattern,
                 "remedy": r.remedy,
                 "source_flaw_type": r.source_flaw_type,
+                "predicate": r.predicate,
+                "affected_resource": r.affected_resource,
                 "hit_count": r.hit_count,
                 "confidence": r.confidence,
                 "created_at": r.created_at

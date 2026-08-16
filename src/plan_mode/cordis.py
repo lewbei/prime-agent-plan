@@ -8,11 +8,11 @@ Formal runtime realization of 'A Programming Paradigm for Spatiotemporal Composa
    - Twisted composition monoid T_Gamma: (f1, g1) o (f2, g2) = (f1 o f2, g2 o g1).
    - Accumulator phi rolls up inverses in LIFO order for complete context recovery.
    - Async Generator Effect Iterators with Step-Boundary Guards & Cancellation Tokens (Algorithm 1).
-   - Content Hash-Verified Journaling & Drift Detection for verifiable rollback.
+   - Content Hash-Verified Journaling & Configurable Drift Policy (warn vs. abort).
 
 2. Reactive Coeffects (Section 3.2):
    - Partial dependent coeffect context Sigma: (k: K) -> V_k.
-   - Provider-Aware Resolution: key -> ProviderRef -> Value.
+   - Provider Stack & Identity Resolution: key -> Stack[(ProviderUID, Value)].
    - Reactive notification: activating / deactivating / neutral state transitions.
    - Theorem 63 Topological Provider Withdrawal: Exact reverse-topological DFS deactivation
      of transitive dependent fibers before provider unmounting.
@@ -87,6 +87,7 @@ class JournalEntry:
     inverse: Callable[[], Any]
     context_uid: str
     drift_detected: bool = False
+    on_drift: str = "warn"  # "warn" | "abort"
 
 
 class CancellationToken:
@@ -146,8 +147,8 @@ class Context:
         # @@store: Value store sigma: (r: Realm) -> Typed Value
         self._store: dict[str, Any] = {} if parent is None else parent._store
 
-        # @@providers: Provider store: Realm -> Provider Fiber UID
-        self._providers: dict[str, str] = {} if parent is None else parent._providers
+        # @@providers: Provider Stack: Realm -> list[(ProviderUID, Value)]
+        self._providers: dict[str, list[tuple[str, Any]]] = {} if parent is None else parent._providers
 
         # @@isolate: Realm table rho: Map(Key, Realm)
         self._isolate: dict[str, str] = {} if parent is None else dict(parent._isolate)
@@ -183,7 +184,6 @@ class Context:
             armed = [True]
             inverses_collected: list[Callable[[], Any]] = []
 
-            # 1. Execute forward effect
             try:
                 res = callback()
             except Exception as err:
@@ -193,7 +193,6 @@ class Context:
             if inspect.isawaitable(res):
                 raise TypeError("ctx.effect() callback returned an awaitable/coroutine. Use 'await ctx.async_effect(...)' instead.")
 
-            # Handle generator / iterator (Effect Iterator)
             if inspect.isgenerator(res) or hasattr(res, "__next__"):
                 try:
                     for inv in res:
@@ -219,8 +218,9 @@ class Context:
                     for inv in reversed(inverses_collected):
                         try:
                             _run_inv_sync(inv)
-                        except Exception:
-                            pass
+                        except Exception as err:
+                            if isinstance(err, RuntimeError) and "Rollback aborted" in str(err):
+                                raise err
 
             async def _dispose_async():
                 with self._lock:
@@ -230,8 +230,9 @@ class Context:
                     for inv in reversed(inverses_collected):
                         try:
                             await _run_inv_async(inv)
-                        except Exception:
-                            pass
+                        except Exception as err:
+                            if isinstance(err, RuntimeError) and "Rollback aborted" in str(err):
+                                raise err
 
             pair = (_dispose, _dispose_async)
             self._inverses.append(pair)
@@ -253,7 +254,6 @@ class Context:
         if inspect.isawaitable(res):
             res = await res
 
-        # Handle Async Generator (Effect Iterator with cancellation token)
         if hasattr(res, "__anext__") or inspect.isasyncgen(res):
             try:
                 async for inv in res:
@@ -307,8 +307,9 @@ class Context:
         return _dispose
 
     def journal_mutation(self, target: str, pre_content: str, post_content: str,
-                         inverse: Callable[[], Any], description: str = "") -> JournalEntry:
-        """Record a hash-verified mutation into the context journal with drift detection on rollback."""
+                         inverse: Callable[[], Any], description: str = "",
+                         on_drift: str = "warn") -> JournalEntry:
+        """Record a hash-verified mutation into the context journal with configurable drift policy (warn vs abort)."""
         pre_hash = hashlib.sha256(pre_content.encode("utf-8")).hexdigest() if pre_content else ""
         post_hash = hashlib.sha256(post_content.encode("utf-8")).hexdigest() if post_content else ""
 
@@ -319,20 +320,23 @@ class Context:
             pre_hash=pre_hash,
             post_hash=post_hash,
             inverse=inverse,
-            context_uid=self.uid
+            context_uid=self.uid,
+            on_drift=on_drift
         )
         self._journal.append(entry)
 
         def _verified_inverse():
-            # Check target content drift if target is a reachable file
             p = Path(target)
             if p.exists() and post_hash:
                 try:
                     curr_hash = hashlib.sha256(p.read_bytes()).hexdigest()
                     if curr_hash != post_hash:
                         entry.drift_detected = True
-                except Exception:
-                    pass
+                        if on_drift == "abort":
+                            raise RuntimeError(f"Rollback aborted: external state drift detected on target '{target}'")
+                except Exception as err:
+                    if on_drift == "abort" and isinstance(err, RuntimeError):
+                        raise err
             return inverse()
 
         self.effect(lambda: _verified_inverse)
@@ -349,8 +353,9 @@ class Context:
             for disp_sync, _ in to_run:
                 try:
                     disp_sync()
-                except Exception:
-                    pass
+                except Exception as err:
+                    if isinstance(err, RuntimeError) and "Rollback aborted" in str(err):
+                        raise err
 
     async def async_dispose(self):
         """Recover all effects executed under this context in LIFO order (async)."""
@@ -363,8 +368,9 @@ class Context:
             for _, disp_async in to_run:
                 try:
                     await disp_async()
-                except Exception:
-                    pass
+                except Exception as err:
+                    if isinstance(err, RuntimeError) and "Rollback aborted" in str(err):
+                        raise err
 
     # --- Reactive Coeffects (ctx.provide, ctx.inject, ctx.get) ---
 
@@ -384,22 +390,18 @@ class Context:
         return val
 
     def provide(self, key: str, value: Any, *, provider_id: Optional[str] = None) -> Callable[[], Any]:
-        """Provide a service binding with Theorem 63 topological DFS deactivation."""
+        """Provide a service binding with Provider Stack resolution and Theorem 63 topological DFS deactivation."""
         realm = self._get_realm(key)
-        old_val = self._store.get(realm)
-        old_provider = self._providers.get(realm)
+        provider_uid = provider_id or f"provider_{id(value)}_{time.time_ns()}"
 
         def _forward():
+            self._providers.setdefault(realm, []).append((provider_uid, value))
             self._store[realm] = value
-            if provider_id:
-                self._providers[realm] = provider_id
             self._notify(key, value, "provided")
 
             def _inverse():
-                # Theorem 63 Topological Reverse Deactivation:
-                # 1. Build dependency graph among active fibers
+                # Theorem 63 Topological Reverse Deactivation
                 active_fibers = {f.uid: f for f in self._registry.values() if f.state == LifecycleState.ACTIVE}
-                # Topological sort via DFS of fibers depending on this key
                 visited: set[str] = set()
                 deactivation_order: list[Fiber] = []
 
@@ -408,7 +410,6 @@ class Context:
                     fiber = active_fibers.get(f_uid)
                     if not fiber:
                         return
-                    # Check any fibers that depend on what this fiber provides
                     for other in active_fibers.values():
                         if other.uid not in visited and any(p in other.dependencies for p in fiber.provisions):
                             _dfs(other.uid)
@@ -418,18 +419,22 @@ class Context:
                     if key in f.dependencies and f.uid not in visited:
                         _dfs(f.uid)
 
-                # Deactivate in topological reverse order (leaves first)
                 for fiber in deactivation_order:
                     try:
                         fiber.deactivate()
                     except Exception:
                         pass
 
-                if old_val is not None:
-                    self._store[realm] = old_val
-                    if old_provider:
-                        self._providers[realm] = old_provider
-                    self._notify(key, old_val, "restored")
+                # Pop this provider from the stack
+                stack = self._providers.get(realm, [])
+                stack = [(p_uid, val) for p_uid, val in stack if p_uid != provider_uid]
+                self._providers[realm] = stack
+
+                if stack:
+                    # Restore previous provider on the stack
+                    prev_uid, prev_val = stack[-1]
+                    self._store[realm] = prev_val
+                    self._notify(key, prev_val, "restored")
                 else:
                     self._store.pop(realm, None)
                     self._providers.pop(realm, None)
@@ -478,7 +483,6 @@ class Context:
             except Exception:
                 pass
 
-        # Dynamic fiber lifecycle auto-reaction
         for fiber in list(self._registry.values()):
             if key in fiber.dependencies and not fiber.retired:
                 if action == "withdrawn" or not fiber.is_satisfied():
@@ -534,9 +538,6 @@ class Fiber:
         self.error: Optional[Exception] = None
         self._dispose_handle: Optional[Callable[[], Any]] = None
         self._unsub_listeners: list[Callable[[], None]] = []
-
-        # Register fiber into the context hierarchy
-        self.ctx._registry[self.uid] = self
 
         # Register fiber into the context hierarchy
         self.ctx._registry[self.uid] = self
