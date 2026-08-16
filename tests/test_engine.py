@@ -880,3 +880,24 @@ for i in range(5):
 
     final_s = plan_mode._load_session(plans_dir, sid)
     assert len(final_s.get("execution_log", [])) == 20
+
+
+def test_plan_dag_and_verify_dependency_parsing_boundary():
+    """Verify that digits on subsequent lines (e.g. output: res_2) are not misparsed as task dependencies."""
+    plan_text = """# Multi-task Plan
+    1. Task One: Allocate
+    - output: res_1
+    2. Task Two: Allocate
+    - depends on 1
+    - output: res_2
+    3. Task Three: Allocate
+    - depends on 2
+    - output: res_3
+    """
+    v = plan_mode.verify(plan_text)
+    assert v["ok"] is True, f"verify failed: {v['errors']}"
+
+    dag = plan_mode.plan_dag(plan_text)
+    assert dag["edges"][1] == []
+    assert dag["edges"][2] == [1]
+    assert dag["edges"][3] == [2]

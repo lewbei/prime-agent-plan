@@ -1181,7 +1181,7 @@ def verify(plan_text: str, *, initial_state: set[str] | list[str] | None = None,
     graph: dict[int, list[int]] = {}
     for n, body in tasks:
         refs: list[int] = []
-        for m in re.finditer(r"depends?\s+on\s+([^.(]+)", body, re.I):
+        for m in re.finditer(r"depends?\s+on\s+([^.(;\n]+)", body, re.I):
             refs += [int(x) for x in re.findall(r"\d+", m.group(1))]
         graph[n] = sorted(set(refs))
         for r in refs:
@@ -1393,7 +1393,7 @@ def plan_dag(plan_text: str) -> dict[str, Any]:
     inputs: dict[int, list[str]] = {}
     for n, body in tasks:
         refs: list[int] = []
-        for m in re.finditer(r"depends?\s+on\s+([^.(]+)", body, re.I):
+        for m in re.finditer(r"depends?\s+on\s+([^.(;\n]+)", body, re.I):
             refs += [int(x) for x in re.findall(r"\d+", m.group(1))]
         edges[n] = sorted(set(refs))
         outs: list[str] = []
