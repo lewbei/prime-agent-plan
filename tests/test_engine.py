@@ -784,3 +784,40 @@ async def test_search_ast_mode_with_custom_cwd(tmp_path):
     res = await plan_mode.search(s, iterations=2, width=2, mode="ast", cwd=tmp_path, plans_dir=tmp_path / "plans")
     assert res["nodes"] >= 1
     assert res["best_score"] > 0
+
+
+def test_assess_convergence_reentrant_lock(tmp_path):
+    """Verify assess() does not deadlock when max_rounds=1 triggers fold_history() under session_lock."""
+    plans_dir = tmp_path / "plans"
+    s = plan_mode.start("Reentrant Assess Test", plans_dir=plans_dir, max_rounds=1)
+    plan_text = """# Plan
+1. Task Alpha
+   Output: alpha.json
+2. Task Beta
+   Depends on 1
+   Inputs: alpha.json
+   Output: beta.json
+"""
+    res = plan_mode.assess(s, plan_text, plans_dir=plans_dir)
+    assert res["status"] == "converged"
+    assert res["continue"] is False
+
+
+def test_finish_require_release_reentrant_lock(tmp_path):
+    """Verify finish() does not deadlock when require_release=True triggers release() under session_lock."""
+    plans_dir = tmp_path / "plans"
+    s = plan_mode.start("Reentrant Finish Test", plans_dir=plans_dir, max_rounds=1)
+    plan_text = """# Plan
+1. Task Alpha
+   Output: alpha.json
+2. Task Beta
+   Depends on 1
+   Inputs: alpha.json
+   Output: beta.json
+"""
+    # assess with max_rounds=1 converges immediately
+    plan_mode.assess(s, plan_text, plans_dir=plans_dir)
+    # Finish with require_release=True and require_judge=False
+    res = plan_mode.finish(s, plans_dir=plans_dir, require_release=True, require_judge=False, min_score=0.0)
+    assert res["status"] == "finished"
+    assert "release_gate" in res

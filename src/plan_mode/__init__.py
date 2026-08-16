@@ -180,36 +180,79 @@ def _session_path(plans_dir: Path, session_id: str) -> Path:
     return Path(plans_dir) / f"{session_id}.json"
 
 
+_REENTRANT_LOCKS: dict[tuple[str, int], tuple[Any, int]] = {}
+_REENTRANT_MUTEX = threading.RLock()
+_SESSION_LOCK = threading.RLock()
+
+
 @contextmanager
 def session_lock(plans_dir: str | Path, session_id: str, timeout: float = 10.0):
-    """Acquire a thread and process-level file lock on a session with strict timeout handling."""
+    """Acquire a thread and process-level reentrant file lock on a session with strict timeout handling."""
     p_dir = Path(plans_dir)
     p_dir.mkdir(parents=True, exist_ok=True)
-    lock_file = p_dir / f".{session_id}.lock"
-    with _SESSION_LOCK:
+    canonical_path = str((p_dir / f".{session_id}.lock").resolve())
+    tid = threading.get_ident()
+    key = (canonical_path, tid)
+
+    with _REENTRANT_MUTEX:
+        if key in _REENTRANT_LOCKS:
+            f_held, depth = _REENTRANT_LOCKS[key]
+            _REENTRANT_LOCKS[key] = (f_held, depth + 1)
+            is_reentrant = True
+        else:
+            is_reentrant = False
+
+    if is_reentrant:
+        try:
+            yield
+        finally:
+            with _REENTRANT_MUTEX:
+                f_held, depth = _REENTRANT_LOCKS.get(key, (None, 0))
+                if depth > 1:
+                    _REENTRANT_LOCKS[key] = (f_held, depth - 1)
+                else:
+                    _REENTRANT_LOCKS.pop(key, None)
+        return
+
+    f = None
+    try:
         try:
             import fcntl
-            with open(lock_file, "a", encoding="utf-8") as f:
-                start_time = time.time()
-                while True:
-                    try:
-                        fcntl.flock(f.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-                        break
-                    except (BlockingIOError, OSError):
-                        if time.time() - start_time >= timeout:
-                            raise TimeoutError(f"Timed out after {timeout}s waiting for session lock: {lock_file}")
-                        time.sleep(0.02)
+            f = open(canonical_path, "a", encoding="utf-8")
+            start_time = time.time()
+            while True:
                 try:
-                    yield
-                finally:
-                    fcntl.flock(f.fileno(), fcntl.LOCK_UN)
-        except (ImportError, OSError) as err:
-            if isinstance(err, TimeoutError) or "Timed out after" in str(err):
-                raise err
+                    fcntl.flock(f.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    break
+                except (BlockingIOError, OSError):
+                    if time.time() - start_time >= timeout:
+                        raise TimeoutError(f"Timed out after {timeout}s waiting for session lock: {canonical_path}")
+                    time.sleep(0.02)
+        except ImportError:
+            f = None
+
+        with _REENTRANT_MUTEX:
+            _REENTRANT_LOCKS[key] = (f, 1)
+
+        try:
             yield
-
-
-_SESSION_LOCK = threading.RLock()
+        finally:
+            with _REENTRANT_MUTEX:
+                _REENTRANT_LOCKS.pop(key, None)
+            if f is not None:
+                try:
+                    import fcntl
+                    fcntl.flock(f.fileno(), fcntl.LOCK_UN)
+                except Exception:
+                    pass
+                try:
+                    f.close()
+                except Exception:
+                    pass
+    except Exception as err:
+        if isinstance(err, TimeoutError) or "Timed out after" in str(err):
+            raise err
+        raise
 
 
 def _load_session(plans_dir: Path, session_id: str) -> dict[str, Any]:
@@ -872,7 +915,8 @@ def release(session: dict[str, Any] | str, *, min_score: float = 90.0,
 
 def finish(session: dict[str, Any] | str, *, verdict: str = "converged",
            plans_dir: str | Path | None = None, require_release: bool = True,
-           min_score: float = 90.0) -> dict[str, Any]:
+           min_score: float = 90.0, require_judge: bool = True,
+           require_external_judge: bool = False) -> dict[str, Any]:
     """Mark the session complete with full session locking across release validation."""
     plans_dir = Path(plans_dir) if plans_dir else (Path(session.get("plans_dir")) if isinstance(session, dict) and session.get("plans_dir") else DEFAULT_PLANS_DIR)
     sid = session if isinstance(session, str) else session.get("session_id", "default")
@@ -882,15 +926,20 @@ def finish(session: dict[str, Any] | str, *, verdict: str = "converged",
             s = _load_session(plans_dir, session)
         else:
             s = session
+        gate = None
         if require_release:
-            gate = release(s, min_score=min_score, plans_dir=plans_dir)
+            gate = release(s, min_score=min_score, require_judge=require_judge,
+                           require_external_judge=require_external_judge, plans_dir=plans_dir)
             if not gate["ok"]:
                 raise RuntimeError("release gate failed: " + "; ".join(gate["problems"]))
         s["status"] = "finished"
         s["completed_at"] = _now()
         s.setdefault("verdict", verdict)
         _save_session(plans_dir, s)
-        return status(s)
+        res = status(s)
+        if gate:
+            res["release_gate"] = gate
+        return res
 
 
 
@@ -1302,16 +1351,14 @@ def record_judge(session: dict[str, Any] | str, verdict: dict[str, Any], *,
                  plans_dir: str | Path | None = None) -> dict[str, Any]:
     """Persist an external judge verdict (from plan_mode.judge) into the
     session with automatic session locking for read-modify-write safety."""
-    if isinstance(session, str):
-        plans_dir = Path(plans_dir) if plans_dir else DEFAULT_PLANS_DIR
-        s = _load_session(plans_dir, session)
-        sid = session
-    else:
-        s = session
-        sid = s.get("session_id", "default")
-        plans_dir = Path(plans_dir) if plans_dir else Path(s.get("plans_dir") or DEFAULT_PLANS_DIR)
+    plans_dir = Path(plans_dir) if plans_dir else (Path(session.get("plans_dir")) if isinstance(session, dict) and session.get("plans_dir") else DEFAULT_PLANS_DIR)
+    sid = session if isinstance(session, str) else session.get("session_id", "default")
 
     with session_lock(plans_dir, sid):
+        if isinstance(session, str):
+            s = _load_session(plans_dir, session)
+        else:
+            s = session
         ver = round_version if round_version is not None else s.get("best_version") or len(s.get("rounds", []))
         entry = {"ts": _now(), "round_version": ver, **{k: v for k, v in verdict.items()}}
         s.setdefault("judge_log", []).append(entry)
