@@ -65,3 +65,35 @@ def test_ast_crossover_semantic_dependency_remapping():
     # Suffix action (B3) should depend on new renumbered B2 index
     val = CausalValidator.validate(child)
     assert not any(f["type"] == "unsatisfied_dependency" for f in val["flaws"])
+
+
+def test_ast_search_preserves_parent_rubric_sections():
+    """Verify that evaluate_ast and render_plan preserve parent markdown headers and success criteria."""
+    parent_plan = """# Goal
+Goal: Build a high-throughput stream ingestion pipeline.
+
+## Success Criteria
+- S1: 10k events/sec throughput
+- S2: zero data loss
+
+## Tasks
+1. Setup Kafka
+   Output: kafka.yaml
+2. Deploy Pipeline
+   Depends on 1
+   Inputs: kafka.yaml
+   Output: pipeline.log
+
+## Risks
+- Risk 1: network partition -> auto-reconnect
+"""
+    engine = ASTSearchEngine(objective="Kafka stream pipeline", source_plan_text=parent_plan)
+    ast = PlanParser.parse_plan(parent_plan)
+    member = engine.evaluate_ast(ast, source_plan_text=parent_plan)
+
+    # Rendered text must contain parent sections
+    rendered = member.plan_text
+    assert "## Success Criteria" in rendered
+    assert "10k events/sec throughput" in rendered
+    assert "## Risks" in rendered
+    assert "Setup Kafka" in rendered

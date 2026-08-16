@@ -513,3 +513,40 @@ async def test_speculative_rollout_async_clean():
     assert res["ok"] is True
     assert res["score"] == 96.0
     assert trace == []
+
+
+def test_cordis_nested_provider_withdrawal_and_clean_reactivation():
+    """Verify that withdrawing overriding provider p2 preserves consumer, and subsequent reactivations succeed."""
+    ctx = Context(name="nested_react_test")
+    trace = []
+
+    def consumer_fn(c):
+        trace.append("consumer_active")
+        return lambda: trace.append("consumer_inactive")
+
+    fiber = Fiber(ctx, "db_consumer", dependencies={"service:db"}, apply_fn=consumer_fn)
+    assert fiber.state == LifecycleState.INACTIVE
+
+    # p1 provides db -> consumer activates
+    disp1 = ctx.provide("service:db", "pg_v1", provider_id="p1")
+    assert fiber.state == LifecycleState.ACTIVE
+    assert "consumer_active" in trace
+
+    # p2 overrides db
+    disp2 = ctx.provide("service:db", "pg_v2", provider_id="p2")
+    assert fiber.state == LifecycleState.ACTIVE
+
+    # withdraw p2 -> consumer must remain ACTIVE (p1 is still on the stack)
+    disp2()
+    assert fiber.state == LifecycleState.ACTIVE
+    assert fiber.error is None
+
+    # withdraw p1 -> consumer deactivates
+    disp1()
+    assert fiber.state == LifecycleState.INACTIVE
+    assert "consumer_inactive" in trace
+
+    # re-provide db -> consumer must cleanly reactivate without RuntimeError / FAILED state
+    disp3 = ctx.provide("service:db", "pg_v3", provider_id="p3")
+    assert fiber.state == LifecycleState.ACTIVE
+    assert fiber.error is None

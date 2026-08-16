@@ -1,4 +1,3 @@
-
 """plan_mode - iterative self-improving planning engine for the ai_funded repo.
 
 Plan mode contract
@@ -25,6 +24,7 @@ checks, so "better and better" is a recorded, auditable fact, not a vibe.
 """
 from __future__ import annotations
 
+from contextlib import contextmanager
 from .causal_validator import (
     ActionSchema,
     CausalFlaw,
@@ -178,6 +178,25 @@ def _score(text: str, rubric: dict[str, dict[str, Any]]) -> dict[str, Any]:
 
 def _session_path(plans_dir: Path, session_id: str) -> Path:
     return Path(plans_dir) / f"{session_id}.json"
+
+
+@contextmanager
+def session_lock(plans_dir: str | Path, session_id: str, timeout: float = 10.0):
+    """Acquire a thread and process-level file lock on a session for safe read-modify-write cycles."""
+    p_dir = Path(plans_dir)
+    p_dir.mkdir(parents=True, exist_ok=True)
+    lock_file = p_dir / f".{session_id}.lock"
+    with _SESSION_LOCK:
+        try:
+            import fcntl
+            with open(lock_file, "a", encoding="utf-8") as f:
+                fcntl.flock(f.fileno(), fcntl.LOCK_EX)
+                try:
+                    yield
+                finally:
+                    fcntl.flock(f.fileno(), fcntl.LOCK_UN)
+        except (ImportError, OSError):
+            yield
 
 
 _SESSION_LOCK = threading.RLock()
@@ -538,7 +557,8 @@ def assess(session: dict[str, Any] | str, plan_text: str, *, note: str | None = 
     rot_base = RoTRuleBase(storage_path=rot_path)
     causal_flaws = (v.get("causal_validation") or {}).get("flaws", [])
     rot_base.distill_from_flaws(causal_flaws, context_tag=session.get("objective", "general"))
-    rot_violations = rot_base.check_plan_violations(plan_text)
+    ast_parsed = PlanParser.parse_plan(plan_text, session.get("objective", ""))
+    rot_violations = rot_base.check_plan_violations(plan_text, ast=ast_parsed)
     for viol in rot_violations:
         result["critiques"].append({"id": f"mech:rot:{viol['rule_id']}", "section": "mechanical",
                                     "hint": f"[learned rule] {viol['remedy']}"})
@@ -1823,5 +1843,5 @@ __all__ = ["start", "assess", "assess_candidates", "run", "status", "history", "
            "plan_dag", "simulate", "plan_quality", "edit_file", "rollback", "deps_check",
            "search_expand", "search_select", "search_backtrack", "search_report", "search",
            "Context", "Fiber", "LifecycleState", "TwistedMonoid", "get_root_context", "reset_root_context",
-           "create_subagent_context", "provide_tool", "execute_plan", "RoTRuleBase", "RoTRule", "ReplanningLadder", "ContextBudgeter", "mutate_flaw_directed", "mutate_exploratory", "crossover_ast", "ast_distance", "PopulationMember", "ASTSearchEngine", "Proposition", "PlanParser", "PlanAST", "CausalValidator", "CausalLink", "CausalFlaw", "ActionSchema", "execute_plan_sync", "speculative_rollout", "speculative_rollout_async",
+           "create_subagent_context", "provide_tool", "execute_plan", "session_lock", "RoTRuleBase", "RoTRule", "ReplanningLadder", "ContextBudgeter", "mutate_flaw_directed", "mutate_exploratory", "crossover_ast", "ast_distance", "PopulationMember", "ASTSearchEngine", "Proposition", "PlanParser", "PlanAST", "CausalValidator", "CausalLink", "CausalFlaw", "ActionSchema", "execute_plan_sync", "speculative_rollout", "speculative_rollout_async",
            "DEFAULT_PLANS_DIR", "RUBRIC_PATH", "REPO_ROOT", "__version__"]

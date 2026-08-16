@@ -698,3 +698,49 @@ def test_atomic_session_save_under_concurrent_writes(tmp_path):
     assert all(results)
     final_session = plan_mode._load_session(tmp_path, s["session_id"])
     assert final_session["session_id"] == s["session_id"]
+
+
+def test_assess_structural_rot_rule_violation_with_reworded_syntax(tmp_path):
+    """Verify assess() catches structural RoT violations even when task phrasing is reworded."""
+    s = plan_mode.start("RoT structural test", plans_dir=tmp_path)
+
+    # Plan 1: declares input that does not exist -> triggers flaw & distills RoT rule
+    plan1 = """
+    1. Extract
+       Inputs: missing_zz.md
+       Output: a.txt
+    """
+    res1 = plan_mode.assess(s, plan1, plans_dir=tmp_path)
+
+    # Plan 2: reworded with "Needs:" instead of "Inputs:"
+    plan2 = """
+    1. Extract
+       Needs: missing_zz.md
+       Output: a.txt
+    """
+    res2 = plan_mode.assess(s, plan2, plans_dir=tmp_path)
+    # Must catch the structural RoT violation
+    assert any("rot:" in c["id"] for c in res2["critiques"])
+
+
+def test_session_lock_read_modify_write_protection(tmp_path):
+    """Verify session_lock protects read-modify-write cycles from lost updates."""
+    from plan_mode import session_lock
+    import concurrent.futures
+    s = plan_mode.start("Session lock test", plans_dir=tmp_path)
+
+    def worker(worker_id):
+        with session_lock(tmp_path, s["session_id"]):
+            data = plan_mode._load_session(tmp_path, s["session_id"])
+            lst = data.setdefault("worker_log", [])
+            lst.append(worker_id)
+            plan_mode._save_session(tmp_path, data)
+        return True
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=8) as pool:
+        futures = [pool.submit(worker, i) for i in range(16)]
+        results = [f.result() for f in futures]
+
+    assert all(results)
+    final_session = plan_mode._load_session(tmp_path, s["session_id"])
+    assert len(final_session["worker_log"]) == 16

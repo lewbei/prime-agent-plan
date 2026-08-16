@@ -184,9 +184,10 @@ class PopulationMember:
 class ASTSearchEngine:
     """Evolutionary MCTS & Genetic Search Engine over Plan ASTs."""
 
-    def __init__(self, objective: str, initial_state: Optional[Set[str]] = None):
+    def __init__(self, objective: str, initial_state: Optional[Set[str]] = None, source_plan_text: str = ""):
         self.objective = objective
         self.initial_state = initial_state or set()
+        self.source_plan_text = source_plan_text
         self.population: list[PopulationMember] = []
         self.transposition_table: dict[str, dict[str, Any]] = {}
 
@@ -198,7 +199,8 @@ class ASTSearchEngine:
 
     def evaluate_ast(self, ast: PlanAST, rubric_score_fn: Optional[Callable[[str], float]] = None, source_plan_text: str = "") -> PopulationMember:
         """Evaluate a PlanAST: validates causal consistency, computes rubric score and effective fitness."""
-        if source_plan_text and not ast.metadata.get("header_section"):
+        src_text = source_plan_text or self.source_plan_text
+        if src_text and not ast.metadata.get("header_section"):
             m_first = re.search(r"^\s*1[.)]\s+", source_plan_text, re.M)
             if m_first:
                 ast.metadata["header_section"] = source_plan_text[:m_first.start()].strip()

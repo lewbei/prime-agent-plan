@@ -400,42 +400,42 @@ class Context:
             self._notify(key, value, "provided")
 
             def _inverse():
-                # Theorem 63 Topological Reverse Deactivation
-                active_fibers = {f.uid: f for f in self._registry.values() if f.state == LifecycleState.ACTIVE}
-                visited: set[str] = set()
-                deactivation_order: list[Fiber] = []
-
-                def _dfs(f_uid: str):
-                    visited.add(f_uid)
-                    fiber = active_fibers.get(f_uid)
-                    if not fiber:
-                        return
-                    for other in active_fibers.values():
-                        if other.uid not in visited and any(p in other.dependencies for p in fiber.provisions):
-                            _dfs(other.uid)
-                    deactivation_order.append(fiber)
-
-                for f in list(active_fibers.values()):
-                    if key in f.dependencies and f.uid not in visited:
-                        _dfs(f.uid)
-
-                for fiber in deactivation_order:
-                    try:
-                        fiber.deactivate()
-                    except Exception:
-                        pass
-
                 # Pop this provider from the stack
                 stack = self._providers.get(realm, [])
                 stack = [(p_uid, val) for p_uid, val in stack if p_uid != provider_uid]
                 self._providers[realm] = stack
 
                 if stack:
-                    # Restore previous provider on the stack
+                    # Previous provider remains on the stack: restore value and keep dependents satisfied
                     prev_uid, prev_val = stack[-1]
                     self._store[realm] = prev_val
                     self._notify(key, prev_val, "restored")
                 else:
+                    # No provider remains on the stack: execute Theorem 63 topological DFS deactivation
+                    active_fibers = {f.uid: f for f in self._registry.values() if f.state == LifecycleState.ACTIVE}
+                    visited: set[str] = set()
+                    deactivation_order: list[Fiber] = []
+
+                    def _dfs(f_uid: str):
+                        visited.add(f_uid)
+                        fiber = active_fibers.get(f_uid)
+                        if not fiber:
+                            return
+                        for other in active_fibers.values():
+                            if other.uid not in visited and any(p in other.dependencies for p in fiber.provisions):
+                                _dfs(other.uid)
+                        deactivation_order.append(fiber)
+
+                    for f in list(active_fibers.values()):
+                        if key in f.dependencies and f.uid not in visited:
+                            _dfs(f.uid)
+
+                    for fiber in deactivation_order:
+                        try:
+                            fiber.deactivate()
+                        except Exception:
+                            pass
+
                     self._store.pop(realm, None)
                     self._providers.pop(realm, None)
                     self._notify(key, None, "withdrawn")
@@ -527,6 +527,7 @@ class Fiber:
                  provisions: Optional[set[str]] = None,
                  apply_fn: Optional[Callable[[Context], Any]] = None):
         self.ctx = ctx.derive(name=f"fiber:{name}")
+        self.active_ctx: Optional[Context] = None
         self.name = name
         self.uid = f"{name}_{id(self)}"
         self.dependencies = set(dependencies or [])
@@ -558,15 +559,19 @@ class Fiber:
 
         self.state = LifecycleState.RELOADING
         try:
+            # Derive fresh active child context so deactivations can be repeated cleanly
+            self.active_ctx = self.ctx.derive(name=f"active_{self.uid}_{time.time_ns()}")
             if self.apply_fn:
-                self._dispose_handle = self.ctx.effect(lambda: self.apply_fn(self.ctx))
+                self._dispose_handle = self.active_ctx.effect(lambda: self.apply_fn(self.active_ctx))
             self.state = LifecycleState.ACTIVE
             self.error = None
             return True
         except Exception as err:
             self.state = LifecycleState.FAILED
             self.error = err
-            self.ctx.dispose()
+            if self.active_ctx:
+                self.active_ctx.dispose()
+                self.active_ctx = None
             return False
 
     async def async_activate(self) -> bool:
@@ -578,15 +583,18 @@ class Fiber:
 
         self.state = LifecycleState.RELOADING
         try:
+            self.active_ctx = self.ctx.derive(name=f"active_{self.uid}_{time.time_ns()}")
             if self.apply_fn:
-                self._dispose_handle = await self.ctx.async_effect(lambda: self.apply_fn(self.ctx))
+                self._dispose_handle = await self.active_ctx.async_effect(lambda: self.apply_fn(self.active_ctx))
             self.state = LifecycleState.ACTIVE
             self.error = None
             return True
         except Exception as err:
             self.state = LifecycleState.FAILED
             self.error = err
-            await self.ctx.async_dispose()
+            if self.active_ctx:
+                await self.active_ctx.async_dispose()
+                self.active_ctx = None
             return False
 
     def deactivate(self) -> None:
@@ -596,7 +604,9 @@ class Fiber:
 
         self.state = LifecycleState.UNLOADING
         try:
-            self.ctx.dispose()
+            if self.active_ctx:
+                self.active_ctx.dispose()
+                self.active_ctx = None
         finally:
             self.state = LifecycleState.INACTIVE
 
@@ -607,7 +617,9 @@ class Fiber:
 
         self.state = LifecycleState.UNLOADING
         try:
-            await self.ctx.async_dispose()
+            if self.active_ctx:
+                await self.active_ctx.async_dispose()
+                self.active_ctx = None
         finally:
             self.state = LifecycleState.INACTIVE
 
