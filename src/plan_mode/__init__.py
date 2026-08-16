@@ -511,12 +511,12 @@ def assess(session: dict[str, Any] | str, plan_text: str, *, note: str | None = 
     audit; unresolved ids are re-emitted in the next round).
     Returns {"version", "score", "delta", "critiques", "status", "continue"}.
     """
-    plans_dir = Path(plans_dir) if plans_dir else DEFAULT_PLANS_DIR
-    if isinstance(session, str):
-        session = _load_session(plans_dir, session)
-    else:
-        # a live session dict knows where it lives; never scatter files elsewhere
-        plans_dir = Path(session.get("plans_dir") or plans_dir)
+    plans_dir = Path(plans_dir) if plans_dir else (Path(session.get("plans_dir")) if isinstance(session, dict) and session.get("plans_dir") else DEFAULT_PLANS_DIR)
+    sid = session if isinstance(session, str) else session.get("session_id", "default")
+
+    with session_lock(plans_dir, sid):
+        if isinstance(session, str):
+            session = _load_session(plans_dir, session)
     if session["status"] in ("finished",):
         raise RuntimeError(f"session {session['session_id']} is finished; start a new objective to continue")
     rubric = session.get("rubric_snapshot") or _load_rubric()
@@ -781,111 +781,114 @@ def release(session: dict[str, Any] | str, *, min_score: float = 90.0,
     verdict "go" with falsifiable criteria. Until then the plan keeps looping.
     Returns the gate report; the plan must NOT be reported as done while ok is False.
     """
-    if isinstance(session, str):
-        plans_dir = Path(plans_dir) if plans_dir else DEFAULT_PLANS_DIR
-        s = _load_session(plans_dir, session)
-    else:
-        s = session
-        plans_dir = Path(plans_dir) if plans_dir else Path(s.get("plans_dir") or DEFAULT_PLANS_DIR)
-    checks: list[dict[str, Any]] = []
-    problems: list[str] = []
-    historical: dict[str, Any] = {}
+    plans_dir = Path(plans_dir) if plans_dir else (Path(session.get("plans_dir")) if isinstance(session, dict) and session.get("plans_dir") else DEFAULT_PLANS_DIR)
+    sid = session if isinstance(session, str) else session.get("session_id", "default")
 
-    converged = s.get("status") == "converged"
-    checks.append({"name": "converged", "ok": converged,
-                   "detail": f"status={s.get('status')}"})
-    if not converged:
-        problems.append("plan has not converged; keep looping assess->revise")
-
-    best_score = s.get("best_score") or 0
-    checks.append({"name": "score", "ok": best_score >= min_score,
-                   "detail": f"best={best_score} >= {min_score}"})
-    if best_score < min_score:
-        problems.append(f"best score {best_score} < {min_score}; keep revising")
-
-    best_text = ""
-    if s.get("best_version") and s.get("rounds"):
-        best_round = s["rounds"][s["best_version"] - 1]
-        best_text = best_round.get("plan_text", "")
-
-    # Re-run canonical mechanical checks (deadlines, dates, task numbering, duplicates)
-    mech = _mechanical_checks(best_text) if best_text else [{"id": "mech:empty", "hint": "no best plan yet"}]
-    checks.append({"name": "mechanical", "ok": not mech,
-                   "detail": str([c["hint"] for c in mech])[:120]})
-    if mech:
-        problems.extend([c["hint"] for c in mech])
-
-    v = verify(best_text) if best_text else {"ok": False, "errors": ["no best plan yet"]}
-    checks.append({"name": "verify", "ok": v["ok"], "detail": str(v["errors"])[:120]})
-    if not v["ok"]:
-        problems.extend(v["errors"])
-
-    gc = ground_check(best_text) if best_text else {"ok": False, "missing": ["no best plan yet"]}
-    checks.append({"name": "feasibility", "ok": bool(gc["ok"]),
-                   "detail": f"missing inputs: {gc['missing'][:3]}"})
-    if not gc["ok"]:
-        problems.append(f"declared inputs do not exist: {gc['missing'][:5]}")
-    # verified environment inputs seed the simulator's initial state, so a
-    # plan that reads real files simulates cleanly (same as assess())
-    sim = simulate(best_text, initial_state=set(gc.get("verified", []))) if best_text \
-        else {"executable_plan": False}
-    checks.append({"name": "simulation", "ok": bool(sim["executable_plan"]),
-                   "detail": str(sim.get("problems", []))[:120]})
-    if not sim["executable_plan"]:
-        problems.extend(sim.get("problems", []))
-
-    judge_ok = False
-    judge_detail = "no judge verdict recorded"
-    judges = s.get("judge_log", [])
-    best_ver = s.get("best_version")
-    matching_judge = None
-    if judges:
-        for j_entry in reversed(judges):
-            if j_entry.get("round_version") == best_ver or j_entry.get("round_version") is None:
-                matching_judge = j_entry
-                break
-    if matching_judge:
-        j = matching_judge
-        is_go = bool(j.get("ok") and j.get("verdict") == "go" and j.get("falsifiable_criteria"))
-        if require_external_judge:
-            is_external = bool(j.get("external") is True and j.get("source") == "external_llm")
-            judge_ok = is_go and is_external
-            judge_detail = f"round={j.get('round_version')} verdict={j.get('verdict')} source={j.get('source', 'unknown')} external={is_external}"
+    with session_lock(plans_dir, sid):
+        if isinstance(session, str):
+            s = _load_session(plans_dir, session)
         else:
-            judge_ok = is_go
-            judge_detail = f"round={j.get('round_version')} verdict={j.get('verdict')} source={j.get('source', 'unknown')} feasibility={j.get('feasibility_0_100')}"
-    checks.append({"name": "judge", "ok": judge_ok or not require_judge, "detail": judge_detail})
-    if require_judge and not judge_ok:
-        problems.append("judge gate not passed; run plan.judge + record_judge, fix blockers, re-assess")
+            s = session
 
-    ok = all(c["ok"] for c in checks)
-    report = {"ok": ok, "checks": checks, "problems": problems}
-    s["release_gate"] = report
-    _save_session(plans_dir, s)
-    return report
+        checks: list[dict[str, Any]] = []
+        problems: list[str] = []
+        historical: dict[str, Any] = {}
+
+        converged = s.get("status") == "converged"
+        checks.append({"name": "converged", "ok": converged,
+                       "detail": f"status={s.get('status')}"})
+        if not converged:
+            problems.append("plan has not converged; keep looping assess->revise")
+
+        best_score = s.get("best_score") or 0
+        checks.append({"name": "score", "ok": best_score >= min_score,
+                       "detail": f"best={best_score} >= {min_score}"})
+        if best_score < min_score:
+            problems.append(f"best score {best_score} < {min_score}; keep revising")
+
+        best_text = ""
+        if s.get("best_version") and s.get("rounds"):
+            best_round = s["rounds"][s["best_version"] - 1]
+            best_text = best_round.get("plan_text", "")
+
+        # Re-run canonical mechanical checks (deadlines, dates, task numbering, duplicates)
+        mech = _mechanical_checks(best_text) if best_text else [{"id": "mech:empty", "hint": "no best plan yet"}]
+        checks.append({"name": "mechanical", "ok": not mech,
+                       "detail": str([c["hint"] for c in mech])[:120]})
+        if mech:
+            problems.extend([c["hint"] for c in mech])
+
+        v = verify(best_text) if best_text else {"ok": False, "errors": ["no best plan yet"]}
+        checks.append({"name": "verify", "ok": v["ok"], "detail": str(v["errors"])[:120]})
+        if not v["ok"]:
+            problems.extend(v["errors"])
+
+        gc = ground_check(best_text) if best_text else {"ok": False, "missing": ["no best plan yet"]}
+        checks.append({"name": "feasibility", "ok": bool(gc["ok"]),
+                       "detail": f"missing inputs: {gc['missing'][:3]}"})
+        if not gc["ok"]:
+            problems.append(f"declared inputs do not exist: {gc['missing'][:5]}")
+        # verified environment inputs seed the simulator's initial state, so a
+        # plan that reads real files simulates cleanly (same as assess())
+        sim = simulate(best_text, initial_state=set(gc.get("verified", []))) if best_text \
+            else {"executable_plan": False}
+        checks.append({"name": "simulation", "ok": bool(sim["executable_plan"]),
+                       "detail": str(sim.get("problems", []))[:120]})
+        if not sim["executable_plan"]:
+            problems.extend(sim.get("problems", []))
+
+        judge_ok = False
+        judge_detail = "no judge verdict recorded"
+        judges = s.get("judge_log", [])
+        best_ver = s.get("best_version")
+        matching_judge = None
+        if judges:
+            for j_entry in reversed(judges):
+                if j_entry.get("round_version") == best_ver or j_entry.get("round_version") is None:
+                    matching_judge = j_entry
+                    break
+        if matching_judge:
+            j = matching_judge
+            is_go = bool(j.get("ok") and j.get("verdict") == "go" and j.get("falsifiable_criteria"))
+            if require_external_judge:
+                is_external = bool(j.get("external") is True and j.get("source") == "external_llm")
+                judge_ok = is_go and is_external
+                judge_detail = f"round={j.get('round_version')} verdict={j.get('verdict')} source={j.get('source', 'unknown')} external={is_external}"
+            else:
+                judge_ok = is_go
+                judge_detail = f"round={j.get('round_version')} verdict={j.get('verdict')} source={j.get('source', 'unknown')} feasibility={j.get('feasibility_0_100')}"
+        checks.append({"name": "judge", "ok": judge_ok or not require_judge, "detail": judge_detail})
+        if require_judge and not judge_ok:
+            problems.append("judge gate not passed; run plan.judge + record_judge, fix blockers, re-assess")
+
+        ok = all(c["ok"] for c in checks)
+        report = {"ok": ok, "checks": checks, "problems": problems}
+        s["release_gate"] = report
+        _save_session(plans_dir, s)
+        return report
 
 
 def finish(session: dict[str, Any] | str, *, verdict: str = "converged",
            plans_dir: str | Path | None = None, require_release: bool = True,
            min_score: float = 90.0) -> dict[str, Any]:
-    """Mark the session complete. With require_release (default), the plan is
-    only releasable after the release() gate passes; otherwise a
-    RuntimeError is raised so the loop continues instead of shipping early."""
-    if isinstance(session, str):
-        plans_dir = Path(plans_dir) if plans_dir else DEFAULT_PLANS_DIR
-        s = _load_session(plans_dir, session)
-    else:
-        s = session
-        plans_dir = Path(plans_dir) if plans_dir else Path(s.get("plans_dir") or DEFAULT_PLANS_DIR)
-    if require_release:
-        gate = release(s, min_score=min_score)
-        if not gate["ok"]:
-            raise RuntimeError("release gate failed: " + "; ".join(gate["problems"]))
-    s["status"] = "finished"
-    s["completed_at"] = _now()
-    s.setdefault("verdict", verdict)
-    _save_session(plans_dir, s)
-    return status(s)
+    """Mark the session complete with full session locking across release validation."""
+    plans_dir = Path(plans_dir) if plans_dir else (Path(session.get("plans_dir")) if isinstance(session, dict) and session.get("plans_dir") else DEFAULT_PLANS_DIR)
+    sid = session if isinstance(session, str) else session.get("session_id", "default")
+
+    with session_lock(plans_dir, sid):
+        if isinstance(session, str):
+            s = _load_session(plans_dir, session)
+        else:
+            s = session
+        if require_release:
+            gate = release(s, min_score=min_score, plans_dir=plans_dir)
+            if not gate["ok"]:
+                raise RuntimeError("release gate failed: " + "; ".join(gate["problems"]))
+        s["status"] = "finished"
+        s["completed_at"] = _now()
+        s.setdefault("verdict", verdict)
+        _save_session(plans_dir, s)
+        return status(s)
 
 
 
@@ -1014,41 +1017,40 @@ def rubric() -> dict[str, dict[str, Any]]:
 
 def log_progress(session: dict[str, Any] | str, task: str, status: str = "done",
                 *, evidence: str | None = None, plans_dir: str | Path | None = None) -> dict[str, Any]:
-    """Record plan execution progress (grounding, 2603.14248: each step must
-    have a detectable outcome). A failed/blocked step arms a replan trigger."""
-    plans_dir = Path(plans_dir) if plans_dir else DEFAULT_PLANS_DIR
-    if isinstance(session, str):
-        s = _load_session(plans_dir, session)
-    else:
-        s = session
-        plans_dir = Path(s.get("plans_dir") or plans_dir)
-    entry = {"ts": _now(), "task": task, "status": status, "evidence": evidence}
-    s.setdefault("execution_log", []).append(entry)
-    # loop closure (2606.22488): execution feedback updates the world model,
-    # so the next replan reads updated state instead of stale assumptions
-    if evidence:
-        s.setdefault("world_state", {})[task] = {"status": status, "evidence": evidence[:200]}
-    if status in ("failed", "blocked"):
-        retry_count = int(s.get("replan_retry_count", 0)) + 1
-        s["replan_retry_count"] = retry_count
-        s["replan_pending"] = True
-        s["replan_task"] = task
-        try:
-            failed_task_id = int(re.findall(r"\d+", task)[-1]) if re.findall(r"\d+", task) else 0
-            best_text = s["rounds"][s.get("best_version", 1) - 1].get("plan_text", "") if s.get("rounds") else ""
-            total_tasks = len(_task_blocks(best_text))
-            scope = ReplanningLadder.determine_replan_tier(
-                failed_task_id=failed_task_id,
-                error_message=evidence or status,
-                total_tasks=total_tasks,
-                retry_count=retry_count - 1
-            )
-            s["replan_scope"] = scope
-            s["replan_tier"] = scope.get("tier", s.get("replan_tier", 1))
-        except Exception:
-            pass
-    _save_session(plans_dir, s)
-    return entry
+    """Record plan execution progress with session locking for atomic read-modify-write safety."""
+    plans_dir = Path(plans_dir) if plans_dir else (Path(session.get("plans_dir")) if isinstance(session, dict) and session.get("plans_dir") else DEFAULT_PLANS_DIR)
+    sid = session if isinstance(session, str) else session.get("session_id", "default")
+
+    with session_lock(plans_dir, sid):
+        if isinstance(session, str):
+            s = _load_session(plans_dir, session)
+        else:
+            s = session
+        entry = {"ts": _now(), "task": task, "status": status, "evidence": evidence}
+        s.setdefault("execution_log", []).append(entry)
+        if evidence:
+            s.setdefault("world_state", {})[task] = {"status": status, "evidence": evidence[:200]}
+        if status in ("failed", "blocked"):
+            retry_count = int(s.get("replan_retry_count", 0)) + 1
+            s["replan_retry_count"] = retry_count
+            s["replan_pending"] = True
+            s["replan_task"] = task
+            try:
+                failed_task_id = int(re.findall(r"\d+", task)[-1]) if re.findall(r"\d+", task) else 0
+                best_text = s["rounds"][s.get("best_version", 1) - 1].get("plan_text", "") if s.get("rounds") else ""
+                total_tasks = len(_task_blocks(best_text))
+                scope = ReplanningLadder.determine_replan_tier(
+                    failed_task_id=failed_task_id,
+                    error_message=evidence or status,
+                    total_tasks=total_tasks,
+                    retry_count=retry_count - 1
+                )
+                s["replan_scope"] = scope
+                s["replan_tier"] = scope.get("tier", s.get("replan_tier", 1))
+            except Exception:
+                pass
+        _save_session(plans_dir, s)
+        return entry
 
 
 def suggest(session: dict[str, Any] | str, *, plans_dir: str | Path | None = None) -> list[dict[str, Any]]:

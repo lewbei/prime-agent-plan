@@ -286,7 +286,7 @@ def _prune(t: dict[str, Any], margin: float) -> None:
 async def search(session: dict[str, Any] | str, *,
                  iterations: int = 4, width: int = 2,
                  exploration: float = 1.4, cost_penalty: float = 0.0,
-                 mode: str = "mcts",            # "mcts" | "beam"
+                 mode: str = "mcts",            # "mcts" | "beam" | "ast"
                  expansion: str = "llm",        # "llm" | "rules"
                  judge_evals: bool = False,
                  max_nodes: int = 64,
@@ -294,6 +294,7 @@ async def search(session: dict[str, Any] | str, *,
                  prune_margin: float | None = 0.15,
                  model: str | None = None,
                  root_plan: str | None = None,
+                 cwd: str | Path | None = None,
                  plans_dir: str | Path | None = None) -> dict[str, Any]:
     """Run a search over plan space and return the best plan found.
 
@@ -370,7 +371,7 @@ async def search(session: dict[str, Any] | str, *,
     if mode in ("ast", "evolutionary"):
         from .ast_search import ASTSearchEngine, PlanParser
         from . import ground_check
-        gc = ground_check(root_plan, cwd=Path(plans_dir).parent if plans_dir else None)
+        gc = ground_check(root_plan, cwd=cwd or Path.cwd())
         initial_state = set(gc.get("verified", []))
         engine = ASTSearchEngine(objective=s.get("objective", ""), initial_state=initial_state, source_plan_text=root_plan)
         root_ast = PlanParser.parse_plan(root_plan, objective=s.get("objective", ""))

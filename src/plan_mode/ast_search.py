@@ -204,11 +204,17 @@ class ASTSearchEngine:
             m_first = re.search(r"^\s*1[.)]\s+", src_text, re.M)
             if m_first:
                 raw_header = src_text[:m_first.start()].strip()
-                # Clean trailing "## Tasks" from header to avoid cosmetic duplication
                 ast.metadata["header_section"] = re.sub(r"##\s*Tasks\s*$", "", raw_header, flags=re.I | re.M).strip()
-            m_footer = re.search(r"^##\s+(?:Risks|Milestones|Rollback|Constraints|Verification)", src_text, re.M)
-            if m_footer:
-                ast.metadata["footer_section"] = src_text[m_footer.start():].strip()
+
+                # Extract footer sections strictly AFTER the last task marker
+                task_markers = [m for m in re.finditer(r"^\s*\d+[.)]\s+", src_text, re.M)]
+                if task_markers:
+                    last_task_pos = task_markers[-1].start()
+                    m_footer = re.search(r"\n(?=##\s+)", src_text[last_task_pos:])
+                    if m_footer:
+                        ast.metadata["footer_section"] = src_text[last_task_pos + m_footer.start():].strip()
+                    else:
+                        ast.metadata["footer_section"] = ""
 
         val = CausalValidator.validate(ast, self.initial_state)
         shash = self._state_hash(ast)
