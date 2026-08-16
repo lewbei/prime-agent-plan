@@ -821,3 +821,62 @@ def test_finish_require_release_reentrant_lock(tmp_path):
     res = plan_mode.finish(s, plans_dir=plans_dir, require_release=True, require_judge=False, min_score=0.0)
     assert res["status"] == "finished"
     assert "release_gate" in res
+
+
+def test_session_lock_concurrent_threads_stress(tmp_path):
+    """Verify 8 concurrent worker threads performing read-modify-write on session log."""
+    plans_dir = tmp_path / "plans"
+    s = plan_mode.start("Concurrent Threads Stress Test", plans_dir=plans_dir)
+    sid = s["session_id"]
+
+    import concurrent.futures
+    def worker(worker_id):
+        for i in range(5):
+            plan_mode.log_progress(sid, f"Task {worker_id}-{i}", "done", plans_dir=plans_dir)
+            plan_mode.record_judge(sid, {"verdict": "improving", "worker": worker_id, "round": i}, plans_dir=plans_dir)
+        return worker_id
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=8) as executor:
+        futures = [executor.submit(worker, w) for w in range(8)]
+        for f in futures:
+            f.result()
+
+    final_s = plan_mode._load_session(plans_dir, sid)
+    assert len(final_s.get("execution_log", [])) == 40
+    assert len(final_s.get("judge_log", [])) == 40
+
+
+def test_session_lock_concurrent_subprocesses_stress(tmp_path):
+    """Verify separate OS processes with real POSIX fcntl.flock concurrency."""
+    plans_dir = tmp_path / "plans"
+    s = plan_mode.start("Subprocesses Stress Test", plans_dir=plans_dir)
+    sid = s["session_id"]
+
+    import os, subprocess
+    script = f"""
+import sys
+from pathlib import Path
+import plan_mode
+
+pdir = Path(r'{plans_dir}')
+sid = r'{sid}'
+worker_id = sys.argv[1]
+
+for i in range(5):
+    plan_mode.log_progress(sid, f'ProcTask-{{worker_id}}-{{i}}', 'done', plans_dir=pdir)
+"""
+    worker_py = tmp_path / "worker.py"
+    worker_py.write_text(script)
+
+    procs = []
+    repo_src = str(Path(plan_mode.__file__).resolve().parent.parent)
+    for i in range(4):
+        p = subprocess.Popen(["python3", str(worker_py), str(i)], env={"PYTHONPATH": repo_src, "PATH": os.environ.get("PATH", "")})
+        procs.append(p)
+
+    for p in procs:
+        ret = p.wait(timeout=10)
+        assert ret == 0
+
+    final_s = plan_mode._load_session(plans_dir, sid)
+    assert len(final_s.get("execution_log", [])) == 20
