@@ -358,16 +358,21 @@ class Context:
                         raise err
 
     async def async_dispose(self):
-        """Recover all effects executed under this context in LIFO order (async)."""
+        """Recover all effects executed under this context in LIFO order (async with sync fallback)."""
         with self._lock:
             if self._disposed:
                 return
             self._disposed = True
             to_run = list(reversed(self._inverses))
             self._inverses.clear()
-            for _, disp_async in to_run:
+            for disp_sync, disp_async in to_run:
                 try:
-                    await disp_async()
+                    if disp_async is not None:
+                        res = disp_async()
+                        if inspect.isawaitable(res):
+                            await res
+                    elif disp_sync is not None:
+                        disp_sync()
                 except Exception as err:
                     if isinstance(err, RuntimeError) and "Rollback aborted" in str(err):
                         raise err
