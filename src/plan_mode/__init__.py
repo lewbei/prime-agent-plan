@@ -500,6 +500,20 @@ def assess(session: dict[str, Any] | str, plan_text: str, *, note: str | None = 
             result["critiques"].append({"id": f"mech:sim:{prob[:40]}", "section": "mechanical",
                                         "hint": f"[simulation] {prob}"})
     result["simulation"] = sim
+    # RoT memory (2404.05449): distill negative rules from causal flaws and
+    # enforce them on subsequent candidate plans for this session.
+    rot_path = Path(plans_dir) / f"{session['session_id']}.rot.json"
+    rot_base = RoTRuleBase(storage_path=rot_path)
+    causal_flaws = (v.get("causal_validation") or {}).get("flaws", [])
+    rot_base.distill_from_flaws(causal_flaws, context_tag=session.get("objective", "general"))
+    rot_violations = rot_base.check_plan_violations(plan_text)
+    for viol in rot_violations:
+        result["critiques"].append({"id": f"mech:rot:{viol['rule_id']}", "section": "mechanical",
+                                    "hint": f"[learned rule] {viol['remedy']}"})
+    result["rot_rules"] = {
+        "learned": len(rot_base.rules),
+        "violations": [v["rule_id"] for v in rot_violations],
+    }
     # external judge: re-emit unresolved blockers from the last judge verdict
     # so the loop keeps revising until the judge says "go" (2510.03469)
     last_judge = session.get("judge_log", [{}])[-1] if session.get("judge_log") else None
@@ -560,13 +574,18 @@ def assess(session: dict[str, Any] | str, plan_text: str, *, note: str | None = 
         failed = session.get("replan_task") or "unknown task"
         # tiered replanning ladder (2605.25851): escalate across three levels
         tier = session.get("replan_tier", 1)
-        ladder = {
-            1: f"Execution failed on '{failed}': level 1 subgoal audit — re-check that task's deps and outputs before anything else.",
-            2: f"Execution failed on '{failed}' again: level 2 structured search — locate the failing resource/step and repair it specifically.",
-            3: f"Execution failed on '{failed}' again: level 3 preemptive global replan — redraft the affected phase, not just the step.",
-        }
+        scope = session.get("replan_scope")
+        if scope and scope.get("description"):
+            hint = scope["description"]
+        else:
+            ladder = {
+                1: f"Execution failed on '{failed}': level 1 subgoal audit — re-check that task's deps and outputs before anything else.",
+                2: f"Execution failed on '{failed}' again: level 2 structured search — locate the failing resource/step and repair it specifically.",
+                3: f"Execution failed on '{failed}' again: level 3 preemptive global replan — redraft the affected phase, not just the step.",
+            }
+            hint = ladder[min(tier, 3)]
         result["critiques"].insert(0, {"id": "mech:replan", "section": "mechanical",
-                                       "hint": ladder[min(tier, 3)]})
+                                       "hint": hint})
         session["replan_tier"] = min(tier + 1, 3)
         if "mech:replan" in addressed_set:
             session["replan_pending"] = False
@@ -603,7 +622,7 @@ def assess(session: dict[str, Any] | str, plan_text: str, *, note: str | None = 
         return {"version": version, "score": result["score"], "delta": delta,
                 "critiques": result["critiques"], "status": "converged",
                 "continue": False, "verify": result.get("verify"),
-                "simulation": result.get("simulation")}
+                "simulation": result.get("simulation"), "rot_rules": result.get("rot_rules")}
     # convergence rule: score must keep improving; allow MAX_PLATEAU_ROUNDS
     # non-improving rounds in a row before declaring convergence.
     recent = [r["score"] for r in session["rounds"]]
@@ -619,7 +638,7 @@ def assess(session: dict[str, Any] | str, plan_text: str, *, note: str | None = 
         return {"version": version, "score": result["score"], "delta": delta,
                 "critiques": result["critiques"], "status": "improving",
                 "continue": True, "verify": result.get("verify"),
-                "simulation": result.get("simulation")}
+                "simulation": result.get("simulation"), "rot_rules": result.get("rot_rules")}
     if plateau >= MAX_PLATEAU_ROUNDS and version >= 2:
         if len(_task_blocks(plan_text)) <= 3:
             result["critiques"].append({"id": "hint:over-refinement",
@@ -632,12 +651,12 @@ def assess(session: dict[str, Any] | str, plan_text: str, *, note: str | None = 
         return {"version": version, "score": result["score"], "delta": delta,
                 "critiques": result["critiques"], "status": "converged",
                 "continue": False, "verify": result.get("verify"),
-                "simulation": result.get("simulation")}
+                "simulation": result.get("simulation"), "rot_rules": result.get("rot_rules")}
     _save_session(plans_dir, session)
     return {"version": version, "score": result["score"], "delta": delta,
             "critiques": result["critiques"], "status": session["status"],
             "continue": True, "verify": result.get("verify"),
-            "simulation": result.get("simulation")}
+            "simulation": result.get("simulation"), "rot_rules": result.get("rot_rules")}
 
 
 def run(objective: str, draft_plan: str, *, plans_dir: str | Path | None = None,
@@ -948,8 +967,24 @@ def log_progress(session: dict[str, Any] | str, task: str, status: str = "done",
     if evidence:
         s.setdefault("world_state", {})[task] = {"status": status, "evidence": evidence[:200]}
     if status in ("failed", "blocked"):
+        retry_count = int(s.get("replan_retry_count", 0)) + 1
+        s["replan_retry_count"] = retry_count
         s["replan_pending"] = True
         s["replan_task"] = task
+        try:
+            failed_task_id = int(re.findall(r"\d+", task)[-1]) if re.findall(r"\d+", task) else 0
+            best_text = s["rounds"][s.get("best_version", 1) - 1].get("plan_text", "") if s.get("rounds") else ""
+            total_tasks = len(_task_blocks(best_text))
+            scope = ReplanningLadder.determine_replan_tier(
+                failed_task_id=failed_task_id,
+                error_message=evidence or status,
+                total_tasks=total_tasks,
+                retry_count=retry_count - 1
+            )
+            s["replan_scope"] = scope
+            s["replan_tier"] = scope.get("tier", s.get("replan_tier", 1))
+        except Exception:
+            pass
     _save_session(plans_dir, s)
     return entry
 
@@ -1154,9 +1189,20 @@ def verify(plan_text: str, *, initial_state: set[str] | list[str] | None = None,
                     errors.append(f"criterion {lab} has no covering task (no landmark chain)")
 
     # --- Formal Causal & Symbolic Validation (SymPlanner 2505.01479, GNNVerifier 2603.14730) ---
+    # Seed only environment inputs that actually exist. Internal handoffs are
+    # produced by earlier tasks in the causal simulation and must NOT be
+    # pre-seeded, otherwise missing producers would pass validation.
     gc = ground_check(plan_text, cwd=cwd)
-    dag_artifacts = {out for outs in dag["artifacts"].values() for out in outs}
-    init_state = set(gc.get("verified", [])) | set(initial_state or []) | dag_artifacts
+    init_state: set[str] = set(gc.get("verified", [])) | set(initial_state or [])
+    internal_artifacts = {out for outs in dag["artifacts"].values() for out in outs}
+    base = Path(cwd) if cwd else Path.cwd()
+    for raw in {inp for ins in dag["inputs"].values() for inp in ins}:
+        if raw in internal_artifacts:
+            continue
+        resolved = Path(raw) if Path(raw).is_absolute() else (base / raw)
+        if resolved.exists():
+            init_state.add(raw)
+            init_state.add(str(resolved))
     ast = PlanParser.parse_plan(plan_text)
     causal_res = CausalValidator.validate(ast, initial_state=init_state)
     for flaw in causal_res.get("flaws", []):
