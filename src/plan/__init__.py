@@ -28,6 +28,7 @@ while _repo != _repo.parent:
     _repo = _repo.parent
 
 from plan_mode import (  # noqa: E402
+    __version__,
     assess,
     assess_candidates,
     best,
@@ -81,13 +82,16 @@ from plan_mode import (  # noqa: E402
     RoTRuleBase,
     execute_plan_sync,
     speculative_rollout,
+    speculative_rollout_async,
 )
 
-__all__ = ["run", "start", "assess", "assess_candidates", "status", "history",
+__all__ = ["__version__", "run", "start", "assess", "assess_candidates", "status", "history",
            "best", "finish", "list_sessions", "rubric", "verify", "judge",
            "record_judge", "release", "plan_dag", "simulate", "plan_quality",
            "search_expand", "search_select", "search_backtrack", "search_report",
            "search", "log_progress", "suggest",
            "Context", "Fiber", "LifecycleState", "TwistedMonoid", "get_root_context",
            "reset_root_context", "create_subagent_context", "provide_tool",
-           "execute_plan", "session_lock", "ReplanningLadder", "RoTRuleBase", "ASTSearchEngine", "PlanParser", "CausalValidator", "ActionSchema", "execute_plan_sync", "speculative_rollout", "speculative_rollout_async"]
+           "execute_plan", "session_lock", "ReplanningLadder", "RoTRuleBase", "ASTSearchEngine",
+           "PlanParser", "CausalValidator", "ActionSchema", "execute_plan_sync",
+           "speculative_rollout", "speculative_rollout_async"]
