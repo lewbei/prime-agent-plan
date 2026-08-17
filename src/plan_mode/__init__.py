@@ -78,11 +78,13 @@ from typing import Any
 __version__ = "0.15.0"
 
 
-def _version_tuple(v: str | None) -> tuple[int, ...]:
+def _version_tuple(v: str | None) -> tuple[int, int, int]:
     if not v:
         return (0, 0, 0)
     try:
-        return tuple(int(x) for x in re.findall(r"\d+", str(v))[:3])
+        nums = [int(x) for x in re.findall(r"\d+", str(v))]
+        padded = (nums + [0, 0, 0])[:3]
+        return (padded[0], padded[1], padded[2])
     except Exception:
         return (0, 0, 0)
 
@@ -852,9 +854,13 @@ def history(session: dict[str, Any] | str, *, plans_dir: str | Path | None = Non
 def best(session: dict[str, Any] | str, *, plans_dir: str | Path | None = None) -> dict[str, Any]:
     plans_dir = Path(plans_dir) if plans_dir else DEFAULT_PLANS_DIR
     s = _load_session(plans_dir, session) if isinstance(session, str) else session
-    if s["best_version"] is None:
+    ver = s.get("best_version")
+    rounds = s.get("rounds") or []
+    if ver is None or not rounds:
         return {"error": "no versions recorded yet"}
-    r = s["rounds"][s["best_version"] - 1]
+    if not (1 <= ver <= len(rounds)):
+        return {"error": f"best version {ver} out of bounds (total rounds: {len(rounds)})"}
+    r = rounds[ver - 1]
     return {"version": r["version"], "score": r["score"], "critiques": r["critiques"],
             "sections": r["sections"], "plan_text": r["plan_text"]}
 
@@ -868,9 +874,12 @@ def committed(session: dict[str, Any] | str, *, plans_dir: str | Path | None = N
     plans_dir = Path(plans_dir) if plans_dir else DEFAULT_PLANS_DIR
     s = _load_session(plans_dir, session) if isinstance(session, str) else session
     ver = s.get("committed_version")
-    if ver is None or not s.get("rounds"):
+    rounds = s.get("rounds") or []
+    if ver is None or not rounds:
         return {"error": "no committed plan yet; run release() successfully first"}
-    r = s["rounds"][ver - 1]
+    if not (1 <= ver <= len(rounds)):
+        return {"error": f"committed version {ver} out of bounds (total rounds: {len(rounds)})"}
+    r = rounds[ver - 1]
     return {"version": ver, "score": s.get("committed_score"),
             "committed_at": s.get("committed_at"),
             "plan_hash": s.get("committed_plan_hash"),
@@ -932,7 +941,12 @@ def rewind(session: dict[str, Any] | str, checkpoint_id: str | None = None, *,
         cps = s.get("checkpoints") or []
         if not cps:
             raise ValueError("no checkpoints recorded for this session")
-        cp = next((c for c in reversed(cps) if c.get("id") == checkpoint_id), cps[-1]) if checkpoint_id else cps[-1]
+        if checkpoint_id:
+            cp = next((c for c in reversed(cps) if c.get("id") == checkpoint_id), None)
+            if cp is None:
+                raise ValueError(f"checkpoint '{checkpoint_id}' not found in session")
+        else:
+            cp = cps[-1]
         snap = cp.get("snapshot", {})
         for k, v in snap.items():
             s[k] = copy.deepcopy(v)

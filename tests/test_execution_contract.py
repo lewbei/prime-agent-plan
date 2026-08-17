@@ -155,3 +155,126 @@ def test_release_requires_passed_probe(tmp_path):
                              execution_cwd=tmp_path, plans_dir=tmp_path)
     assert gate["ok"] is False
     assert any("probe" in p.lower() for p in gate["problems"])
+
+def test_contract_defensive_null_and_primitive_handling():
+    """Verify parse_execution_contract handles nulls and non-dict/list primitives without crashing."""
+    raw_plan = """# Goal
+Goal: Test null handling.
+
+## Tasks
+1. Task A. Output: out.txt.
+
+## Execution Contract
+```json
+{
+  "probe": null,
+  "verification_commands": null,
+  "expected_artifacts": null,
+  "workspace_invariants": null,
+  "parity_checks": null,
+  "symbols": null
+}
+```
+"""
+    contract, errors = plan_mode.parse_execution_contract(raw_plan)
+    assert contract is not None
+    assert contract.probe == {}
+    assert contract.verification_commands == []
+    assert contract.expected_artifacts == {}
+    assert contract.workspace_invariants == []
+    assert contract.parity_checks == []
+    assert contract.symbols == {}
+
+    val = plan_mode.validate_execution_contract(raw_plan)
+    assert val["ok"] is False
+    assert any("verification command" in e for e in val["errors"])
+
+
+def test_contract_indented_markdown_fences():
+    """Verify indented markdown code fences are recognized."""
+    raw_plan = """# Goal
+Goal: Test indentation.
+
+## Tasks
+1. Task A. Output: a.py.
+
+   ## Execution Contract
+   ```json
+   {
+     "verification_commands": [["python", "-V"]],
+     "expected_artifacts": {"a.py": {"min_lines": 1}},
+     "symbols": {"a.py": {"functions": ["run"]}}
+   }
+   ```
+"""
+    contract, errors = plan_mode.parse_execution_contract(raw_plan)
+    assert contract is not None
+    assert len(contract.verification_commands) == 1
+    val = plan_mode.validate_execution_contract(raw_plan)
+    assert val["ok"] is True
+
+
+def test_contract_invalid_budget_integers(tmp_path):
+    """Verify malformed non-integer budget values do not crash."""
+    (tmp_path / "a.py").write_text("x = 1\n")
+    plan = _plan_with_contract({
+        "verification_commands": [["python", "-V"]],
+        "expected_artifacts": {"a.py": {"min_bytes": "100KB", "min_lines": "ten"}, "report.txt": {"min_lines": 1}},
+        "symbols": {"a.py": {"variables": ["x"]}}
+    })
+    val = plan_mode.validate_execution_contract(plan, cwd=tmp_path)
+    assert val["ok"] is False
+    assert any("not a valid integer" in e for e in val["errors"])
+
+
+def test_probe_missing_binary_no_crash(tmp_path):
+    """Verify missing executable binary returns ok=False cleanly without raising FileNotFoundError."""
+    plan = _plan_with_contract({
+        "probe": {"command": ["non_existent_binary_xyz_12345", "--version"]},
+        "verification_commands": [["python", "-V"]],
+        "expected_artifacts": {"runner.py": {"min_lines": 1}, "report.txt": {"min_lines": 1}},
+        "symbols": {"runner.py": {"functions": ["main"]}}
+    })
+    probe = plan_mode.probe_contract(plan, cwd=tmp_path)
+    assert probe["ok"] is False
+    assert any("probe failed" in e for e in probe["errors"])
+
+
+def test_symbol_audit_ignores_inner_locals_and_class_methods(tmp_path):
+    """Verify local variables inside functions and class methods don't cause false positives in symbol audit."""
+    src = """import sys
+
+GLOBAL_VAR = "hello"
+
+class Worker:
+    def __init__(self, name):
+        self.name = name
+
+    def compute(self):
+        temp_val = 42
+        return temp_val * 2
+
+def run():
+    local_calc = [i * 2 for i in range(5)]
+    return len(local_calc)
+"""
+    (tmp_path / "worker.py").write_text(src)
+    plan = _plan_with_contract({
+        "verification_commands": [["python", "-V"]],
+        "expected_artifacts": {"worker.py": {"min_lines": 1}, "report.txt": {"min_lines": 1}},
+        "symbols": {"worker.py": {"functions": ["run"], "classes": ["Worker"], "variables": ["GLOBAL_VAR"]}}
+    })
+    audit = plan_mode.symbol_audit(plan, cwd=tmp_path)
+    assert audit["ok"] is True, audit["errors"]
+
+
+def test_symbol_audit_non_python_artifacts(tmp_path):
+    """Verify non-Python artifacts in symbol contracts don't trigger missing file false alarms."""
+    (tmp_path / "config.json").write_text('{"key": "value"}\n')
+    plan = _plan_with_contract({
+        "verification_commands": [["python", "-V"]],
+        "expected_artifacts": {"config.json": {"min_lines": 1}, "report.txt": {"min_lines": 1}},
+        "symbols": {"config.json": {"variables": []}}
+    })
+    audit = plan_mode.symbol_audit(plan, cwd=tmp_path)
+    assert audit["files"]["config.json"].get("non_python") is True

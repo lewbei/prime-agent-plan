@@ -85,3 +85,55 @@ def test_replanning_ladder_has_drift_tier():
     )
     assert tier["tier"] == 4
     assert tier["scope"] == "runtime_drift_recovery"
+
+
+def test_rewind_invalid_checkpoint_raises_error(tmp_path):
+    """Verify rewind raises ValueError when an unknown checkpoint ID is supplied."""
+    s = plan_mode.start("invalid cp", plans_dir=tmp_path)
+    plan_mode.assess(s, _valid_plan("first"), plans_dir=tmp_path)
+    plan_mode.checkpoint(s, note="good cp")
+    with pytest.raises(ValueError, match="checkpoint 'non-existent-cp-id' not found"):
+        plan_mode.rewind(s, checkpoint_id="non-existent-cp-id")
+
+
+def test_committed_and_best_out_of_bounds(tmp_path):
+    """Verify best() and committed() return error dictionaries on invalid versions rather than crashing."""
+    s = plan_mode.start("bounds check", plans_dir=tmp_path)
+    assert "error" in plan_mode.best(s)
+    assert "error" in plan_mode.committed(s)
+
+    plan_mode.assess(s, _valid_plan("first"), plans_dir=tmp_path)
+    s["best_version"] = 99
+    assert "out of bounds" in plan_mode.best(s).get("error", "")
+
+    s["best_version"] = 0
+    assert "out of bounds" in plan_mode.best(s).get("error", "")
+
+    s["best_version"] = 1
+    s["committed_version"] = 99
+    assert "out of bounds" in plan_mode.committed(s).get("error", "")
+
+
+def test_replanning_ladder_tier2_on_last_task_and_key_consistency():
+    """Verify Tier 2 replanning works on final task and consistently exports task_id."""
+    tier1 = ReplanningLadder.determine_replan_tier(failed_task_id=2, error_message="timeout", total_tasks=5, retry_count=0)
+    assert tier1["task_id"] == 2
+
+    tier2 = ReplanningLadder.determine_replan_tier(failed_task_id=5, error_message="compilation error", total_tasks=5, retry_count=1)
+    assert tier2["tier"] == 2
+    assert tier2["task_id"] == 5
+    assert tier2["failed_task_id"] == 5
+
+    tier4 = ReplanningLadder.determine_replan_tier(failed_task_id=3, error_message="schema violation divergence", total_tasks=5, retry_count=0)
+    assert tier4["task_id"] == 3
+
+
+def test_version_tuple_zero_padding():
+    """Verify _version_tuple zero-pads two-part and single-part versions so Python tuple comparison works."""
+    from plan_mode import _version_tuple
+    assert _version_tuple("0.14") == (0, 14, 0)
+    assert _version_tuple("0.14.0") == (0, 14, 0)
+    assert _version_tuple("0.14") >= (0, 14, 0)
+    assert _version_tuple("0.13.9") < (0, 14, 0)
+    assert _version_tuple("1") == (1, 0, 0)
+    assert _version_tuple(None) == (0, 0, 0)

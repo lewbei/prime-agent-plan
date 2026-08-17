@@ -57,10 +57,12 @@ def parse_execution_contract(plan_text: str) -> tuple[Optional[ExecutionContract
     errors: list[str] = []
     candidates: list[str] = []
 
-    m = re.search(r"##\s*Execution\s+Contract.*?\n```json\s*\n(.*?)\n```", plan_text, re.I | re.S)
+    pattern1 = r"##\s*Execution\s+Contract.*?\n[ \t]*```json\s*\n(.*?)\n[ \t]*```"
+    m = re.search(pattern1, plan_text, re.I | re.S)
     if m:
         candidates.append(m.group(1))
-    for block in re.finditer(r"```json\s*\n(.*?)\n```", plan_text, re.I | re.S):
+    pattern2 = r"[ \t]*```json\s*\n(.*?)\n[ \t]*```"
+    for block in re.finditer(pattern2, plan_text, re.I | re.S):
         payload = block.group(1)
         if "verification_commands" in payload or "probe" in payload or "symbols" in payload:
             candidates.append(payload)
@@ -81,13 +83,31 @@ def parse_execution_contract(plan_text: str) -> tuple[Optional[ExecutionContract
     if data is None:
         return None, errors or ["execution contract JSON is invalid"]
 
+    raw_probe = data.get("probe")
+    probe = raw_probe if isinstance(raw_probe, dict) else {}
+
+    raw_cmds = data.get("verification_commands")
+    verification_commands = [cmd for cmd in raw_cmds if isinstance(cmd, list)] if isinstance(raw_cmds, list) else []
+
+    raw_artifacts = data.get("expected_artifacts")
+    expected_artifacts = {str(k): (v if isinstance(v, dict) else {}) for k, v in raw_artifacts.items()} if isinstance(raw_artifacts, dict) else {}
+
+    raw_invariants = data.get("workspace_invariants")
+    workspace_invariants = [str(x) for x in raw_invariants] if isinstance(raw_invariants, list) else []
+
+    raw_parity = data.get("parity_checks")
+    parity_checks = [p for p in raw_parity if isinstance(p, dict)] if isinstance(raw_parity, list) else []
+
+    raw_symbols = data.get("symbols")
+    symbols = {str(k): (v if isinstance(v, dict) else {}) for k, v in raw_symbols.items()} if isinstance(raw_symbols, dict) else {}
+
     contract = ExecutionContract(
-        probe=data.get("probe", {}) if isinstance(data.get("probe"), dict) else {},
-        verification_commands=[cmd for cmd in data.get("verification_commands", []) if isinstance(cmd, list)],
-        expected_artifacts={str(k): (v if isinstance(v, dict) else {}) for k, v in data.get("expected_artifacts", {}).items()},
-        workspace_invariants=[str(x) for x in data.get("workspace_invariants", [])],
-        parity_checks=[p for p in data.get("parity_checks", []) if isinstance(p, dict)],
-        symbols={str(k): (v if isinstance(v, dict) else {}) for k, v in data.get("symbols", {}).items()},
+        probe=probe,
+        verification_commands=verification_commands,
+        expected_artifacts=expected_artifacts,
+        workspace_invariants=workspace_invariants,
+        parity_checks=parity_checks,
+        symbols=symbols,
         raw=data,
     )
     return contract, errors
@@ -112,8 +132,8 @@ def validate_execution_contract(plan_text: str, *, cwd: str | Path | None = None
             errors.append(f"invalid verification command: {cmd!r}")
             break
 
-    ast = PlanParser.parse_plan(plan_text)
-    declared_outputs = {out for action in ast.actions for out in action.outputs}
+    ast_tree = PlanParser.parse_plan(plan_text)
+    declared_outputs = {out for action in ast_tree.actions for out in action.outputs}
     if declared_outputs:
         missing = sorted(out for out in declared_outputs if out not in contract.expected_artifacts)
         if missing:
@@ -123,82 +143,78 @@ def validate_execution_contract(plan_text: str, *, cwd: str | Path | None = None
         p = Path(cwd or Path.cwd()) / path
         if p.exists():
             size = p.stat().st_size
-            if budget.get("min_bytes") and size < int(budget["min_bytes"]):
-                errors.append(f"{path}: actual {size} bytes < min_bytes {budget['min_bytes']}")
-            if budget.get("min_lines"):
+            if budget.get("min_bytes") is not None:
                 try:
-                    lines = len(p.read_text(encoding="utf-8").splitlines())
-                except Exception:
-                    lines = 0
-                if lines < int(budget["min_lines"]):
-                    errors.append(f"{path}: actual {lines} lines < min_lines {budget['min_lines']}")
+                    min_bytes = int(budget["min_bytes"])
+                    if size < min_bytes:
+                        errors.append(f"{path}: actual {size} bytes < min_bytes {min_bytes}")
+                except (ValueError, TypeError):
+                    errors.append(f"{path}: min_bytes budget '{budget.get('min_bytes')}' is not a valid integer")
+            if budget.get("min_lines") is not None:
+                try:
+                    min_lines = int(budget["min_lines"])
+                    try:
+                        lines = len(p.read_text(encoding="utf-8").splitlines())
+                    except Exception:
+                        lines = 0
+                    if lines < min_lines:
+                        errors.append(f"{path}: actual {lines} lines < min_lines {min_lines}")
+                except (ValueError, TypeError):
+                    errors.append(f"{path}: min_lines budget '{budget.get('min_lines')}' is not a valid integer")
 
     for path, syms in contract.symbols.items():
-        functions = syms.get("functions", [])
-        variables = syms.get("variables", [])
-        if not functions and not variables:
-            errors.append(f"symbol contract for {path} must declare at least one function or variable")
+        functions = syms.get("functions", []) if isinstance(syms, dict) else []
+        classes = syms.get("classes", []) if isinstance(syms, dict) else []
+        variables = syms.get("variables", []) if isinstance(syms, dict) else []
+        if not functions and not classes and not variables:
+            errors.append(f"symbol contract for {path} must declare at least one function, class, or variable")
 
     return {"ok": not errors, "errors": errors, "contract": contract,
             "declared_outputs": sorted(declared_outputs)}
 
 
 def _symbols_from_source(source: str) -> dict[str, set[str]]:
+    """Extract top-level module functions, classes, and variables from Python source."""
     tree = ast.parse(source)
     funcs: set[str] = set()
     classes: set[str] = set()
     vars_: set[str] = set()
 
-    class Visitor(ast.NodeVisitor):
-        def visit_FunctionDef(self, node):  # noqa: N802
-            funcs.add(node.name)
-            self.generic_visit(node)
+    def _extract_target(target):
+        if isinstance(target, ast.Name):
+            vars_.add(target.id)
+        elif isinstance(target, (ast.Tuple, ast.List)):
+            for elt in target.elts:
+                _extract_target(elt)
 
-        def visit_AsyncFunctionDef(self, node):  # noqa: N802
+    for node in tree.body:
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
             funcs.add(node.name)
-            self.generic_visit(node)
-
-        def visit_ClassDef(self, node):  # noqa: N802
+        elif isinstance(node, ast.ClassDef):
             classes.add(node.name)
-            self.generic_visit(node)
-
-        def _add_target(self, target):
-            if isinstance(target, ast.Name):
-                vars_.add(target.id)
-            elif isinstance(target, (ast.Tuple, ast.List)):
-                for elt in target.elts:
-                    self._add_target(elt)
-
-        def visit_Assign(self, node):  # noqa: N802
+        elif isinstance(node, ast.Assign):
             for target in node.targets:
-                self._add_target(target)
-            self.generic_visit(node)
+                _extract_target(target)
+        elif isinstance(node, (ast.AnnAssign, ast.AugAssign)):
+            _extract_target(node.target)
+        elif isinstance(node, ast.NamedExpr):
+            _extract_target(node.target)
 
-        def visit_AnnAssign(self, node):  # noqa: N802
-            self._add_target(node.target)
-            self.generic_visit(node)
-
-        def visit_AugAssign(self, node):  # noqa: N802
-            self._add_target(node.target)
-            self.generic_visit(node)
-
-        def visit_NamedExpr(self, node):  # noqa: N802
-            self._add_target(node.target)
-            self.generic_visit(node)
-
-    Visitor().visit(tree)
     return {"functions": funcs, "classes": classes, "variables": vars_}
 
 
 def scan_symbols(paths: list[str] | tuple[str, ...] | set[str], *,
-                 cwd: str | Path | None = None) -> dict[str, dict[str, list[str]]]:
+                 cwd: str | Path | None = None) -> dict[str, dict[str, Any]]:
     """Return actual functions/classes/variables for each existing Python file."""
     base = Path(cwd or Path.cwd())
-    out: dict[str, dict[str, list[str]]] = {}
+    out: dict[str, dict[str, Any]] = {}
     for raw in paths:
         p = Path(raw) if Path(raw).is_absolute() else base / raw
-        if not p.exists() or p.suffix != ".py":
+        if not p.exists():
             out[raw] = {"functions": [], "classes": [], "variables": [], "missing": True}
+            continue
+        if p.suffix != ".py":
+            out[raw] = {"functions": [], "classes": [], "variables": [], "non_python": True}
             continue
         try:
             found = _symbols_from_source(p.read_text(encoding="utf-8"))
@@ -223,32 +239,46 @@ def symbol_audit(plan_text: str, *, cwd: str | Path | None = None) -> dict[str, 
             errors.append(f"{path}: declared symbol file is missing")
             files[path] = {"missing": True}
             continue
+        if found.get("non_python"):
+            files[path] = {"non_python": True}
+            continue
         if found.get("syntax_error"):
             errors.append(f"{path}: syntax error: {found['syntax_error']}")
             files[path] = found
             continue
-        expected_funcs = {str(x) for x in declared.get("functions", [])}
-        expected_vars = {str(x) for x in declared.get("variables", [])}
+        expected_funcs = {str(x) for x in declared.get("functions", [])} if isinstance(declared, dict) else set()
+        expected_classes = {str(x) for x in declared.get("classes", [])} if isinstance(declared, dict) else set()
+        expected_vars = {str(x) for x in declared.get("variables", [])} if isinstance(declared, dict) else set()
         actual_funcs = set(found.get("functions", []))
-        actual_vars = set(found.get("variables", [])) | set(found.get("classes", []))
+        actual_classes = set(found.get("classes", []))
+        actual_vars = set(found.get("variables", []))
         missing_funcs = sorted(expected_funcs - actual_funcs)
-        missing_vars = sorted(expected_vars - actual_vars)
+        missing_classes = sorted(expected_classes - actual_classes)
+        missing_vars = sorted(expected_vars - (actual_vars | actual_classes))
         undeclared_funcs = sorted(actual_funcs - expected_funcs)
-        undeclared_vars = sorted(actual_vars - expected_vars)
+        undeclared_classes = sorted(actual_classes - (expected_classes | expected_vars))
+        undeclared_vars = sorted(actual_vars - (expected_vars | expected_classes))
         files[path] = {
             "missing_functions": missing_funcs,
+            "missing_classes": missing_classes,
             "missing_variables": missing_vars,
             "undeclared_functions": undeclared_funcs,
+            "undeclared_classes": undeclared_classes,
             "undeclared_variables": undeclared_vars,
             "actual_functions": sorted(actual_funcs),
+            "actual_classes": sorted(actual_classes),
             "actual_variables": sorted(actual_vars),
         }
         if missing_funcs:
             errors.append(f"{path}: missing declared functions: {missing_funcs}")
+        if missing_classes:
+            errors.append(f"{path}: missing declared classes: {missing_classes}")
         if missing_vars:
             errors.append(f"{path}: missing declared variables: {missing_vars}")
         if undeclared_funcs:
             errors.append(f"{path}: undeclared functions not listed in contract: {undeclared_funcs}")
+        if undeclared_classes:
+            errors.append(f"{path}: undeclared classes not listed in contract: {undeclared_classes}")
         if undeclared_vars:
             errors.append(f"{path}: undeclared variables not listed in contract: {undeclared_vars}")
     return {"ok": not errors, "errors": errors, "files": files, "contract": contract}
@@ -313,6 +343,9 @@ def run_command(cmd: list[str], *, cwd: str | Path | None = None,
     except subprocess.TimeoutExpired:
         return {"command": cmd, "exit_code": None, "ok": False, "stdout": "",
                 "stderr": "timeout", "timeout": True}
+    except (FileNotFoundError, PermissionError, OSError) as exc:
+        return {"command": cmd, "exit_code": None, "ok": False, "stdout": "",
+                "stderr": f"command execution failed: {exc}", "timeout": False}
 
 
 def probe_contract(plan_text: str, *, cwd: str | Path | None = None,
@@ -337,6 +370,6 @@ def probe_contract(plan_text: str, *, cwd: str | Path | None = None,
     expected = str(probe.get("expected_output", "")).strip()
     matched = not expected or expected in (result.get("stdout") or "")
     ok = bool(result.get("ok")) and matched
-    errors = [] if ok else [f"probe failed (exit={result.get('exit_code')}, expected_output={'present' if expected else 'none'})"]
+    errors = [] if ok else [f"probe failed (exit={result.get('exit_code')}, expected_output={'present' if expected else 'none'}, stderr={result.get('stderr')[:200]})"]
     return {"ok": ok, "configured": True, "errors": errors, "result": result,
             "expected_output": expected, "matched": matched, "probe": probe}

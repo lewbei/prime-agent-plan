@@ -315,10 +315,11 @@ class ReplanningLadder:
                 "description": f"Tier 1 Replan: Adjust task {failed_task_id} parameters without modifying DAG"
             }
 
-        if retry_count <= 2 and failed_task_id < total_tasks:
+        if retry_count <= 2 and failed_task_id <= total_tasks:
             return {
                 "tier": 2,
                 "scope": "subgraph_replan",
+                "task_id": failed_task_id,
                 "failed_task_id": failed_task_id,
                 "action": "replan_subgraph_from_failure",
                 "description": f"Tier 2 Replan: Preserve validated prefix (Tasks 1..{failed_task_id-1}), replan from Task {failed_task_id} onwards"

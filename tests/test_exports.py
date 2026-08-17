@@ -33,8 +33,8 @@ def test_all_skill_documented_symbols_exported():
         "start", "assess", "assess_candidates", "search", "verify", "ground_check",
         "simulate", "record_judge", "committed", "checkpoint", "rewind", "release",
         "finish", "log_progress", "fold_history", "validate_execution_contract",
-        "probe_contract", "symbol_audit", "execute_plan", "speculative_rollout",
-        "create_subagent_context", "provide_tool", "selfcheck"
+        "probe_contract", "symbol_audit", "parity_audit", "run_verification_commands",
+        "execute_plan", "speculative_rollout", "create_subagent_context", "provide_tool", "selfcheck"
     ]
 
     for sym in expected_symbols:
