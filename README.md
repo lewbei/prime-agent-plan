@@ -584,3 +584,9 @@ angle$ asserting that step $a_i$ achieves condition $p$ consumed by step $a_j$.
 - **Explore / Commit Separation**: `best()` is the best explored plan; `committed()` is the last successfully released plan. Only `release()` promotes best to committed.
 - **Aligned Session Checkpoints**: `checkpoint()` stores a deep session snapshot; `rewind()` restores rounds, search tree, execution log, and world state with a rewind-log entry (AgentRewind 2608.14380).
 - **Search Checkpoints**: `search(..., checkpoint_before=True)` records a recoverable checkpoint before expansion begins.
+
+### 6. Execution Contracts & Anti-Stub Verification
+- **`## Execution Contract` JSON**: every implementation plan can declare `probe`, `verification_commands`, `expected_artifacts`, `workspace_invariants`, `parity_checks`, and `symbols`.
+- **Minimal Probe**: `probe_contract()` runs the spike before full implementation; `assess(..., run_probe=True)` emits `mech:probe:*` critiques on failure.
+- **Symbol Registry**: `symbol_audit()` compares declared functions/variables against real source files and flags missing declarations plus undeclared helpers — the classic stub loophole.
+- **Gate Integration**: `release(..., require_execution_contract=True)` refuses to release plans without a valid execution contract.

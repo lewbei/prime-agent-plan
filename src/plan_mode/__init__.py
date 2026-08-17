@@ -48,6 +48,14 @@ from .memory_distiller import (
     RoTRule,
     RoTRuleBase,
 )
+from .execution_contract import (
+    ExecutionContract,
+    parse_execution_contract,
+    probe_contract,
+    scan_symbols,
+    symbol_audit,
+    validate_execution_contract,
+)
 
 import asyncio
 import copy
@@ -553,7 +561,9 @@ def start(objective: str, *, plans_dir: str | Path | None = None, max_rounds: in
 
 
 def assess(session: dict[str, Any] | str, plan_text: str, *, note: str | None = None,
-           addressed: list[str] | None = None, plans_dir: str | Path | None = None) -> dict[str, Any]:
+           addressed: list[str] | None = None, plans_dir: str | Path | None = None,
+           require_execution_contract: bool = False,
+           run_probe: bool = False, probe_cwd: str | Path | None = None) -> dict[str, Any]:
     """Score a plan version, record it, and return critiques + loop status.
 
     session may be the session dict (from start) or a session_id string.
@@ -611,6 +621,22 @@ def assess(session: dict[str, Any] | str, plan_text: str, *, note: str | None = 
                 result["critiques"].append({"id": f"mech:sim:{prob[:40]}", "section": "mechanical",
                                             "hint": f"[simulation] {prob}"})
         result["simulation"] = sim
+        # Execution contract (ACID-Agent 2608.13900): plans for real work must
+        # declare commands, artifact budgets, and symbol contracts. Optionally
+        # run the minimal probe now; failed probes force plan revision.
+        ec = validate_execution_contract(plan_text, cwd=probe_cwd or Path.cwd())
+        result["execution_contract"] = ec
+        if require_execution_contract or ec.get("contract") is not None:
+            for err in ec.get("errors", []):
+                result["critiques"].append({"id": f"mech:contract:{err[:40]}",
+                                            "section": "mechanical", "hint": f"[execution contract] {err}"})
+        if run_probe:
+            probe = probe_contract(plan_text, cwd=probe_cwd or Path.cwd())
+            result["probe"] = probe
+            if not probe.get("ok"):
+                for err in probe.get("errors", []) or [probe.get("message") or "probe failed"]:
+                    result["critiques"].append({"id": f"mech:probe:{err[:40]}",
+                                                "section": "mechanical", "hint": f"[feasibility probe] {err}"})
         # RoT memory (2404.05449): distill negative rules from causal flaws and
         # enforce them on subsequent candidate plans for this session.
         rot_path = Path(plans_dir) / f"{session['session_id']}.rot.json"
@@ -734,7 +760,8 @@ def assess(session: dict[str, Any] | str, plan_text: str, *, note: str | None = 
             return {"version": version, "score": result["score"], "delta": delta,
                     "critiques": result["critiques"], "status": "converged",
                     "continue": False, "verify": result.get("verify"),
-                    "simulation": result.get("simulation"), "rot_rules": result.get("rot_rules")}
+                    "simulation": result.get("simulation"), "rot_rules": result.get("rot_rules"),
+                "execution_contract": result.get("execution_contract"), "probe": result.get("probe")}
         # convergence rule: score must keep improving; allow MAX_PLATEAU_ROUNDS
         # non-improving rounds in a row before declaring convergence.
         recent = [r["score"] for r in session["rounds"]]
@@ -750,7 +777,8 @@ def assess(session: dict[str, Any] | str, plan_text: str, *, note: str | None = 
             return {"version": version, "score": result["score"], "delta": delta,
                     "critiques": result["critiques"], "status": "improving",
                     "continue": True, "verify": result.get("verify"),
-                    "simulation": result.get("simulation"), "rot_rules": result.get("rot_rules")}
+                    "simulation": result.get("simulation"), "rot_rules": result.get("rot_rules"),
+                "execution_contract": result.get("execution_contract"), "probe": result.get("probe")}
         if plateau >= MAX_PLATEAU_ROUNDS and version >= 2:
             if len(_task_blocks(plan_text)) <= 3:
                 result["critiques"].append({"id": "hint:over-refinement",
@@ -763,12 +791,14 @@ def assess(session: dict[str, Any] | str, plan_text: str, *, note: str | None = 
             return {"version": version, "score": result["score"], "delta": delta,
                     "critiques": result["critiques"], "status": "converged",
                     "continue": False, "verify": result.get("verify"),
-                    "simulation": result.get("simulation"), "rot_rules": result.get("rot_rules")}
+                    "simulation": result.get("simulation"), "rot_rules": result.get("rot_rules"),
+                "execution_contract": result.get("execution_contract"), "probe": result.get("probe")}
         _save_session(plans_dir, session)
         return {"version": version, "score": result["score"], "delta": delta,
                 "critiques": result["critiques"], "status": session["status"],
                 "continue": True, "verify": result.get("verify"),
-                "simulation": result.get("simulation"), "rot_rules": result.get("rot_rules")}
+                "simulation": result.get("simulation"), "rot_rules": result.get("rot_rules"),
+                "execution_contract": result.get("execution_contract"), "probe": result.get("probe")}
 
 
 def run(objective: str, draft_plan: str, *, plans_dir: str | Path | None = None,
@@ -905,6 +935,8 @@ def rewind(session: dict[str, Any] | str, checkpoint_id: str | None = None, *,
 def release(session: dict[str, Any] | str, *, min_score: float = 90.0,
             require_judge: bool = True,
             require_external_judge: bool = False,
+            require_execution_contract: bool = False,
+            execution_cwd: str | Path | None = None,
             plans_dir: str | Path | None = None) -> dict[str, Any]:
     """Release gate (2602.08948 confidence-gated checkpoints, 2608.10729
     acceptance thresholds): a plan may only be released to execution after
@@ -971,6 +1003,16 @@ def release(session: dict[str, Any] | str, *, min_score: float = 90.0,
         if not sim["executable_plan"]:
             problems.extend(sim.get("problems", []))
 
+        ec = validate_execution_contract(best_text, cwd=execution_cwd or Path.cwd()) if best_text \
+            else {"ok": False, "errors": ["no best plan yet"], "contract": None}
+        contract_ok = bool(ec["ok"]) if require_execution_contract else not (
+            ec.get("contract") is not None and ec.get("errors")
+        )
+        checks.append({"name": "execution_contract", "ok": contract_ok,
+                       "detail": str(ec.get("errors", []))[:120]})
+        if not contract_ok:
+            problems.extend(ec.get("errors", []))
+
         judge_ok = False
         judge_detail = "no judge verdict recorded"
         judges = s.get("judge_log", [])
@@ -1011,7 +1053,9 @@ def release(session: dict[str, Any] | str, *, min_score: float = 90.0,
 def finish(session: dict[str, Any] | str, *, verdict: str = "converged",
            plans_dir: str | Path | None = None, require_release: bool = True,
            min_score: float = 90.0, require_judge: bool = True,
-           require_external_judge: bool = False) -> dict[str, Any]:
+           require_external_judge: bool = False,
+           require_execution_contract: bool = False,
+           execution_cwd: str | Path | None = None) -> dict[str, Any]:
     """Mark the session complete with full session locking across release validation."""
     plans_dir = Path(plans_dir) if plans_dir else (Path(session.get("plans_dir")) if isinstance(session, dict) and session.get("plans_dir") else DEFAULT_PLANS_DIR)
     sid = session if isinstance(session, str) else session.get("session_id", "default")
@@ -1024,7 +1068,9 @@ def finish(session: dict[str, Any] | str, *, verdict: str = "converged",
         gate = None
         if require_release:
             gate = release(s, min_score=min_score, require_judge=require_judge,
-                           require_external_judge=require_external_judge, plans_dir=plans_dir)
+                           require_external_judge=require_external_judge,
+                           require_execution_contract=require_execution_contract,
+                           execution_cwd=execution_cwd, plans_dir=plans_dir)
             if not gate["ok"]:
                 raise RuntimeError("release gate failed: " + "; ".join(gate["problems"]))
         s["status"] = "finished"
@@ -2008,6 +2054,8 @@ __all__ = [
     "Context", "Fiber", "LifecycleState", "TwistedMonoid", "get_root_context", "reset_root_context",
     "create_subagent_context", "provide_tool", "execute_plan", "execute_plan_sync",
     "speculative_rollout", "speculative_rollout_async", "session_lock",
+    "ExecutionContract", "parse_execution_contract", "validate_execution_contract",
+    "probe_contract", "symbol_audit", "scan_symbols",
     "RoTRuleBase", "RoTRule", "ReplanningLadder", "ContextBudgeter",
     "mutate_flaw_directed", "mutate_exploratory", "crossover_ast", "ast_distance",
     "PopulationMember", "ASTSearchEngine", "Proposition", "PlanParser", "PlanAST",

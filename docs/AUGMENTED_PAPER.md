@@ -233,12 +233,12 @@ The combination is currently missing from the literature and is testable.
 
 ## 8. Immediate implementation priorities from the new papers
 
-Status (2026-08-17): items 1, 2, 3, and 6 are implemented in engine v0.15.0.
+Status (2026-08-17): items 1, 2, 3, and 6 are implemented in engine v0.15.0. Execution-contract anti-stub verification (probe + symbol audit) is also implemented.
 
 1. **Checkpoint records in search** — ✅ `plan.checkpoint()` / `plan.rewind()`; `search(..., checkpoint_before=True)`.
 2. **Commit semantics** — ✅ `session["committed_*"]` separate from `best_*`; `plan.committed()`; only `release()` commits.
 3. **RoT experience tree** — ✅ `RoTRule.perspective`, `record_outcome()`, `tree_report()`.
-4. **Execution-feedback search mode** — ⏳ not yet implemented.
+4. **Execution-feedback search mode** — 🟡 partial: execution contracts + feasibility probe implemented; full execution-guided AST search still pending.
 5. **Stage-aware context budget** — ⏳ not yet implemented.
 6. **Drift recovery node** — ✅ `ReplanningLadder` Tier 4 for drift/silent-failure signals.
 

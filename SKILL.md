@@ -13,7 +13,8 @@ Plan mode drafts a formal plan for an objective and iteratively refines it round
 - **STRIPS Causal Validation** (*SymPlanner 2505.01479, GNNVerifier 2603.14730*): AST causal link tracking $\langle a_i, p, a_j \rangle$, clobber threat detection, closed-world negation, and localized type-mismatch verification.
 - **Evolutionary AST Search** (*PlanBench 2409.13373, LATS 2310.04406, SYMPHONY 2601.22623*): AST subgraph crossover with semantic dependency remapping, flaw-directed and exploratory mutations, and Jaccard diversity tracking.
 - **Rule of Thought (RoT) Memory Distillation** (*2404.05449*): Causal flaws distilled into persistent structural rules enforced on subsequent plans.
-- **Hierarchical Re-planning Ladder** (*RePLan 2401.04157, 2605.25851*): 3-tier escalation (L1 Subgoal Audit $\to$ L2 Structured Search $\to$ L3 Global Redraft) with HIPIF context compression (*2606.10507*).
+- **Hierarchical Re-planning Ladder** (*RePLan 2401.04157, 2605.25851*): 4-tier escalation (L1 Subgoal Audit $\to$ L2 Structured Search $\to$ L3 Global Redraft $\to$ L4 Runtime Drift Recovery) with HIPIF context compression (*2606.10507*).
+- **Execution Contracts** (*ACID-Agent 2608.13900, FlowScout 2608.10039*): released plans must declare verification commands, artifact budgets, parity checks, and symbol contracts; a minimal probe must pass before full implementation.
 
 ---
 
@@ -72,11 +73,27 @@ Spawn a planner subagent (`await rlm('Draft a complete plan for: ...', name='pla
    Output: model.bin
 ```
 
-### 3. Assess Draft
+Every implementation plan must also contain an `## Execution Contract`. The planner writes a minimal spike file first and lists every function/variable it intends to create, so stubs and undeclared helpers are detectable:
+```markdown
+## Execution Contract
+```json
+{
+  "probe": {"command": ["python", "spike.py"], "expected_output": "runner=40"},
+  "verification_commands": [["python", "-m", "pytest", "-q"], ["ruff", "check", "."]],
+  "expected_artifacts": {"runner.py": {"min_lines": 60}},
+  "symbols": {"runner.py": {"functions": ["main", "run_profile"], "variables": ["PROFILES"]}},
+  "parity_checks": [{"left": "legacy_runner", "right": "runner", "algorithm": "sha256"}]
+}
+```
+```
+
+### 3. Assess Draft and Probe Feasibility
 ```python
-res = plan.assess(s, draft_plan_text, note="Initial draft")
+res = plan.assess(s, draft_plan_text, note="Initial draft",
+                  require_execution_contract=True, run_probe=True)
 # res: {"version": 1, "score": 85.0, "delta": None, "critiques": [...], "status": "improving", "continue": True}
 ```
+If `run_probe=True` and the spike fails, `assess()` emits `mech:probe:*` critiques. The plan must be revised until the spike produces the declared output.
 `assess()` executes the full validation pipeline:
 1. **Rubric Scoring**: Mechanical, domain, and structure checks (`RUBRIC.md`).
 2. **Causal Validation**: Validates precondition satisfaction and clobber threats.
@@ -111,8 +128,10 @@ plan.record_judge(s, {
 Enforce strict acceptance thresholds before executing:
 ```python
 # Verifies convergence, score >= min_score, clean verify(), clean simulation, and judge "go"
-plan.finish(s, require_release=True, min_score=90.0)
+plan.finish(s, require_release=True, min_score=90.0,
+           require_execution_contract=True)
 ```
+Release fails while the execution contract is missing/invalid. After implementation, Prime Agent runs `plan.symbol_audit(plan_text, cwd=repo)` and the independent verifier subagent runs the contract commands before reporting done.
 
 ### 7. Transactional Execution (Cordis Runtime)
 Execute the released plan transactionally with automatic LIFO rollback on failure:
@@ -141,6 +160,9 @@ results = await plan.execute_plan(best_plan_text, task_handlers={1: run_task1})
 | `plan.simulate(plan_text, initial_state=None)` | Execute plan against explicit state model (SymPlanner). |
 | `plan.record_judge(session, verdict)` | Persist judge verdict into session under lock. |
 | `plan.committed(session)` | Return the last successfully released plan (explored best is separate from committed). |
+| `plan.validate_execution_contract(plan_text, cwd=None)` | Parse and statically validate the `## Execution Contract` JSON block. |
+| `plan.probe_contract(plan_text, cwd=None)` | Run the minimal feasibility spike; failed probes force plan revision. |
+| `plan.symbol_audit(plan_text, cwd=None)` | Compare declared functions/variables against actual source files to catch stubs and undeclared helpers. |
 | `plan.checkpoint(session, note=None)` / `plan.rewind(session, checkpoint_id=None)` | AgentRewind-style aligned session checkpoints and rollback. |
 | `plan.release(session, min_score=90.0, require_judge=True)` | Confidence-gated checkpoint release validation; successful release commits `best` -> `committed`. |
 | `plan.finish(session, require_release=True, min_score=90.0)` | Complete session after verifying release gate. |
