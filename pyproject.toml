@@ -1,6 +1,6 @@
 [project]
 name = "plan"
-version = "0.14.0"
+version = "0.15.0"
 description = "Plan mode - iterative self-improving plan synthesis, rubric scoring, STRIPS simulation, MCTS search, and Cordis spatiotemporal composability runtime."
 readme = "README.md"
 license = { text = "MIT" }

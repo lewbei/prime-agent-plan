@@ -575,6 +575,12 @@ angle$ asserting that step $a_i$ achieves condition $p$ consumed by step $a_j$.
 - **State Transposition Table**: Collapses search space by caching state and DAG hashes.
 
 ### 4. RoT Memory Distillation & Context Management (`memory_distiller.py`)
-- **Rule of Thought (RoT) Distiller**: Automatically distills negative rules `Rule(id, trigger, pattern, remedy)` from structural/execution flaws to prevent repeat errors.
+- **Rule of Thought (RoT) Distiller**: Automatically distills negative rules `Rule(id, trigger, pattern, remedy, perspective)` from structural/execution flaws to prevent repeat errors.
+- **Tree-of-Experience Rule Namespaces**: Rules are grouped by perspective and updated with environmental success/failure outcomes (2608.09044).
 - **HIPIF Context Budgeter**: Compresses superseded rounds into compact semantic diffs while preserving full text for the best and latest rounds.
-- **3-Tier Replanning Ladder**: Escalates failures systematically from local task parameter adjustments (Tier 1) to subgraph replanning (Tier 2) to global strategy upgrades (Tier 3).
+- **4-Tier Replanning Ladder**: Escalates failures systematically from local task parameter adjustments (Tier 1) to subgraph replanning (Tier 2) to global strategy upgrades (Tier 3) to runtime drift recovery (Tier 4, 2608.14109).
+
+### 5. Agentic Transactions & Aligned Rewind
+- **Explore / Commit Separation**: `best()` is the best explored plan; `committed()` is the last successfully released plan. Only `release()` promotes best to committed.
+- **Aligned Session Checkpoints**: `checkpoint()` stores a deep session snapshot; `rewind()` restores rounds, search tree, execution log, and world state with a rewind-log entry (AgentRewind 2608.14380).
+- **Search Checkpoints**: `search(..., checkpoint_before=True)` records a recoverable checkpoint before expansion begins.

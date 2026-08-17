@@ -50,6 +50,7 @@ from .memory_distiller import (
 )
 
 import asyncio
+import copy
 import difflib
 import inspect
 import json
@@ -64,7 +65,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-__version__ = "0.14.0"
+__version__ = "0.15.0"
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 DEFAULT_PLANS_DIR = Path(os.environ.get("PLAN_PLANS_DIR") or (Path.cwd() / "plans"))
@@ -536,6 +537,10 @@ def start(objective: str, *, plans_dir: str | Path | None = None, max_rounds: in
         "rounds": [],
         "best_version": None,
         "best_score": None,
+        "committed_version": None,
+        "committed_score": None,
+        "committed_at": None,
+        "checkpoints": [],
         "status": "drafting",   # drafting -> improving -> converged -> finished
         "completed_at": None,
         "execution_log": [],
@@ -811,6 +816,90 @@ def best(session: dict[str, Any] | str, *, plans_dir: str | Path | None = None) 
             "sections": r["sections"], "plan_text": r["plan_text"]}
 
 
+def committed(session: dict[str, Any] | str, *, plans_dir: str | Path | None = None) -> dict[str, Any]:
+    """Return the last released/committed plan, as opposed to the best explored plan.
+
+    Search and assess may improve `best_*` without committing anything. Only a
+    successful `release()` promotes the current best plan to committed.
+    """
+    plans_dir = Path(plans_dir) if plans_dir else DEFAULT_PLANS_DIR
+    s = _load_session(plans_dir, session) if isinstance(session, str) else session
+    ver = s.get("committed_version")
+    if ver is None or not s.get("rounds"):
+        return {"error": "no committed plan yet; run release() successfully first"}
+    r = s["rounds"][ver - 1]
+    return {"version": ver, "score": s.get("committed_score"),
+            "committed_at": s.get("committed_at"),
+            "plan_hash": s.get("committed_plan_hash"),
+            "plan_text": r.get("plan_text"), "critiques": r.get("critiques")}
+
+
+# --- Aligned session checkpoints / rewind (AgentRewind 2608.14380) ---
+
+_CHECKPOINT_FIELDS = (
+    "rounds", "best_version", "best_score", "status", "completed_at",
+    "execution_log", "world_state", "replan_pending", "replan_task",
+    "replan_tier", "replan_scope", "search_tree", "release_gate",
+    "committed_version", "committed_score", "committed_at", "committed_plan_hash",
+)
+
+
+def checkpoint(session: dict[str, Any] | str, *, plans_dir: str | Path | None = None,
+               note: str = "") -> dict[str, Any]:
+    """Record a recoverable session checkpoint (AgentRewind 2608.14380).
+
+    The checkpoint stores a deep copy of the plan rounds, best/committed state,
+    execution log, world state, and search tree. It does not snapshot files
+    outside the session; use Cordis journal_mutation() for external effects.
+    """
+    plans_dir = Path(plans_dir) if plans_dir else (Path(session.get("plans_dir")) if isinstance(session, dict) and session.get("plans_dir") else DEFAULT_PLANS_DIR)
+    sid = session if isinstance(session, str) else session.get("session_id", "default")
+    with session_lock(plans_dir, sid):
+        if isinstance(session, str):
+            s = _load_session(plans_dir, session)
+        else:
+            s = session
+        snap = {k: copy.deepcopy(s.get(k)) for k in _CHECKPOINT_FIELDS if k in s}
+        cp_id = f"cp-{_now().replace(':','')}-{len(s.get('checkpoints', [])) + 1}"
+        entry = {"id": cp_id, "ts": _now(), "note": note,
+                 "session_hash": hashlib.sha256(
+                     json.dumps(s.get("rounds", []), sort_keys=True, default=str).encode("utf-8")
+                 ).hexdigest(),
+                 "snapshot": snap}
+        s.setdefault("checkpoints", []).append(entry)
+        _save_session(plans_dir, s)
+        return {"checkpoint_id": cp_id, "note": note,
+                "best_version": s.get("best_version"), "rounds": len(s.get("rounds", []))}
+
+
+def rewind(session: dict[str, Any] | str, checkpoint_id: str | None = None, *,
+           plans_dir: str | Path | None = None, note: str = "manual rewind") -> dict[str, Any]:
+    """Restore a session to a prior checkpoint and return the restored session.
+
+    If no checkpoint_id is given, the latest checkpoint is used. The rewind
+    event is appended to the restored session for auditability.
+    """
+    plans_dir = Path(plans_dir) if plans_dir else (Path(session.get("plans_dir")) if isinstance(session, dict) and session.get("plans_dir") else DEFAULT_PLANS_DIR)
+    sid = session if isinstance(session, str) else session.get("session_id", "default")
+    with session_lock(plans_dir, sid):
+        if isinstance(session, str):
+            s = _load_session(plans_dir, session)
+        else:
+            s = session
+        cps = s.get("checkpoints") or []
+        if not cps:
+            raise ValueError("no checkpoints recorded for this session")
+        cp = next((c for c in reversed(cps) if c.get("id") == checkpoint_id), cps[-1]) if checkpoint_id else cps[-1]
+        snap = cp.get("snapshot", {})
+        for k, v in snap.items():
+            s[k] = copy.deepcopy(v)
+        s.setdefault("rewind_log", []).append({
+            "ts": _now(), "checkpoint_id": cp.get("id"), "note": note,
+            "restored_rounds": len(s.get("rounds", [])),
+        })
+        _save_session(plans_dir, s)
+        return s
+
 
 
 def release(session: dict[str, Any] | str, *, min_score: float = 90.0,
@@ -908,6 +997,12 @@ def release(session: dict[str, Any] | str, *, min_score: float = 90.0,
 
         ok = all(c["ok"] for c in checks)
         report = {"ok": ok, "checks": checks, "problems": problems}
+        if ok and s.get("best_version"):
+            s["committed_version"] = s["best_version"]
+            s["committed_score"] = s["best_score"]
+            s["committed_at"] = _now()
+            s["committed_plan_hash"] = hashlib.sha256(best_text.encode("utf-8")).hexdigest()
+            report["committed"] = {"version": s["committed_version"], "score": s["committed_score"]}
         s["release_gate"] = report
         _save_session(plans_dir, s)
         return report
@@ -1023,10 +1118,11 @@ def selfcheck(*, plans_dir: str | Path | None = None,
     # 2b) feature dependency status (reactive coeffects report)
     try:
         ds = deps_check()
-        checks.append({"name": "feature_deps", "ok": True,
-                       "detail": f"{len(ds['unsatisfied'])} unsatisfied: {ds['unsatisfied']}"})
-        if ds["unsatisfied"]:
-            problems.append(f"feature deps unsatisfied: {ds['unsatisfied']}")
+        required_missing = [u for u in ds.get("unsatisfied", []) if u != "corpus"]
+        checks.append({"name": "feature_deps", "ok": not required_missing,
+                       "detail": f"optional corpus: {'present' if 'corpus' not in ds.get('unsatisfied', []) else 'absent'}; required missing: {required_missing}"})
+        if required_missing:
+            problems.append(f"required feature deps unsatisfied: {required_missing}")
     except Exception as e:
         checks.append({"name": "feature_deps", "ok": False, "detail": str(e)[:120]})
     # 3) pytest (optional but default)
@@ -1904,7 +2000,7 @@ def speculative_rollout(plan_text: str,
         ctx.dispose()
 
 __all__ = [
-    "__version__", "start", "assess", "assess_candidates", "run", "status", "history", "best", "finish",
+    "__version__", "start", "assess", "assess_candidates", "run", "status", "history", "best", "committed", "checkpoint", "rewind", "finish",
     "log_progress", "suggest", "list_sessions", "rubric", "verify", "judge", "record_judge",
     "release", "plan_dag", "simulate", "plan_quality", "edit_file", "rollback", "deps_check",
     "ground_check", "constraint_check", "fold_history", "judge_ensemble", "template", "selfcheck",

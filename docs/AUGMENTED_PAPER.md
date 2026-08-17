@@ -233,12 +233,14 @@ The combination is currently missing from the literature and is testable.
 
 ## 8. Immediate implementation priorities from the new papers
 
-1. **Checkpoint records in search** — store `(round, plan_hash, session_hash)` before expansion; expose `rewind_to_checkpoint()`.
-2. **Commit semantics** — introduce `session["committed"]` separate from `session["best"]`; only release/finish commits.
-3. **RoT experience tree** — add `perspective` and `outcome_success/failure` fields; retrieve by path.
-4. **Execution-feedback search mode** — `search(mode="ast", expansion="execution")` using task handler outcomes.
-5. **Stage-aware context budget** — make `fold_history()` stage-aware instead of uniform.
-6. **Drift recovery node** — extend replan ladder with a runtime drift policy.
+Status (2026-08-17): items 1, 2, 3, and 6 are implemented in engine v0.15.0.
+
+1. **Checkpoint records in search** — ✅ `plan.checkpoint()` / `plan.rewind()`; `search(..., checkpoint_before=True)`.
+2. **Commit semantics** — ✅ `session["committed_*"]` separate from `best_*`; `plan.committed()`; only `release()` commits.
+3. **RoT experience tree** — ✅ `RoTRule.perspective`, `record_outcome()`, `tree_report()`.
+4. **Execution-feedback search mode** — ⏳ not yet implemented.
+5. **Stage-aware context budget** — ⏳ not yet implemented.
+6. **Drift recovery node** — ✅ `ReplanningLadder` Tier 4 for drift/silent-failure signals.
 
 ---
 

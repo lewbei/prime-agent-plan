@@ -140,9 +140,11 @@ results = await plan.execute_plan(best_plan_text, task_handlers={1: run_task1})
 | `plan.ground_check(plan_text, cwd=None)` | Verify declared environment inputs exist on disk. |
 | `plan.simulate(plan_text, initial_state=None)` | Execute plan against explicit state model (SymPlanner). |
 | `plan.record_judge(session, verdict)` | Persist judge verdict into session under lock. |
-| `plan.release(session, min_score=90.0, require_judge=True)` | Confidence-gated checkpoint release validation. |
+| `plan.committed(session)` | Return the last successfully released plan (explored best is separate from committed). |
+| `plan.checkpoint(session, note=None)` / `plan.rewind(session, checkpoint_id=None)` | AgentRewind-style aligned session checkpoints and rollback. |
+| `plan.release(session, min_score=90.0, require_judge=True)` | Confidence-gated checkpoint release validation; successful release commits `best` -> `committed`. |
 | `plan.finish(session, require_release=True, min_score=90.0)` | Complete session after verifying release gate. |
-| `plan.log_progress(session, task, status, evidence=None)` | Record execution progress; triggers 3-tier replanning ladder on failure. |
+| `plan.log_progress(session, task, status, evidence=None)` | Record execution progress; triggers 4-tier replanning ladder on failure (L1 local -> L4 drift recovery). |
 | `plan.fold_history(session, keep_last=2, max_context_tokens=4000)` | HIPIF context token compression for older rounds. |
 | `await plan.execute_plan(plan_text, task_handlers=None, timeout_per_task=None)` | Transactional plan execution with Cordis LIFO rollback. |
 | `plan.speculative_rollout(plan_text, eval_fn)` | Isolated speculative execution with guaranteed 100% clean recovery. |

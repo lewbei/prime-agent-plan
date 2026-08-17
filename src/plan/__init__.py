@@ -36,6 +36,9 @@ from plan_mode import (  # noqa: E402
     status,
     history,
     best,
+    committed,
+    checkpoint,
+    rewind,
     finish,
     log_progress,
     suggest,
@@ -103,7 +106,7 @@ from plan_mode import (  # noqa: E402
 )
 
 __all__ = [
-    "__version__", "start", "assess", "assess_candidates", "run", "status", "history", "best", "finish",
+    "__version__", "start", "assess", "assess_candidates", "run", "status", "history", "best", "committed", "checkpoint", "rewind", "finish",
     "log_progress", "suggest", "list_sessions", "rubric", "verify", "judge", "record_judge",
     "release", "plan_dag", "simulate", "plan_quality", "edit_file", "rollback", "deps_check",
     "ground_check", "constraint_check", "fold_history", "judge_ensemble", "template", "selfcheck",

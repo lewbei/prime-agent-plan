@@ -295,6 +295,7 @@ async def search(session: dict[str, Any] | str, *,
                  model: str | None = None,
                  root_plan: str | None = None,
                  cwd: str | Path | None = None,
+                 checkpoint_before: bool = False,
                  plans_dir: str | Path | None = None) -> dict[str, Any]:
     """Run a search over plan space and return the best plan found.
 
@@ -327,6 +328,10 @@ async def search(session: dict[str, Any] | str, *,
         t["root"] = root_id
         t["best_node"] = root_id
         t["best_value"] = ro["value"]
+
+    if checkpoint_before:
+        from . import checkpoint as session_checkpoint
+        session_checkpoint(s, plans_dir=plans_dir, note=f"search:{mode}:pre-expansion")
 
     # seed pool (2605.21902, 2605.06957): reuse validated plans from prior
     # finished sessions in this plans_dir as extra root variants (cap 3)
