@@ -254,6 +254,51 @@ def symbol_audit(plan_text: str, *, cwd: str | Path | None = None) -> dict[str, 
     return {"ok": not errors, "errors": errors, "files": files, "contract": contract}
 
 
+def run_verification_commands(contract: ExecutionContract, *, cwd: str | Path | None = None,
+                              timeout: float = 60.0) -> dict[str, Any]:
+    """Run every verification command declared by the contract.
+
+    The verdict is true only when all commands exit 0.
+    """
+    results = [run_command(cmd, cwd=cwd, timeout=timeout) for cmd in contract.verification_commands]
+    ok = all(r.get("ok") for r in results)
+    return {"ok": ok, "results": results, "total": len(results),
+            "passed": sum(bool(r.get("ok")) for r in results)}
+
+
+def parity_audit(contract: ExecutionContract, *, cwd: str | Path | None = None) -> dict[str, Any]:
+    """Execute parity checks by hashing the declared left/right artifacts."""
+    base = Path(cwd or Path.cwd())
+    results: list[dict[str, Any]] = []
+    errors: list[str] = []
+    for check in contract.parity_checks:
+        left = Path(str(check.get("left", "")))
+        right = Path(str(check.get("right", "")))
+        left_p = left if left.is_absolute() else base / left
+        right_p = right if right.is_absolute() else base / right
+        if not left_p.exists() or not right_p.exists():
+            errors.append(f"parity files missing: {left} / {right}")
+            results.append({"left": str(left), "right": str(right), "ok": False})
+            continue
+        algo = (check.get("algorithm") or "sha256").lower()
+        if algo == "sha256":
+            lh = hashlib.sha256(left_p.read_bytes()).hexdigest()
+            rh = hashlib.sha256(right_p.read_bytes()).hexdigest()
+        elif algo == "md5":
+            lh = hashlib.md5(left_p.read_bytes()).hexdigest()
+            rh = hashlib.md5(right_p.read_bytes()).hexdigest()
+        else:
+            errors.append(f"unsupported parity algorithm: {algo}")
+            results.append({"left": str(left), "right": str(right), "ok": False})
+            continue
+        ok = lh == rh
+        if not ok:
+            errors.append(f"parity mismatch for {left} vs {right}")
+        results.append({"left": str(left), "right": str(right), "algorithm": algo,
+                        "left_hash": lh, "right_hash": rh, "ok": ok})
+    return {"ok": not errors, "errors": errors, "results": results}
+
+
 def run_command(cmd: list[str], *, cwd: str | Path | None = None,
                 timeout: float = 60.0) -> dict[str, Any]:
     resolved = list(cmd)

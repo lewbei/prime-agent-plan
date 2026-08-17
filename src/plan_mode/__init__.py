@@ -50,8 +50,10 @@ from .memory_distiller import (
 )
 from .execution_contract import (
     ExecutionContract,
+    parity_audit,
     parse_execution_contract,
     probe_contract,
+    run_verification_commands,
     scan_symbols,
     symbol_audit,
     validate_execution_contract,
@@ -643,6 +645,7 @@ def assess(session: dict[str, Any] | str, plan_text: str, *, note: str | None = 
         if run_probe:
             probe = probe_contract(plan_text, cwd=probe_cwd or Path.cwd())
             result["probe"] = probe
+            session["probe_last"] = probe
             if not probe.get("ok"):
                 for err in probe.get("errors", []) or [probe.get("message") or "probe failed"]:
                     result["critiques"].append({"id": f"mech:probe:{err[:40]}",
@@ -1018,8 +1021,16 @@ def release(session: dict[str, Any] | str, *, min_score: float = 90.0,
         contract_ok = bool(ec["ok"]) if require_execution_contract else not (
             ec.get("contract") is not None and ec.get("errors")
         )
-        checks.append({"name": "execution_contract", "ok": contract_ok,
-                       "detail": str(ec.get("errors", []))[:120]})
+        probe_ok = True
+        if require_execution_contract and ec.get("contract") is not None:
+            probe_cfg = ec["contract"].probe
+            probe_last = s.get("probe_last")
+            if probe_cfg and probe_cfg.get("command"):
+                probe_ok = bool(probe_last and probe_last.get("configured") and probe_last.get("ok"))
+                if not probe_ok:
+                    problems.append("feasibility probe not passed; run assess(..., run_probe=True) and revise until the spike succeeds")
+        checks.append({"name": "execution_contract", "ok": contract_ok and probe_ok,
+                       "detail": str(ec.get("errors", []))[:120] + ("; probe passed" if probe_ok else "; probe pending/failed")})
         if not contract_ok:
             problems.extend(ec.get("errors", []))
 
@@ -2065,7 +2076,8 @@ __all__ = [
     "create_subagent_context", "provide_tool", "execute_plan", "execute_plan_sync",
     "speculative_rollout", "speculative_rollout_async", "session_lock",
     "ExecutionContract", "parse_execution_contract", "validate_execution_contract",
-    "probe_contract", "symbol_audit", "scan_symbols",
+    "probe_contract", "symbol_audit", "scan_symbols", "parity_audit",
+    "run_verification_commands",
     "RoTRuleBase", "RoTRule", "ReplanningLadder", "ContextBudgeter",
     "mutate_flaw_directed", "mutate_exploratory", "crossover_ast", "ast_distance",
     "PopulationMember", "ASTSearchEngine", "Proposition", "PlanParser", "PlanAST",

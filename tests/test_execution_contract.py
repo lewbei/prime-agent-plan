@@ -119,3 +119,39 @@ def test_assess_with_contract_and_probe_critiques(tmp_path):
     assert result["execution_contract"]["ok"] is True
     assert result["probe"]["ok"] is True
     assert not any(c["id"].startswith("mech:contract") for c in result["critiques"])
+
+
+def test_parity_audit_and_verification_commands(tmp_path):
+    plan = _plan_with_contract({
+        "verification_commands": [["python", "-c", "print('ok')"]],
+        "expected_artifacts": {"runner.py": {"min_lines": 1}, "report.txt": {"min_lines": 1}},
+        "parity_checks": [{"left": "a.txt", "right": "b.txt", "algorithm": "sha256"}],
+        "symbols": {"runner.py": {"functions": ["main"], "variables": ["PROFILES"]}},
+    })
+    contract = plan_mode.parse_execution_contract(plan)[0]
+    (tmp_path / "a.txt").write_text("same")
+    (tmp_path / "b.txt").write_text("same")
+    parity = plan_mode.parity_audit(contract, cwd=tmp_path)
+    assert parity["ok"] is True
+    cmds = plan_mode.run_verification_commands(contract, cwd=tmp_path)
+    assert cmds["ok"] is True
+
+
+def test_release_requires_passed_probe(tmp_path):
+    (tmp_path / "spike.py").write_text("print('runner=3')\n")
+    plan = _plan_with_contract({
+        "probe": {"command": ["python", "spike.py"], "expected_output": "runner=40"},
+        "verification_commands": [["python", "-c", "print('ok')"]],
+        "expected_artifacts": {"runner.py": {"min_lines": 1}, "report.txt": {"min_lines": 1}},
+        "symbols": {"runner.py": {"functions": ["main"], "variables": ["PROFILES"]}},
+    })
+    s = plan_mode.start("probe gate", plans_dir=tmp_path, max_rounds=1)
+    result = plan_mode.assess(s, plan, plans_dir=tmp_path,
+                              require_execution_contract=True, run_probe=True,
+                              probe_cwd=tmp_path)
+    assert result["probe"]["ok"] is False
+    gate = plan_mode.release(s, min_score=0, require_judge=False,
+                             require_execution_contract=True,
+                             execution_cwd=tmp_path, plans_dir=tmp_path)
+    assert gate["ok"] is False
+    assert any("probe" in p.lower() for p in gate["problems"])
