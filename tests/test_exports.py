@@ -31,8 +31,10 @@ def test_all_skill_documented_symbols_exported():
 
     expected_symbols = [
         "start", "assess", "assess_candidates", "search", "verify", "ground_check",
-        "simulate", "record_judge", "release", "finish", "log_progress", "fold_history",
-        "execute_plan", "speculative_rollout", "create_subagent_context", "provide_tool", "selfcheck"
+        "simulate", "record_judge", "committed", "checkpoint", "rewind", "release",
+        "finish", "log_progress", "fold_history", "validate_execution_contract",
+        "probe_contract", "symbol_audit", "execute_plan", "speculative_rollout",
+        "create_subagent_context", "provide_tool", "selfcheck"
     ]
 
     for sym in expected_symbols:

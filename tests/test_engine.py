@@ -366,12 +366,12 @@ def test_template_bank():
 
 
 def test_selfcheck_detects_broken_session(tmp_path):
-    good = _mk_session(tmp_path, engine_version="0.12.0", rounds=1)
+    good = _mk_session(tmp_path, engine_version="0.15.0", rounds=1)
     good["rounds"][0]["plan_text"] = GOOD_PLAN
     good["best_version"] = 1; good["best_score"] = 90.0
     good["status"] = "finished"
     (tmp_path / f"{good['session_id']}.json").write_text(json.dumps(good))
-    bad = _mk_session(tmp_path, engine_version="0.12.0", rounds=1)
+    bad = _mk_session(tmp_path, engine_version="0.15.0", rounds=1)
     bad["session_id"] = "broken-finished"
     bad["rounds"][0]["plan_text"] = "# Goal\nGoal: x.\n\n## Tasks\n1. A. Depends on task 2. Output: a.md.\n2. B.\n"
     bad["best_version"] = 1; bad["best_score"] = 50.0

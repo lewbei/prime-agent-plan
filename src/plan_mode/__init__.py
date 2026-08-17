@@ -75,6 +75,16 @@ from typing import Any
 
 __version__ = "0.15.0"
 
+
+def _version_tuple(v: str | None) -> tuple[int, ...]:
+    if not v:
+        return (0, 0, 0)
+    try:
+        return tuple(int(x) for x in re.findall(r"\d+", str(v))[:3])
+    except Exception:
+        return (0, 0, 0)
+
+
 REPO_ROOT = Path(__file__).resolve().parent.parent
 DEFAULT_PLANS_DIR = Path(os.environ.get("PLAN_PLANS_DIR") or (Path.cwd() / "plans"))
 RUBRIC_PATH = Path(__file__).resolve().parent / "RUBRIC.md"
@@ -490,7 +500,7 @@ def fold_history(session: dict[str, Any] | str, *, plans_dir: str | Path | None 
             s = _load_session(plans_dir, session)
         else:
             s = session
-        if s.get("engine_version", "0.0.0") < "0.6.0" or s.get("history_folded"):
+        if _version_tuple(s.get("engine_version")) < (0, 6, 0) or s.get("history_folded"):
             return s
         rounds = s.get("rounds") or []
         if len(rounds) <= keep_last + 1:
@@ -1150,11 +1160,11 @@ def selfcheck(*, plans_dir: str | Path | None = None,
             if not sim["executable_plan"]: fails += sim["problems"][:2]
             if not gc["ok"]: fails += [f"missing inputs: {gc['missing'][:2]}"]
             if not cc["ok"]: fails += cc["problems"][:2]
-            is_historical = s2.get("engine_version", "0.0.0") < "0.11.0"
+            is_historical = _version_tuple(s2.get("engine_version")) < (0, 14, 0)
             checks.append({"name": f"session:{s2.get('session_id', p.stem)[:30]}",
                            "ok": not fails or is_historical,
                            "detail": ("re-verified clean" if not fails else
-                                      f"[historical, pre-0.11] " + "; ".join(fails)[:100])})
+                                      f"[historical, pre-0.14] " + "; ".join(fails)[:100])})
             if fails and not is_historical:
                 problems.append(f"{p.name}: " + "; ".join(fails)[:160])
             elif fails:
