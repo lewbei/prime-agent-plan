@@ -103,11 +103,26 @@ class CapabilityEntry(BaseModel):
                 {
                     "id": v.verifier_id,
                     "predicate": v.predicate,
+                    "target_args_mapping": [str(a) for a in v.target_args_mapping],
                     "cmd": v.command_template,
+                    "expected_output_pattern": v.expected_output_pattern,
+                    "json_path": v.json_path,
+                    "expected_value": str(v.expected_value) if v.expected_value is not None else None,
+                    "timeout_seconds": v.timeout_seconds,
                 }
                 for v in self.verifiers
             ],
             "executor_command_template": self.executor_command_template,
+            "default_compensation": (
+                {
+                    "id": self.default_compensation.compensation_id,
+                    "cap": self.default_compensation.capability_name,
+                    "param_mapping": self.default_compensation.parameter_mapping,
+                    "timeout": self.default_compensation.timeout_seconds,
+                }
+                if self.default_compensation is not None
+                else None
+            ),
         }
         serialized = json.dumps(data, sort_keys=True)
         return hashlib.sha256(serialized.encode("utf-8")).hexdigest()

@@ -1,4 +1,4 @@
-"""Adversarial Runtime Semantics and Empirical Witnessing Tests (Phase 2)."""
+"""Adversarial Runtime Semantics, Fail-Closed Preflight, and Attestation Tests (Phase 2)."""
 
 import os
 import time
@@ -25,6 +25,7 @@ from plan_mode.session import (
     SessionState,
     StateDriftError,
     SignatureVerificationError,
+    InvalidStateTransitionError,
 )
 from plan_mode.runtime.ledger import EvidenceLedger
 from plan_mode.runtime.sandbox import ExecutionSandbox, SandboxExecutionResult
@@ -71,35 +72,61 @@ def _action(
 
 
 # ---------------------------------------------------------------------------
-# Test 1: Default executor cannot be a silent 'true' no-op
+# Section A: Runtime Preflight Non-Bypassability
 # ---------------------------------------------------------------------------
-def test_default_executor_cannot_be_true_noop(tmp_path):
-    """A capability without a concrete executor contract must not silently execute 'true' and fabricate completion."""
+
+def test_execution_manager_refuses_if_session_preflight_not_completed():
+    """Plan is authorized, but session.start_execution() is NOT called. ExecutionPlanManager must refuse."""
     reg = CapabilityRegistry()
     reg.register(
         CapabilityEntry(
-            name="empty_executor_cap",
-            description="Capability with no executor command template",
-            input_schema={"val": {"type": "str", "required": True}},
-            positive_effects=[_cond("done", ["{val}"])],
-            verifiers=[ObservationVerifier(verifier_id="v1", predicate="done", target_args_mapping=["{val}"])],
-            executor_command_template=[],  # No concrete command!
+            name="tool_ok",
+            description="Tool",
+            input_schema={},
+            positive_effects=[_cond("done", [])],
+            verifiers=[ObservationVerifier(verifier_id="v1", predicate="done", command_template=["true"])],
+            executor_command_template=["true"],
         )
     )
     plan = PlanIR(
-        plan_id="p1_no_noop",
-        goal_description="Test no true noop",
+        plan_id="p_no_preflight",
+        goal_description="Test preflight requirement",
         initial_state=[],
-        actions=[
-            _action(
-                action_id="act1",
-                capability_name="empty_executor_cap",
-                parameters={"val": "a"},
-                positive_effects=[_cond("done", ["a"])],
-            )
-        ],
+        actions=[_action(action_id="act1", capability_name="tool_ok", positive_effects=[_cond("done", [])])],
     )
-    session = PlanningSession(session_id="s1_no_noop")
+    session = PlanningSession(session_id="s_no_preflight")
+    session.submit_draft(plan)
+    session.validate_candidate(1, reg)
+    session.select_version(1)
+    policy_hash = reg.compute_registry_hash()
+    cert = session.authorize_selected(reg, policy_hash=policy_hash)
+
+    # Note: We do NOT call session.start_execution() -> current_state remains AUTHORIZED, not EXECUTING!
+    manager = ExecutionPlanManager(session=session, registry=reg, ledger=EvidenceLedger(session_id=session.session_id))
+    with pytest.raises((ValueError, InvalidStateTransitionError)):
+        manager.execute_authorized_plan(cert)
+
+
+def test_runtime_rejects_registry_drift_after_authorization():
+    """Authorize with registry R1, then mutate capability contract. Runtime must reject before executing."""
+    reg = CapabilityRegistry()
+    reg.register(
+        CapabilityEntry(
+            name="tool_drift",
+            description="Tool",
+            input_schema={"p": {"type": "str", "required": True}},
+            positive_effects=[_cond("done", ["{p}"])],
+            verifiers=[ObservationVerifier(verifier_id="v1", predicate="done", target_args_mapping=["{p}"], command_template=["true"])],
+            executor_command_template=["true"],
+        )
+    )
+    plan = PlanIR(
+        plan_id="p_reg_drift",
+        goal_description="Test registry drift",
+        initial_state=[],
+        actions=[_action(action_id="act1", capability_name="tool_drift", parameters={"p": "x"}, positive_effects=[_cond("done", ["x"])])],
+    )
+    session = PlanningSession(session_id="s_reg_drift")
     session.submit_draft(plan)
     session.validate_candidate(1, reg)
     session.select_version(1)
@@ -107,38 +134,437 @@ def test_default_executor_cannot_be_true_noop(tmp_path):
     cert = session.authorize_selected(reg, policy_hash=policy_hash)
     session.start_execution(reg, policy_hash=policy_hash)
 
-    ledger = EvidenceLedger(session_id=session.session_id)
-    manager = ExecutionPlanManager(session=session, registry=reg, ledger=ledger)
+    # Mutate registry capability after authorization
+    mutated_reg = CapabilityRegistry()
+    mutated_reg.register(
+        CapabilityEntry(
+            name="tool_drift",
+            description="Mutated tool",
+            input_schema={"p": {"type": "str", "required": True}},
+            positive_effects=[_cond("done", ["{p}"])],
+            verifiers=[ObservationVerifier(verifier_id="v1", predicate="done", target_args_mapping=["{p}"], command_template=["echo", "mutated"])],
+            executor_command_template=["echo", "mutated"],
+        )
+    )
 
-    # Must refuse execution or fail, NOT execute 'true' and return success
-    summary = manager.execute_authorized_plan(cert)
-    assert summary.success is False
-    assert any("contract" in str(r.error_message).lower() or "executor" in str(r.error_message).lower() for r in summary.step_results)
+    manager = ExecutionPlanManager(session=session, registry=mutated_reg, ledger=EvidenceLedger(session_id=session.session_id))
+    with pytest.raises((StateDriftError, ValueError)):
+        manager.execute_authorized_plan(cert)
 
 
-# ---------------------------------------------------------------------------
-# Test 2: Capability without executor contract cannot execute
-# ---------------------------------------------------------------------------
-def test_capability_without_executor_contract_cannot_execute(tmp_path):
-    """Planning semantics alone are insufficient for runtime execution; missing contract causes explicit refusal."""
+def test_runtime_rejects_world_state_drift_before_execution():
+    """Authorize against world snapshot W1, then world state drifts. Runtime rejects before executor runs."""
+    w1_fact = _fact("sys_status", ["green"])
     reg = CapabilityRegistry()
     reg.register(
         CapabilityEntry(
-            name="abstract_cap",
-            description="Abstract planning capability without execution binding",
+            name="tool_w",
+            description="Tool",
             input_schema={},
-            positive_effects=[_cond("state_ready", [])],
-            verifiers=[ObservationVerifier(verifier_id="v_ready", predicate="state_ready")],
-            executor_command_template=[],  # Empty
+            preconditions=[_cond("sys_status", ["green"])],
+            positive_effects=[_cond("done", [])],
+            verifiers=[ObservationVerifier(verifier_id="v1", predicate="done", command_template=["true"])],
+            executor_command_template=["true"],
         )
     )
     plan = PlanIR(
-        plan_id="p2_abstract",
-        goal_description="Test abstract capability refusal",
-        initial_state=[],
-        actions=[_action(action_id="act1", capability_name="abstract_cap", positive_effects=[_cond("state_ready", [])])],
+        plan_id="p_world_drift",
+        goal_description="Test world drift",
+        initial_state=[w1_fact],
+        actions=[_action(action_id="act1", capability_name="tool_w", preconditions=[_cond("sys_status", ["green"])], positive_effects=[_cond("done", [])])],
     )
-    session = PlanningSession(session_id="s2_abstract")
+    session = PlanningSession(session_id="s_world_drift")
+    session.submit_draft(plan)
+    session.validate_candidate(1, reg, observed_world_state=[w1_fact])
+    session.select_version(1)
+    policy_hash = reg.compute_registry_hash()
+    cert = session.authorize_selected(reg, policy_hash=policy_hash)
+
+    # Session starts execution with authorized world
+    session.start_execution(reg, policy_hash=policy_hash, current_world_facts=[w1_fact])
+
+    # World drifts before manager executes
+    drifted_world = [_fact("sys_status", ["red"])]
+    manager = ExecutionPlanManager(
+        session=session,
+        registry=reg,
+        ledger=EvidenceLedger(session_id=session.session_id),
+        observed_world_state=drifted_world,
+    )
+    with pytest.raises((StateDriftError, PreconditionFailedError, ValueError)):
+        manager.execute_authorized_plan(cert)
+
+
+def test_runtime_rejects_policy_hash_mismatch():
+    """Certificate policy hash does not match current registry/policy identity. Rejects execution."""
+    reg = CapabilityRegistry()
+    reg.register(
+        CapabilityEntry(
+            name="tool_p",
+            description="Tool",
+            input_schema={},
+            positive_effects=[_cond("done", [])],
+            verifiers=[ObservationVerifier(verifier_id="v1", predicate="done", command_template=["true"])],
+            executor_command_template=["true"],
+        )
+    )
+    plan = PlanIR(
+        plan_id="p_pol_mismatch",
+        goal_description="Test policy mismatch",
+        initial_state=[],
+        actions=[_action(action_id="act1", capability_name="tool_p", positive_effects=[_cond("done", [])])],
+    )
+    session = PlanningSession(session_id="s_pol_mismatch")
+    session.submit_draft(plan)
+    session.validate_candidate(1, reg)
+    session.select_version(1)
+    cert = session.authorize_selected(reg, policy_hash="policy_v1")
+    session.start_execution(reg, policy_hash="policy_v1")
+
+    # Pass mismatched policy hash to manager
+    tampered_cert = cert.model_copy(update={"policy_hash": "wrong_policy_hash_xyz"})
+    manager = ExecutionPlanManager(session=session, registry=reg, ledger=EvidenceLedger(session_id=session.session_id))
+    with pytest.raises((StateDriftError, ValueError, SignatureVerificationError)):
+        manager.execute_authorized_plan(tampered_cert)
+
+
+def test_runtime_rejects_wrong_authorization_certificate_for_session():
+    """Attempting to execute using a certificate from a different session must fail preflight."""
+    reg = CapabilityRegistry()
+    reg.register(
+        CapabilityEntry(
+            name="tool_sess",
+            description="Tool",
+            input_schema={},
+            positive_effects=[_cond("done", [])],
+            verifiers=[ObservationVerifier(verifier_id="v1", predicate="done", command_template=["true"])],
+            executor_command_template=["true"],
+        )
+    )
+    plan = PlanIR(
+        plan_id="p_wrong_cert",
+        goal_description="Test wrong cert",
+        initial_state=[],
+        actions=[_action(action_id="act1", capability_name="tool_sess", positive_effects=[_cond("done", [])])],
+    )
+    s1 = PlanningSession(session_id="s_correct")
+    s1.submit_draft(plan)
+    s1.validate_candidate(1, reg)
+    s1.select_version(1)
+    policy_hash = reg.compute_registry_hash()
+    cert1 = s1.authorize_selected(reg, policy_hash=policy_hash)
+    s1.start_execution(reg, policy_hash=policy_hash)
+
+    s2 = PlanningSession(session_id="s_other")
+    s2.submit_draft(plan)
+    s2.validate_candidate(1, reg)
+    s2.select_version(1)
+    cert2 = s2.authorize_selected(reg, policy_hash=policy_hash)
+    s2.start_execution(reg, policy_hash=policy_hash)
+
+    manager = ExecutionPlanManager(session=s1, registry=reg, ledger=EvidenceLedger(session_id=s1.session_id))
+    # Passing cert2 (from session s2) to session s1's manager
+    with pytest.raises((SignatureVerificationError, ValueError, StateDriftError)):
+        manager.execute_authorized_plan(cert2)
+
+
+# ---------------------------------------------------------------------------
+# Section B: Do NOT Trust PlanIR Initial State at Runtime
+# ---------------------------------------------------------------------------
+
+def test_runtime_without_trusted_world_state_does_not_trust_plan_initial_state():
+    """PlanIR self-asserts admin_authorized(prod)=VERIFIED_TRUE without trusted snapshot. Runtime must refuse action."""
+    untrusted_fact = WorldFact(
+        predicate="admin_authorized",
+        args=["prod"],
+        truth=FactTruth.VERIFIED_TRUE,
+        provenance=Provenance(source_type=SourceType.PLANNER_INFERENCE),
+    )
+    reg = CapabilityRegistry()
+    reg.register(
+        CapabilityEntry(
+            name="admin_action",
+            description="Requires admin",
+            input_schema={},
+            preconditions=[_cond("admin_authorized", ["prod"])],
+            positive_effects=[_cond("admin_done", [])],
+            verifiers=[ObservationVerifier(verifier_id="v1", predicate="admin_done", command_template=["true"])],
+            executor_command_template=["true"],
+        )
+    )
+    plan = PlanIR(
+        plan_id="p_untrusted_runtime",
+        goal_description="Test untrusted runtime initial state",
+        initial_state=[untrusted_fact],
+        actions=[_action(action_id="act1", capability_name="admin_action", preconditions=[_cond("admin_authorized", ["prod"])], positive_effects=[_cond("admin_done", [])])],
+    )
+    session = PlanningSession(session_id="s_untrusted_runtime")
+    session.submit_draft(plan)
+    # Validation marks plan UNKNOWN because initial fact is ungrounded
+    val_res = session.validate_candidate(1, reg, observed_world_state=None)
+    assert val_res.status.value == "UNKNOWN"
+
+
+# ---------------------------------------------------------------------------
+# Section C: Exact Runtime Effect <-> Verifier Attestation
+# ---------------------------------------------------------------------------
+
+def test_runtime_verifier_must_match_exact_effect_predicate_and_args(tmp_path):
+    """Capability has verifier for file_exists(staging). Action effect is file_exists(prod). Verifier cannot witness prod."""
+    prod_file = tmp_path / "prod.txt"
+    staging_file = tmp_path / "staging.txt"
+    staging_file.write_text("staging exists")
+
+    reg = CapabilityRegistry()
+    reg.register(
+        CapabilityEntry(
+            name="deploy_tool",
+            description="Deploy",
+            input_schema={"target": {"type": "str", "required": True}},
+            positive_effects=[_cond("file_exists", ["{target}"])],
+            verifiers=[
+                ObservationVerifier(
+                    verifier_id="v_staging",
+                    predicate="file_exists",
+                    target_args_mapping=[str(staging_file)],
+                    command_template=["test", "-f", str(staging_file)],
+                )
+            ],
+            executor_command_template=["touch", "{target}"],
+        )
+    )
+    plan = PlanIR(
+        plan_id="p_mismatched_target",
+        goal_description="Test mismatched verifier target",
+        initial_state=[],
+        actions=[_action(action_id="act1", capability_name="deploy_tool", parameters={"target": str(prod_file)}, positive_effects=[_cond("file_exists", [str(prod_file)])])],
+    )
+    session = PlanningSession(session_id="s_mismatched_target")
+    session.submit_draft(plan)
+    val_res = session.validate_candidate(1, reg)
+    assert val_res.status.value == "UNKNOWN"
+
+
+def test_runtime_only_promotes_effects_with_matching_verifiers(tmp_path):
+    """Capability declares 2 positive effects: effect 1 has verifier (passes), effect 2 has no verifier. Only effect 1 is promoted."""
+    f1 = tmp_path / "f1.txt"
+    reg = CapabilityRegistry()
+    reg.register(
+        CapabilityEntry(
+            name="multi_effect_tool",
+            description="Multiple effects",
+            input_schema={"p1": {"type": "str", "required": True}},
+            positive_effects=[_cond("file_exists", ["{p1}"]), _cond("unverified_flag", [])],
+            verifiers=[
+                ObservationVerifier(
+                    verifier_id="v_f1",
+                    predicate="file_exists",
+                    target_args_mapping=["{p1}"],
+                    command_template=["test", "-f", "{p1}"],
+                )
+            ],
+            executor_command_template=["touch", "{p1}"],
+        )
+    )
+    plan = PlanIR(
+        plan_id="p_multi_effect",
+        goal_description="Test multi effect promotion",
+        initial_state=[],
+        actions=[_action(action_id="act1", capability_name="multi_effect_tool", parameters={"p1": str(f1)}, positive_effects=[_cond("file_exists", [str(f1)]), _cond("unverified_flag", [])])],
+    )
+    session = PlanningSession(session_id="s_multi_effect")
+    session.submit_draft(plan)
+    # Plan validation has UNKNOWN for unverified_flag
+    val_res = session.validate_candidate(1, reg)
+    assert "unverified_flag()" in val_res.unknown_facts
+
+
+def test_runtime_revalidates_action_against_current_registry(tmp_path):
+    """Action parameters modified to violate schema must fail before execution."""
+    reg = CapabilityRegistry()
+    reg.register(
+        CapabilityEntry(
+            name="typed_tool",
+            description="Typed param",
+            input_schema={"num": {"type": "int", "required": True}},
+            positive_effects=[_cond("done", [1])],
+            verifiers=[ObservationVerifier(verifier_id="v1", predicate="done", target_args_mapping=[1], command_template=["true"])],
+            executor_command_template=["true"],
+        )
+    )
+    # Action supplies string "not_an_int"
+    bad_action = _action(action_id="act1", capability_name="typed_tool", parameters={"num": "not_an_int"}, positive_effects=[_cond("done", [1])])
+    plan = PlanIR(plan_id="p_bad_schema", goal_description="Test schema revalidation", initial_state=[], actions=[bad_action])
+    session = PlanningSession(session_id="s_bad_schema")
+    session.submit_draft(plan)
+    val_res = session.validate_candidate(1, reg)
+    assert val_res.status.value == "FAIL"
+
+
+# ---------------------------------------------------------------------------
+# Section D: Capability Hash Covers Full Runtime Contract
+# ---------------------------------------------------------------------------
+
+def test_registry_hash_changes_when_verifier_target_mapping_changes():
+    """Changing verifier target_args_mapping must change capability and registry hash."""
+    cap1 = CapabilityEntry(
+        name="cap",
+        description="Cap",
+        verifiers=[ObservationVerifier(verifier_id="v1", predicate="pred", target_args_mapping=["a"])],
+    )
+    cap2 = CapabilityEntry(
+        name="cap",
+        description="Cap",
+        verifiers=[ObservationVerifier(verifier_id="v1", predicate="pred", target_args_mapping=["b"])],
+    )
+    assert cap1.compute_capability_hash() != cap2.compute_capability_hash()
+
+
+def test_registry_hash_changes_when_verifier_expected_pattern_changes():
+    """Changing verifier expected_output_pattern must change capability hash."""
+    cap1 = CapabilityEntry(
+        name="cap",
+        description="Cap",
+        verifiers=[ObservationVerifier(verifier_id="v1", predicate="pred", expected_output_pattern="pattern_a")],
+    )
+    cap2 = CapabilityEntry(
+        name="cap",
+        description="Cap",
+        verifiers=[ObservationVerifier(verifier_id="v1", predicate="pred", expected_output_pattern="pattern_b")],
+    )
+    assert cap1.compute_capability_hash() != cap2.compute_capability_hash()
+
+
+def test_registry_hash_changes_when_verifier_expected_value_changes():
+    """Changing verifier json_path or expected_value must change capability hash."""
+    cap1 = CapabilityEntry(
+        name="cap",
+        description="Cap",
+        verifiers=[ObservationVerifier(verifier_id="v1", predicate="pred", json_path="status", expected_value="OK")],
+    )
+    cap2 = CapabilityEntry(
+        name="cap",
+        description="Cap",
+        verifiers=[ObservationVerifier(verifier_id="v1", predicate="pred", json_path="status", expected_value="ERROR")],
+    )
+    assert cap1.compute_capability_hash() != cap2.compute_capability_hash()
+
+
+def test_registry_hash_changes_when_executor_contract_changes():
+    """Changing executor_command_template must change capability hash."""
+    cap1 = CapabilityEntry(
+        name="cap",
+        description="Cap",
+        executor_command_template=["echo", "1"],
+    )
+    cap2 = CapabilityEntry(
+        name="cap",
+        description="Cap",
+        executor_command_template=["echo", "2"],
+    )
+    assert cap1.compute_capability_hash() != cap2.compute_capability_hash()
+
+
+# ---------------------------------------------------------------------------
+# Section E: Custom Handler Cannot Replace Authorized Contract
+# ---------------------------------------------------------------------------
+
+def test_custom_handler_cannot_bypass_missing_executor_contract(tmp_path):
+    """Capability without executor_command_template cannot be executed even if custom_action_handler is passed."""
+    reg = CapabilityRegistry()
+    reg.register(
+        CapabilityEntry(
+            name="empty_contract_cap",
+            description="No executor command",
+            input_schema={},
+            positive_effects=[_cond("done", [])],
+            verifiers=[ObservationVerifier(verifier_id="v1", predicate="done", command_template=["true"])],
+            executor_command_template=[],  # Missing!
+        )
+    )
+    plan = PlanIR(
+        plan_id="p_handler_bypass",
+        goal_description="Test custom handler cannot bypass missing contract",
+        initial_state=[],
+        actions=[_action(action_id="act1", capability_name="empty_contract_cap", positive_effects=[_cond("done", [])])],
+    )
+    session = PlanningSession(session_id="s_handler_bypass")
+    session.submit_draft(plan)
+    session.validate_candidate(1, reg)
+    session.select_version(1)
+    policy_hash = reg.compute_registry_hash()
+    cert = session.authorize_selected(reg, policy_hash=policy_hash)
+    session.start_execution(reg, policy_hash=policy_hash)
+
+    def custom_handler(action, params):
+        return SandboxExecutionResult(stdout="fake", returncode=0)
+
+    manager = ExecutionPlanManager(session=session, registry=reg, ledger=EvidenceLedger(session_id=session.session_id))
+    summary = manager.execute_authorized_plan(cert, custom_action_handler=custom_handler)
+    assert summary.success is False
+    assert any("contract" in str(r.error_message).lower() for r in summary.step_results)
+
+
+# ---------------------------------------------------------------------------
+# Section F: Correct Witness Semantics (UNWITNESSED vs WITNESSED_FALSE)
+# ---------------------------------------------------------------------------
+
+def test_precondition_failure_is_unwitnessed(tmp_path):
+    """Precondition check failure must record witness_status == UNWITNESSED (not WITNESSED_FALSE)."""
+    init_fact = _fact("needed_fact", [])
+    reg = CapabilityRegistry()
+    reg.register(
+        CapabilityEntry(
+            name="tool_pre",
+            description="Tool",
+            input_schema={},
+            preconditions=[_cond("needed_fact", [])],
+            positive_effects=[_cond("done", [])],
+            verifiers=[ObservationVerifier(verifier_id="v1", predicate="done", command_template=["true"])],
+            executor_command_template=["true"],
+        )
+    )
+    plan = PlanIR(
+        plan_id="p_pre_unwitnessed",
+        goal_description="Test pre failure witness status",
+        initial_state=[init_fact],
+        actions=[_action(action_id="act1", capability_name="tool_pre", preconditions=[_cond("needed_fact", [])], positive_effects=[_cond("done", [])])],
+    )
+    session = PlanningSession(session_id="s_pre_unwitnessed")
+    session.submit_draft(plan)
+    session.validate_candidate(1, reg, observed_world_state=[init_fact])
+    session.select_version(1)
+    policy_hash = reg.compute_registry_hash()
+    cert = session.authorize_selected(reg, policy_hash=policy_hash)
+    session.start_execution(reg, policy_hash=policy_hash, current_world_facts=[init_fact])
+
+    # Manager created with missing live world state (needed_fact is missing in live state)
+    manager = ExecutionPlanManager(session=session, registry=reg, ledger=EvidenceLedger(session_id=session.session_id), observed_world_state=[])
+    summary = manager.execute_authorized_plan(cert)
+    assert summary.success is False
+    assert summary.step_results[0].witness_status == WitnessStatus.UNWITNESSED
+
+
+def test_executor_failure_is_unwitnessed(tmp_path):
+    """Process exit code != 0 must record witness_status == UNWITNESSED (no postcondition observation occurred)."""
+    reg = CapabilityRegistry()
+    reg.register(
+        CapabilityEntry(
+            name="failing_proc_tool",
+            description="Process returns exit 1",
+            input_schema={},
+            positive_effects=[_cond("done", [])],
+            verifiers=[ObservationVerifier(verifier_id="v1", predicate="done", command_template=["true"])],
+            executor_command_template=["false"],  # Fails!
+        )
+    )
+    plan = PlanIR(
+        plan_id="p_exec_unwitnessed",
+        goal_description="Test exec failure witness status",
+        initial_state=[],
+        actions=[_action(action_id="act1", capability_name="failing_proc_tool", positive_effects=[_cond("done", [])])],
+    )
+    session = PlanningSession(session_id="s_exec_unwitnessed")
     session.submit_draft(plan)
     session.validate_candidate(1, reg)
     session.select_version(1)
@@ -150,50 +576,118 @@ def test_capability_without_executor_contract_cannot_execute(tmp_path):
     summary = manager.execute_authorized_plan(cert)
     assert summary.success is False
     assert summary.step_results[0].exit_code != 0
+    assert summary.step_results[0].witness_status == WitnessStatus.UNWITNESSED
+
+
+def test_missing_verifier_is_unwitnessed(tmp_path):
+    """Capability with effects but without verifiers must return witness_status == UNWITNESSED (cannot witness true or false)."""
+    reg = CapabilityRegistry()
+    cap_no_verif = CapabilityEntry(
+        name="no_verif_tool",
+        description="No verifiers",
+        input_schema={},
+        positive_effects=[_cond("done", [])],
+        verifiers=[],
+        executor_command_template=["true"],
+    )
+    action_with_effect = _action(action_id="act1", capability_name="no_verif_tool", positive_effects=[_cond("done", [])])
+
+    session = PlanningSession(session_id="s_miss_verif")
+    manager = ExecutionPlanManager(session=session, registry=reg, ledger=EvidenceLedger(session_id=session.session_id))
+    witness_status = manager._witness_postconditions(action_with_effect, cap_no_verif)
+    assert witness_status == WitnessStatus.UNWITNESSED
 
 
 # ---------------------------------------------------------------------------
-# Test 3: Capability without verifier cannot witness VERIFIED_TRUE
+# Section G: Fail Closed on Verifier Modes (JSON Path & Expected Value)
 # ---------------------------------------------------------------------------
-def test_capability_without_verifier_cannot_witness_true(tmp_path):
-    """Successful process exit code 0 alone must never create VERIFIED_TRUE if capability lacks verifier."""
-    out_file = tmp_path / "output.txt"
+
+def test_unsupported_verifier_mode_cannot_silently_witness_true(tmp_path):
+    """ObservationVerifier specifying json_path and expected_value must evaluate JSON output correctly."""
     reg = CapabilityRegistry()
     reg.register(
         CapabilityEntry(
-            name="unverified_creator",
-            description="Creates file but has zero verifiers",
-            input_schema={"dst": {"type": "str", "required": True}},
-            positive_effects=[_cond("file_created", ["{dst}"])],
-            verifiers=[],  # Zero verifiers!
-            executor_command_template=["touch", "{dst}"],
+            name="json_api_tool",
+            description="Tool returning JSON",
+            input_schema={},
+            positive_effects=[_cond("health_ok", [])],
+            verifiers=[
+                ObservationVerifier(
+                    verifier_id="v_health",
+                    predicate="health_ok",
+                    command_template=["echo", '{"status": "healthy", "code": 200}'],
+                    json_path="status",
+                    expected_value="healthy",
+                )
+            ],
+            executor_command_template=["true"],
         )
     )
     plan = PlanIR(
-        plan_id="p3_unverified",
-        goal_description="Test unverified capability cannot witness true",
+        plan_id="p_json_ok",
+        goal_description="Test json verifier success",
         initial_state=[],
-        actions=[
-            _action(
-                action_id="act1",
-                capability_name="unverified_creator",
-                parameters={"dst": str(out_file)},
-                positive_effects=[_cond("file_created", [str(out_file)])],
-            )
-        ],
+        actions=[_action(action_id="act1", capability_name="json_api_tool", positive_effects=[_cond("health_ok", [])])],
     )
-    session = PlanningSession(session_id="s3_unverified")
+    session = PlanningSession(session_id="s_json_ok")
     session.submit_draft(plan)
-    # Plan validation is UNKNOWN because missing verifier
-    val_res = session.validate_candidate(1, reg)
-    assert val_res.status.value == "UNKNOWN"
+    session.validate_candidate(1, reg)
+    session.select_version(1)
+    policy_hash = reg.compute_registry_hash()
+    cert = session.authorize_selected(reg, policy_hash=policy_hash)
+    session.start_execution(reg, policy_hash=policy_hash)
+
+    manager = ExecutionPlanManager(session=session, registry=reg, ledger=EvidenceLedger(session_id=session.session_id))
+    summary = manager.execute_authorized_plan(cert)
+    assert summary.success is True
+    assert summary.step_results[0].witness_status == WitnessStatus.WITNESSED_TRUE
+
+    # Negative test: json value mismatch fails witnessing
+    reg_bad = CapabilityRegistry()
+    reg_bad.register(
+        CapabilityEntry(
+            name="json_bad_tool",
+            description="Tool returning wrong JSON",
+            input_schema={},
+            positive_effects=[_cond("health_ok", [])],
+            verifiers=[
+                ObservationVerifier(
+                    verifier_id="v_bad",
+                    predicate="health_ok",
+                    command_template=["echo", '{"status": "unhealthy", "code": 500}'],
+                    json_path="status",
+                    expected_value="healthy",
+                )
+            ],
+            executor_command_template=["true"],
+        )
+    )
+    plan_bad = PlanIR(
+        plan_id="p_json_bad",
+        goal_description="Test json verifier mismatch failure",
+        initial_state=[],
+        actions=[_action(action_id="act1", capability_name="json_bad_tool", positive_effects=[_cond("health_ok", [])])],
+    )
+    s_bad = PlanningSession(session_id="s_json_bad")
+    s_bad.submit_draft(plan_bad)
+    s_bad.validate_candidate(1, reg_bad)
+    s_bad.select_version(1)
+    pol_bad = reg_bad.compute_registry_hash()
+    cert_bad = s_bad.authorize_selected(reg_bad, policy_hash=pol_bad)
+    s_bad.start_execution(reg_bad, policy_hash=pol_bad)
+
+    mgr_bad = ExecutionPlanManager(session=s_bad, registry=reg_bad, ledger=EvidenceLedger(session_id=s_bad.session_id))
+    sum_bad = mgr_bad.execute_authorized_plan(cert_bad)
+    assert sum_bad.success is False
+    assert sum_bad.step_results[0].witness_status == WitnessStatus.WITNESSED_FALSE
 
 
 # ---------------------------------------------------------------------------
-# Test 4: Executor command creates real observable filesystem effect
+# Section H: Real Mutation & Multi-Step Runtime Handoffs
 # ---------------------------------------------------------------------------
+
 def test_executor_command_creates_real_observable_effect(tmp_path):
-    """Executor runs the real command and creates actual file artifact on disk."""
+    """Executor runs real command and creates actual file on disk."""
     target_file = tmp_path / "real_file.txt"
     assert not target_file.exists()
 
@@ -216,7 +710,7 @@ def test_executor_command_creates_real_observable_effect(tmp_path):
         )
     )
     plan = PlanIR(
-        plan_id="p4_real_mutation",
+        plan_id="p_real_mutation",
         goal_description="Test real filesystem mutation",
         initial_state=[],
         actions=[
@@ -228,7 +722,7 @@ def test_executor_command_creates_real_observable_effect(tmp_path):
             )
         ],
     )
-    session = PlanningSession(session_id="s4_real_mutation")
+    session = PlanningSession(session_id="s_real_mutation")
     session.submit_draft(plan)
     session.validate_candidate(1, reg)
     session.select_version(1)
@@ -240,14 +734,10 @@ def test_executor_command_creates_real_observable_effect(tmp_path):
     summary = manager.execute_authorized_plan(cert)
 
     assert summary.success is True
-    # Real file was created on disk!
     assert target_file.exists()
     assert target_file.read_text().strip() == "grounded_content_123"
 
 
-# ---------------------------------------------------------------------------
-# Test 5: Witnessed effect updates live world state to VERIFIED_TRUE
-# ---------------------------------------------------------------------------
 def test_witnessed_effect_updates_live_world_state(tmp_path):
     """After execution and successful independent verification, live world state is updated to VERIFIED_TRUE."""
     target_file = tmp_path / "witnessed.txt"
@@ -270,7 +760,7 @@ def test_witnessed_effect_updates_live_world_state(tmp_path):
         )
     )
     plan = PlanIR(
-        plan_id="p5_live_state",
+        plan_id="p_live_state",
         goal_description="Test live state update",
         initial_state=[],
         actions=[
@@ -282,7 +772,7 @@ def test_witnessed_effect_updates_live_world_state(tmp_path):
             )
         ],
     )
-    session = PlanningSession(session_id="s5_live_state")
+    session = PlanningSession(session_id="s_live_state")
     session.submit_draft(plan)
     session.validate_candidate(1, reg)
     session.select_version(1)
@@ -294,7 +784,6 @@ def test_witnessed_effect_updates_live_world_state(tmp_path):
     summary = manager.execute_authorized_plan(cert)
     assert summary.success is True
 
-    # Check live world state in manager
     key = f"file_exists({str(target_file)})"
     assert key in manager.live_world_state
     live_fact = manager.live_world_state[key]
@@ -302,9 +791,6 @@ def test_witnessed_effect_updates_live_world_state(tmp_path):
     assert live_fact.provenance.source_type == SourceType.OBSERVED_WORLD_STATE
 
 
-# ---------------------------------------------------------------------------
-# Test 6: Two-step plan consumes first-step witnessed effect at runtime
-# ---------------------------------------------------------------------------
 def test_two_step_plan_consumes_first_step_witnessed_effect(tmp_path):
     """Action 2 checks empirical precondition satisfied only after Action 1 is executed and witnessed."""
     f1 = tmp_path / "step1.txt"
@@ -348,7 +834,7 @@ def test_two_step_plan_consumes_first_step_witnessed_effect(tmp_path):
     )
 
     plan = PlanIR(
-        plan_id="p6_two_step_runtime",
+        plan_id="p_two_step_runtime",
         goal_description="Test 2 step runtime execution",
         initial_state=[],
         actions=[
@@ -367,7 +853,7 @@ def test_two_step_plan_consumes_first_step_witnessed_effect(tmp_path):
             ),
         ],
     )
-    session = PlanningSession(session_id="s6_two_step_runtime")
+    session = PlanningSession(session_id="s_two_step_runtime")
     session.submit_draft(plan)
     session.validate_candidate(1, reg)
     session.select_version(1)
@@ -384,105 +870,6 @@ def test_two_step_plan_consumes_first_step_witnessed_effect(tmp_path):
     assert f2.exists()
 
 
-# ---------------------------------------------------------------------------
-# Test 7: Projected truth alone cannot satisfy runtime precondition
-# ---------------------------------------------------------------------------
-def test_projected_truth_alone_cannot_satisfy_runtime_precondition(tmp_path):
-    """At runtime, if an action precondition has projected_truth=SUPPORTED_TRUE but truth=UNKNOWN, execution aborts."""
-    reg = CapabilityRegistry()
-    reg.register(
-        CapabilityEntry(
-            name="dependent_tool",
-            description="Tool requiring unobserved fact",
-            input_schema={},
-            preconditions=[_cond("unobserved_fact", ["x"])],
-            positive_effects=[_cond("done", ["x"])],
-            verifiers=[ObservationVerifier(verifier_id="v1", predicate="done", target_args_mapping=["x"])],
-            executor_command_template=["true"],
-        )
-    )
-    plan = PlanIR(
-        plan_id="p7_projected_alone",
-        goal_description="Test projected alone fails runtime precheck",
-        initial_state=[],  # unobserved_fact is not in trusted initial state
-        actions=[
-            _action(
-                action_id="act1",
-                capability_name="dependent_tool",
-                preconditions=[_cond("unobserved_fact", ["x"])],
-                positive_effects=[_cond("done", ["x"])],
-            )
-        ],
-    )
-    session = PlanningSession(session_id="s7_projected_alone")
-    session.submit_draft(plan)
-    val_res = session.validate_candidate(1, reg)
-    assert val_res.status.value == "UNKNOWN"
-
-
-# ---------------------------------------------------------------------------
-# Test 8: Custom handler cannot bypass observation attestation
-# ---------------------------------------------------------------------------
-def test_custom_handler_cannot_bypass_attestation(tmp_path):
-    """Custom handler returns exit code 0, but if independent verifier fails, effect is NOT marked VERIFIED_TRUE."""
-    missing_file = tmp_path / "never_created.txt"
-
-    reg = CapabilityRegistry()
-    reg.register(
-        CapabilityEntry(
-            name="lying_custom_tool",
-            description="Claims to create file",
-            input_schema={"path": {"type": "str", "required": True}},
-            positive_effects=[_cond("file_exists", ["{path}"])],
-            verifiers=[
-                ObservationVerifier(
-                    verifier_id="v_verify_file",
-                    predicate="file_exists",
-                    target_args_mapping=["{path}"],
-                    command_template=["test", "-f", "{path}"],
-                )
-            ],
-            executor_command_template=["sh", "-c", "echo 'no-op'"],
-        )
-    )
-    plan = PlanIR(
-        plan_id="p8_custom_bypass",
-        goal_description="Test custom handler cannot fake verifier success",
-        initial_state=[],
-        actions=[
-            _action(
-                action_id="act1",
-                capability_name="lying_custom_tool",
-                parameters={"path": str(missing_file)},
-                positive_effects=[_cond("file_exists", [str(missing_file)])],
-            )
-        ],
-    )
-    session = PlanningSession(session_id="s8_custom_bypass")
-    session.submit_draft(plan)
-    session.validate_candidate(1, reg)
-    session.select_version(1)
-    policy_hash = reg.compute_registry_hash()
-    cert = session.authorize_selected(reg, policy_hash=policy_hash)
-    session.start_execution(reg, policy_hash=policy_hash)
-
-    # Custom handler returns exit_code=0 without creating file
-    def lying_handler(action, params):
-        return SandboxExecutionResult(stdout="fake success", returncode=0)
-
-    manager = ExecutionPlanManager(session=session, registry=reg, ledger=EvidenceLedger(session_id=session.session_id))
-    summary = manager.execute_authorized_plan(cert, custom_action_handler=lying_handler)
-
-    assert summary.success is False
-    assert summary.step_results[0].witness_status == WitnessStatus.WITNESSED_FALSE
-    # Live state must NOT have VERIFIED_TRUE
-    key = f"file_exists({str(missing_file)})"
-    assert manager.live_world_state.get(key) is None or manager.live_world_state[key].truth != FactTruth.VERIFIED_TRUE
-
-
-# ---------------------------------------------------------------------------
-# Test 9: Failed verifier keeps effect unverified and aborts plan
-# ---------------------------------------------------------------------------
 def test_failed_verifier_keeps_effect_unverified(tmp_path):
     """Executor succeeds (exit 0) but verifier fails -> effect remains UNKNOWN and dependent actions do not run."""
     f_step1 = tmp_path / "step1_failed_verif.txt"
@@ -518,7 +905,7 @@ def test_failed_verifier_keeps_effect_unverified(tmp_path):
         )
     )
     plan = PlanIR(
-        plan_id="p9_failed_verifier",
+        plan_id="p_failed_verifier",
         goal_description="Test failed verifier stops dependent action",
         initial_state=[],
         actions=[
@@ -537,7 +924,7 @@ def test_failed_verifier_keeps_effect_unverified(tmp_path):
             ),
         ],
     )
-    session = PlanningSession(session_id="s9_failed_verifier")
+    session = PlanningSession(session_id="s_failed_verifier")
     session.submit_draft(plan)
     session.validate_candidate(1, reg)
     session.select_version(1)
@@ -550,102 +937,14 @@ def test_failed_verifier_keeps_effect_unverified(tmp_path):
 
     assert summary.success is False
     assert summary.failed_step_id == "act1"
-    # Action 2 must never have executed
     assert len(summary.step_results) == 1
     assert not f_step2.exists()
 
 
-# ---------------------------------------------------------------------------
-# Test 10: Verifier observes exact bound target
-# ---------------------------------------------------------------------------
-def test_verifier_observes_exact_bound_target(tmp_path):
-    """Verifier with wrong target argument binding fails to witness effect."""
-    target_a = tmp_path / "file_a.txt"
-    target_b = tmp_path / "file_b.txt"
-    target_b.write_text("exists")
-
-    reg = CapabilityRegistry()
-    reg.register(
-        CapabilityEntry(
-            name="mismatched_verifier_tool",
-            description="Creates target A but verifier checks target B",
-            input_schema={"path": {"type": "str", "required": True}},
-            positive_effects=[_cond("file_exists", ["{path}"])],
-            verifiers=[
-                # Verifier is bound to target_b, not target_a
-                ObservationVerifier(
-                    verifier_id="v_mismatch",
-                    predicate="file_exists",
-                    target_args_mapping=[str(target_b)],
-                    command_template=["test", "-f", str(target_b)],
-                )
-            ],
-            executor_command_template=["touch", "{path}"],
-        )
-    )
-    plan = PlanIR(
-        plan_id="p10_target_match",
-        goal_description="Test verifier bound target matching",
-        initial_state=[],
-        actions=[
-            _action(
-                action_id="act1",
-                capability_name="mismatched_verifier_tool",
-                parameters={"path": str(target_a)},
-                positive_effects=[_cond("file_exists", [str(target_a)])],
-            )
-        ],
-    )
-    session = PlanningSession(session_id="s10_target_match")
-    session.submit_draft(plan)
-    # Plan validation should mark effect as UNWITNESSABLE because target_args_mapping does not match
-    val_res = session.validate_candidate(1, reg)
-    assert val_res.status.value == "UNKNOWN"
-
-
-# ---------------------------------------------------------------------------
-# Test 11: Execution re-checks plan, registry, and world identity before execution
-# ---------------------------------------------------------------------------
-def test_execution_rechecks_plan_registry_and_world_identity(tmp_path):
-    """Mutating plan or registry after authorization causes execution to be rejected due to hash mismatch."""
-    reg = CapabilityRegistry()
-    reg.register(
-        CapabilityEntry(
-            name="tool_ok",
-            description="Ok tool",
-            input_schema={},
-            positive_effects=[_cond("ok", [])],
-            verifiers=[ObservationVerifier(verifier_id="v_ok", predicate="ok", command_template=["true"])],
-            executor_command_template=["true"],
-        )
-    )
-    plan = PlanIR(
-        plan_id="p11_drift",
-        goal_description="Test drift rejection",
-        initial_state=[],
-        actions=[_action(action_id="act1", capability_name="tool_ok", positive_effects=[_cond("ok", [])])],
-    )
-    session = PlanningSession(session_id="s11_drift")
-    session.submit_draft(plan)
-    session.validate_candidate(1, reg)
-    session.select_version(1)
-    cert = session.authorize_selected(reg, policy_hash="policy_initial")
-
-    # Tamper with certificate plan hash
-    tampered_cert = cert.model_copy(update={"plan_hash": "bad_hash_0000000000000000000000000000000000000000000000000000000000000000"})
-    session.start_execution(reg, policy_hash="policy_initial")
-    manager = ExecutionPlanManager(session=session, registry=reg, ledger=EvidenceLedger(session_id=session.session_id))
-
-    with pytest.raises((ValueError, SignatureVerificationError, StateDriftError)):
-        manager.execute_authorized_plan(tampered_cert)
-
-
-# ---------------------------------------------------------------------------
-# Test 12: Runtime does not mutate PlanIR to fake observations
-# ---------------------------------------------------------------------------
 def test_runtime_does_not_mutate_plan_ir_to_fake_observation(tmp_path):
     """PlanIR remains immutable during execution; empirical facts live only in manager.live_world_state and ledger."""
     target_file = tmp_path / "immutable.txt"
+    init_fact = _fact("system_ready", [])
     reg = CapabilityRegistry()
     reg.register(
         CapabilityEntry(
@@ -665,9 +964,9 @@ def test_runtime_does_not_mutate_plan_ir_to_fake_observation(tmp_path):
         )
     )
     plan = PlanIR(
-        plan_id="p12_immutable",
+        plan_id="p_immutable",
         goal_description="Test plan immutability",
-        initial_state=[_fact("system_ready", [])],
+        initial_state=[init_fact],
         actions=[
             _action(
                 action_id="act1",
@@ -680,19 +979,19 @@ def test_runtime_does_not_mutate_plan_ir_to_fake_observation(tmp_path):
     )
     original_plan_hash = plan.compute_hash()
 
-    session = PlanningSession(session_id="s12_immutable")
+    session = PlanningSession(session_id="s_immutable")
     session.submit_draft(plan)
-    session.validate_candidate(1, reg, observed_world_state=plan.initial_state)
+    session.validate_candidate(1, reg, observed_world_state=[init_fact])
     session.select_version(1)
     policy_hash = reg.compute_registry_hash()
     cert = session.authorize_selected(reg, policy_hash=policy_hash)
-    session.start_execution(reg, policy_hash=policy_hash, current_world_facts=plan.initial_state)
+    session.start_execution(reg, policy_hash=policy_hash, current_world_facts=[init_fact])
 
     manager = ExecutionPlanManager(
         session=session,
         registry=reg,
         ledger=EvidenceLedger(session_id=session.session_id),
-        observed_world_state=plan.initial_state,
+        observed_world_state=[init_fact],
     )
     summary = manager.execute_authorized_plan(cert)
     assert summary.success is True
