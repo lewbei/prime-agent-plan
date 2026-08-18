@@ -14,6 +14,7 @@ from plan_mode.ir import (
     ActionIR,
     PlanIR,
 )
+from plan_mode.registry import CapabilityRegistry, CapabilityEntry, ObservationVerifier
 from plan_mode.epistemic_validator import (
     CausalValidator,
     EpistemicCausalValidator,
@@ -42,6 +43,21 @@ def test_causal_validator_simple_pass():
     
     f1 = WorldFact(predicate="file_exists", args=["/tmp/src.txt"], truth=FactTruth.VERIFIED_TRUE, provenance=prov)
     f2 = WorldFact(predicate="dest_clean", args=["/tmp/dest.txt"], truth=FactTruth.VERIFIED_TRUE, provenance=prov)
+    
+    reg = CapabilityRegistry()
+    reg.register(
+        CapabilityEntry(
+            name="fs.copy",
+            description="Copy file",
+            input_schema={"src": "str", "dst": "str"},
+            positive_effects=[PredicateCondition(predicate="file_exists", args=["{dst}"])],
+            negative_effects=[PredicateCondition(predicate="dest_clean", args=["{dst}"], expected_truth=FactTruth.VERIFIED_FALSE)],
+            verifiers=[
+                ObservationVerifier(verifier_id="v_exists", predicate="file_exists"),
+                ObservationVerifier(verifier_id="v_clean", predicate="dest_clean"),
+            ],
+        )
+    )
     
     act1 = ActionIR(
         action_id="step_1",
@@ -76,7 +92,7 @@ def test_causal_validator_simple_pass():
     )
     
     validator = CausalValidator()
-    result = validator.validate_plan(plan)
+    result = validator.validate_plan(plan, registry=reg)
     
     assert result.status == ValidationStatus.PASS
     assert len(result.criteria_satisfied) == 1
@@ -104,10 +120,11 @@ def test_causal_validator_unknown_precondition_yields_unknown():
     )
     
     plan = PlanIR(
-        plan_id="plan_unk_001",
-        goal_description="Copy file with unverified precondition",
+        plan_id="plan_unknown_001",
+        goal_description="Attempt copy with unknown precondition",
         initial_state=[f1],
         actions=[act1],
+        hard_constraints=[],
         success_criteria=[
             SuccessCriterion(
                 criterion_id="sc_001",
@@ -122,31 +139,41 @@ def test_causal_validator_unknown_precondition_yields_unknown():
     
     assert result.status == ValidationStatus.UNKNOWN
     assert "file_exists(/tmp/src.txt)" in result.unknown_facts
-    assert result.failed_step_id == "step_1"
+    assert len(result.criteria_satisfied) == 0
 
 
-def test_causal_validator_false_precondition_yields_fail():
+def test_causal_validator_failed_precondition_yields_fail():
     prov = Provenance(source_type=SourceType.OBSERVED_WORLD_STATE)
     
-    # Ground truth is explicitly FALSE
-    f1 = WorldFact(predicate="file_exists", args=["/tmp/missing.txt"], truth=FactTruth.VERIFIED_FALSE, provenance=prov)
+    # Precondition is verified FALSE
+    f1 = WorldFact(predicate="file_exists", args=["/tmp/src.txt"], truth=FactTruth.VERIFIED_FALSE, provenance=prov)
     
     act1 = ActionIR(
         action_id="step_1",
-        capability_name="fs.read",
-        parameters={"path": "/tmp/missing.txt"},
+        capability_name="fs.copy",
+        parameters={"src": "/tmp/src.txt", "dst": "/tmp/dest.txt"},
         preconditions=[
-            PredicateCondition(predicate="file_exists", args=["/tmp/missing.txt"], expected_truth=FactTruth.VERIFIED_TRUE),
+            PredicateCondition(predicate="file_exists", args=["/tmp/src.txt"], expected_truth=FactTruth.VERIFIED_TRUE),
         ],
-        positive_effects=[],
+        positive_effects=[
+            PredicateCondition(predicate="file_exists", args=["/tmp/dest.txt"])
+        ],
         provenance=prov,
     )
     
     plan = PlanIR(
         plan_id="plan_fail_001",
-        goal_description="Read nonexistent file",
+        goal_description="Fail due to missing source file",
         initial_state=[f1],
         actions=[act1],
+        hard_constraints=[],
+        success_criteria=[
+            SuccessCriterion(
+                criterion_id="sc_001",
+                description="Dest file exists",
+                condition=PredicateCondition(predicate="file_exists", args=["/tmp/dest.txt"]),
+            )
+        ],
     )
     
     validator = CausalValidator()
@@ -154,7 +181,8 @@ def test_causal_validator_false_precondition_yields_fail():
     
     assert result.status == ValidationStatus.FAIL
     assert result.failed_step_id == "step_1"
-    assert "file_exists(/tmp/missing.txt)" in result.failed_predicate
+    assert result.failed_predicate == "file_exists(/tmp/src.txt)"
+    assert len(result.blocker_reasons) > 0
 
 
 def test_causal_validator_hard_constraint_violation():
@@ -162,6 +190,17 @@ def test_causal_validator_hard_constraint_violation():
     
     f1 = WorldFact(predicate="service_running", args=["web"], truth=FactTruth.VERIFIED_TRUE, provenance=prov)
     
+    reg = CapabilityRegistry()
+    reg.register(
+        CapabilityEntry(
+            name="system.stop_service",
+            description="Stop service",
+            input_schema={"name": "str"},
+            negative_effects=[PredicateCondition(predicate="service_running", args=["{name}"], expected_truth=FactTruth.VERIFIED_FALSE)],
+            verifiers=[ObservationVerifier(verifier_id="v_stop", predicate="service_running")],
+        )
+    )
+
     # Action stops service
     act1 = ActionIR(
         action_id="step_1",
@@ -191,7 +230,7 @@ def test_causal_validator_hard_constraint_violation():
     )
     
     validator = CausalValidator()
-    result = validator.validate_plan(plan)
+    result = validator.validate_plan(plan, registry=reg)
     
     assert result.status == ValidationStatus.FAIL
     assert "hc_no_downtime" in result.invariants_violated

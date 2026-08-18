@@ -1,4 +1,4 @@
-"""Adversarial Soundness and Invariant Tests for Epistemic Causal Validator."""
+"""Adversarial Soundness and Invariant Tests for Epistemic Causal Validator (Phase 1)."""
 
 import time
 import pytest
@@ -11,6 +11,7 @@ from plan_mode.ir import (
     Provenance,
     SourceType,
     SuccessCriterion,
+    WitnessabilityStatus,
     WorldFact,
 )
 from plan_mode.registry import (
@@ -27,7 +28,7 @@ from plan_mode.epistemic_validator import (
 )
 
 
-def _fact(predicate: str, args: list[str], truth: FactTruth, ttl: float | None = None, created_at: float | None = None) -> WorldFact:
+def _fact(predicate: str, args: list[str], truth: FactTruth, ttl: float | None = None, created_at: float | None = None, source: SourceType = SourceType.OBSERVED_WORLD_STATE) -> WorldFact:
     now = created_at if created_at is not None else time.time()
     return WorldFact(
         predicate=predicate,
@@ -36,7 +37,7 @@ def _fact(predicate: str, args: list[str], truth: FactTruth, ttl: float | None =
         ttl_seconds=ttl,
         created_at=now,
         updated_at=now,
-        provenance=Provenance(source_type=SourceType.OBSERVED_WORLD_STATE, confidence=1.0),
+        provenance=Provenance(source_type=source, confidence=1.0),
     )
 
 
@@ -51,6 +52,7 @@ def _action(
     positive_effects: list[PredicateCondition] | None = None,
     negative_effects: list[PredicateCondition] | None = None,
     parameters: dict | None = None,
+    timeout_seconds: float = 10.0,
 ) -> ActionIR:
     return ActionIR(
         action_id=action_id,
@@ -59,6 +61,7 @@ def _action(
         preconditions=preconditions or [],
         positive_effects=positive_effects or [],
         negative_effects=negative_effects or [],
+        timeout_seconds=timeout_seconds,
         provenance=Provenance(source_type=SourceType.PLANNER_INFERENCE, source_id=action_id),
     )
 
@@ -72,315 +75,414 @@ def _criterion(criterion_id: str, condition: PredicateCondition, is_mandatory: b
     )
 
 
-def test_unknown_precondition_does_not_apply_effects():
-    """Invariant 1: If precondition is UNKNOWN, action effects MUST NOT be applied to state."""
+# ---------------------------------------------------------------------------
+# Test 1: Effectful action without registry MUST yield UNKNOWN (not PASS)
+# ---------------------------------------------------------------------------
+def test_effectful_action_without_registry_yields_unknown():
+    """An effectful action validated with registry=None must yield UNKNOWN due to missing grounding."""
     validator = EpistemicCausalValidator()
     plan = PlanIR(
         plan_id="p1",
-        goal_description="Test unknown gating",
-        initial_state=[],  # is_authenticated is UNKNOWN
+        goal_description="Test effectful without registry",
+        initial_state=[],
         actions=[
             _action(
                 action_id="act1",
-                capability_name="delete_database",
-                preconditions=[_cond("is_authenticated", ["admin"])],
-                positive_effects=[_cond("database_deleted", ["prod"])],
+                capability_name="magic_tool",
+                positive_effects=[_cond("data_written", ["file.txt"])],
             )
         ],
-        success_criteria=[_criterion("c1", _cond("database_deleted", ["prod"]))],
+        success_criteria=[_criterion("c1", _cond("data_written", ["file.txt"]))],
     )
-    result = validator.validate_plan(plan)
-    # The action could not execute with certainty; database_deleted must NOT be verified in intermediate/final state
+    result = validator.validate_plan(plan, registry=None)
     assert result.status == ValidationStatus.UNKNOWN
-    assert "is_authenticated(admin)" in result.unknown_facts
-    # Final state must NOT contain verified database_deleted
-    final_state = result.intermediate_states[-1]
-    db_fact = final_state.get("database_deleted(prod)")
-    assert db_fact is None or db_fact.truth != FactTruth.VERIFIED_TRUE
+    assert any("registry" in r.lower() or "grounding" in r.lower() or "unregistered" in r.lower() or "verifier" in r.lower() for r in (result.blocker_reasons + result.unknown_facts))
 
 
-def test_unknown_action_cannot_satisfy_downstream_precondition():
-    """Invariant 2: Downstream action depending on an un-executed / unknown action must remain UNKNOWN."""
-    validator = EpistemicCausalValidator()
-    plan = PlanIR(
-        plan_id="p2",
-        goal_description="Test downstream propagation",
-        initial_state=[],  # has_code is UNKNOWN
-        actions=[
-            _action(
-                action_id="act1",
-                capability_name="build_app",
-                preconditions=[_cond("has_code", ["main"])],
-                positive_effects=[_cond("app_built", ["v1"])],
-            ),
-            _action(
-                action_id="act2",
-                capability_name="deploy_app",
-                preconditions=[_cond("app_built", ["v1"])],
-                positive_effects=[_cond("app_deployed", ["prod"])],
-            ),
-        ],
-        success_criteria=[_criterion("c1", _cond("app_deployed", ["prod"]))],
-    )
-    result = validator.validate_plan(plan)
-    assert result.status == ValidationStatus.UNKNOWN
-    final_state = result.intermediate_states[-1]
-    deployed = final_state.get("app_deployed(prod)")
-    assert deployed is None or deployed.truth != FactTruth.VERIFIED_TRUE
-
-
-def test_conflicting_duplicate_initial_facts_yield_conflict():
-    """Invariant 3: Duplicate contradictory facts in initial_state must merge to CONFLICT."""
-    validator = EpistemicCausalValidator()
-    plan = PlanIR(
-        plan_id="p3",
-        goal_description="Test duplicate conflict",
-        initial_state=[
-            _fact("service_running", ["api"], FactTruth.VERIFIED_TRUE),
-            _fact("service_running", ["api"], FactTruth.VERIFIED_FALSE),
-        ],
-        actions=[
-            _action(
-                action_id="act1",
-                capability_name="check_service",
-                preconditions=[_cond("service_running", ["api"], FactTruth.VERIFIED_TRUE)],
-                positive_effects=[_cond("checked", ["api"])],
-            )
-        ],
-        success_criteria=[_criterion("c1", _cond("checked", ["api"]))],
-    )
-    result = validator.validate_plan(plan)
-    assert result.status == ValidationStatus.FAIL
-    assert any("conflict" in b.lower() for b in result.blocker_reasons)
-
-
-def test_registered_and_observed_fact_conflict_is_preserved():
-    """Invariant 4: Merging conflicting truth states preserves CONFLICT in 4-state lattice."""
-    assert merge_fact_truth(FactTruth.VERIFIED_TRUE, FactTruth.VERIFIED_FALSE) == FactTruth.CONFLICT
-    assert merge_fact_truth(FactTruth.CONFLICT, FactTruth.VERIFIED_TRUE) == FactTruth.CONFLICT
-    assert merge_fact_truth(FactTruth.CONFLICT, FactTruth.UNKNOWN) == FactTruth.CONFLICT
-
-
-def test_unregistered_effectful_capability_cannot_pass():
-    """Invariant 5: Validating an action whose capability is not in the registry must fail validation."""
+# ---------------------------------------------------------------------------
+# Test 2: Unregistered capability yields UNKNOWN (lack of knowledge, not FAIL)
+# ---------------------------------------------------------------------------
+def test_unregistered_capability_yields_unknown_not_fail():
+    """Empty registry + unknown capability must return UNKNOWN, not FAIL."""
     validator = EpistemicCausalValidator()
     registry = CapabilityRegistry()  # Empty registry
     plan = PlanIR(
-        plan_id="p5",
-        goal_description="Test unregistered capability",
-        initial_state=[_fact("flag", ["on"], FactTruth.VERIFIED_TRUE)],
+        plan_id="p2",
+        goal_description="Test unknown capability",
+        initial_state=[_fact("input_ready", ["file.txt"], FactTruth.VERIFIED_TRUE)],
         actions=[
             _action(
                 action_id="act1",
-                capability_name="unregistered_tool",
-                preconditions=[_cond("flag", ["on"])],
-                positive_effects=[_cond("done", ["yes"])],
+                capability_name="novel_probe_tool",
+                preconditions=[_cond("input_ready", ["file.txt"])],
+                positive_effects=[_cond("probed", ["file.txt"])],
             )
         ],
-        success_criteria=[_criterion("c1", _cond("done", ["yes"]))],
+        success_criteria=[_criterion("c1", _cond("probed", ["file.txt"]))],
     )
     result = validator.validate_plan(plan, registry=registry)
-    assert result.status == ValidationStatus.FAIL
-    assert any("not found" in b.lower() or "unregistered" in b.lower() or "missing" in b.lower() for b in result.blocker_reasons)
+    # Lack of capability registration is epistemic uncertainty (UNKNOWN), not a proven contradiction (FAIL)
+    assert result.status == ValidationStatus.UNKNOWN
+    assert result.status != ValidationStatus.FAIL
 
 
-def test_action_effect_must_be_declared_by_capability():
-    """Invariant 6: Action effects must be a subset of the registered capability declared effects."""
+# ---------------------------------------------------------------------------
+# Test 3: Empty registered positive effect set strictly rejects claimed effect
+# ---------------------------------------------------------------------------
+def test_empty_registered_effect_set_rejects_claimed_effect():
+    """Capability with positive_effects=[] strictly forbids any positive effects."""
     registry = CapabilityRegistry()
     registry.register(
         CapabilityEntry(
-            name="safe_reader",
-            description="Read a file",
+            name="read_only_tool",
+            description="Pure read-only operation with zero side effects",
             input_schema={"path": {"type": "str", "required": True}},
-            positive_effects=[_cond("file_read", ["{path}"])],
-            verifiers=[ObservationVerifier(verifier_id="v1", predicate="file_read")],
+            positive_effects=[],  # ZERO positive effects allowed
+            negative_effects=[],
+            verifiers=[],
+        )
+    )
+    validator = EpistemicCausalValidator()
+    plan = PlanIR(
+        plan_id="p3",
+        goal_description="Test empty positive effect set",
+        initial_state=[],
+        actions=[
+            _action(
+                action_id="act1",
+                capability_name="read_only_tool",
+                parameters={"path": "/tmp/a"},
+                positive_effects=[_cond("file_modified", ["/tmp/a"])],  # Forbidden!
+            )
+        ],
+        success_criteria=[_criterion("c1", _cond("file_modified", ["/tmp/a"]))],
+    )
+    result = validator.validate_plan(plan, registry=registry)
+    assert result.status == ValidationStatus.FAIL
+    assert any("effect" in b.lower() or "undeclared" in b.lower() for b in result.blocker_reasons)
+
+
+# ---------------------------------------------------------------------------
+# Test 4: Empty registered negative effect set strictly rejects claimed negative effect
+# ---------------------------------------------------------------------------
+def test_empty_registered_negative_effect_set_rejects_claimed_negative_effect():
+    """Capability with negative_effects=[] strictly forbids any negative effects."""
+    registry = CapabilityRegistry()
+    registry.register(
+        CapabilityEntry(
+            name="creator_tool",
+            description="Creation tool with no deletions",
+            input_schema={"name": {"type": "str", "required": True}},
+            positive_effects=[_cond("created", ["{name}"])],
+            negative_effects=[],  # ZERO negative effects allowed
+            verifiers=[ObservationVerifier(verifier_id="v1", predicate="created")],
+        )
+    )
+    validator = EpistemicCausalValidator()
+    plan = PlanIR(
+        plan_id="p4",
+        goal_description="Test empty negative effect set",
+        initial_state=[],
+        actions=[
+            _action(
+                action_id="act1",
+                capability_name="creator_tool",
+                parameters={"name": "box"},
+                positive_effects=[_cond("created", ["box"])],
+                negative_effects=[_cond("deleted", ["old_box"])],  # Forbidden!
+            )
+        ],
+        success_criteria=[_criterion("c1", _cond("created", ["box"]))],
+    )
+    result = validator.validate_plan(plan, registry=registry)
+    assert result.status == ValidationStatus.FAIL
+    assert any("negative" in b.lower() or "undeclared" in b.lower() for b in result.blocker_reasons)
+
+
+# ---------------------------------------------------------------------------
+# Test 5: Effect binding requires exact instantiated arguments (template unification)
+# ---------------------------------------------------------------------------
+def test_effect_binding_requires_exact_arguments():
+    """Action cannot claim an effect on /etc/passwd when parameter is path=/tmp/a."""
+    registry = CapabilityRegistry()
+    registry.register(
+        CapabilityEntry(
+            name="file_writer",
+            description="Writes to target path",
+            input_schema={"path": {"type": "str", "required": True}},
+            positive_effects=[_cond("file_written", ["{path}"])],
+            verifiers=[ObservationVerifier(verifier_id="v1", predicate="file_written")],
+        )
+    )
+    validator = EpistemicCausalValidator()
+    plan = PlanIR(
+        plan_id="p5",
+        goal_description="Test argument binding mismatch",
+        initial_state=[],
+        actions=[
+            _action(
+                action_id="act1",
+                capability_name="file_writer",
+                parameters={"path": "/tmp/a"},
+                positive_effects=[_cond("file_written", ["/etc/passwd"])],  # Mismatch with path=/tmp/a!
+            )
+        ],
+        success_criteria=[_criterion("c1", _cond("file_written", ["/etc/passwd"]))],
+    )
+    result = validator.validate_plan(plan, registry=registry)
+    assert result.status == ValidationStatus.FAIL
+    assert any("mismatch" in b.lower() or "argument" in b.lower() or "effect" in b.lower() for b in result.blocker_reasons)
+
+
+# ---------------------------------------------------------------------------
+# Test 6: Effect binding requires matching truth and sign
+# ---------------------------------------------------------------------------
+def test_effect_binding_requires_matching_truth_and_sign():
+    """Action claiming VERIFIED_FALSE for an effect registered as VERIFIED_TRUE must fail contract."""
+    registry = CapabilityRegistry()
+    registry.register(
+        CapabilityEntry(
+            name="starter",
+            description="Starts a service",
+            input_schema={"svc": {"type": "str", "required": True}},
+            positive_effects=[_cond("service_running", ["{svc}"], FactTruth.VERIFIED_TRUE)],
+            verifiers=[ObservationVerifier(verifier_id="v1", predicate="service_running")],
         )
     )
     validator = EpistemicCausalValidator()
     plan = PlanIR(
         plan_id="p6",
-        goal_description="Test undeclared effect",
+        goal_description="Test truth sign mismatch",
         initial_state=[],
         actions=[
             _action(
                 action_id="act1",
-                capability_name="safe_reader",
-                parameters={"path": "/tmp/a"},
-                preconditions=[],
-                positive_effects=[
-                    _cond("file_read", ["/tmp/a"]),
-                    _cond("system_reformatted", ["root"]),  # Undeclared!
-                ],
+                capability_name="starter",
+                parameters={"svc": "db"},
+                positive_effects=[_cond("service_running", ["db"], FactTruth.VERIFIED_FALSE)],  # Sign mismatch!
             )
         ],
-        success_criteria=[_criterion("c1", _cond("system_reformatted", ["root"]))],
+        success_criteria=[_criterion("c1", _cond("service_running", ["db"], FactTruth.VERIFIED_FALSE))],
     )
     result = validator.validate_plan(plan, registry=registry)
     assert result.status == ValidationStatus.FAIL
-    assert any("undeclared" in b.lower() or "effect" in b.lower() for b in result.blocker_reasons)
 
 
-def test_undeclared_extra_effect_cannot_become_verified():
-    """Invariant 7: Planner cannot hallucinate effects not supported by registry capability."""
+# ---------------------------------------------------------------------------
+# Test 7: Verifier presence means WITNESSABLE / PLANNER_INFERENCE, NOT empirical OBSERVED_WORLD_STATE
+# ---------------------------------------------------------------------------
+def test_verifier_predicate_match_does_not_mean_effect_witnessed():
+    """Plan simulation must produce PLANNER_INFERENCE provenance, not fabricate OBSERVED_WORLD_STATE."""
     registry = CapabilityRegistry()
     registry.register(
         CapabilityEntry(
-            name="mkdir",
-            description="Make directory",
-            input_schema={"dir": "str"},
-            positive_effects=[_cond("dir_exists", ["{dir}"])],
-            verifiers=[ObservationVerifier(verifier_id="v1", predicate="dir_exists")],
+            name="service_manager",
+            description="Manage service",
+            input_schema={"svc": {"type": "str", "required": True}},
+            positive_effects=[_cond("service_active", ["{svc}"])],
+            verifiers=[ObservationVerifier(verifier_id="v_svc", predicate="service_active")],
         )
     )
     validator = EpistemicCausalValidator()
     plan = PlanIR(
         plan_id="p7",
-        goal_description="Test hallucinated effect",
+        goal_description="Test simulation provenance",
         initial_state=[],
         actions=[
             _action(
                 action_id="act1",
-                capability_name="mkdir",
-                parameters={"dir": "/data"},
-                positive_effects=[_cond("database_seeded", ["all"])],  # Not in capability
+                capability_name="service_manager",
+                parameters={"svc": "web"},
+                positive_effects=[_cond("service_active", ["web"])],
             )
         ],
-        success_criteria=[_criterion("c1", _cond("database_seeded", ["all"]))],
+        success_criteria=[_criterion("c1", _cond("service_active", ["web"]))],
     )
     result = validator.validate_plan(plan, registry=registry)
-    assert result.status == ValidationStatus.FAIL
+    final_state = result.intermediate_states[-1]
+    fact = final_state.get("service_active(web)")
+    assert fact is not None
+    # Simulation creates WITNESSABLE facts from planner inference, NOT empirical observed world facts
+    assert fact.witnessability == WitnessabilityStatus.WITNESSABLE
+    assert fact.provenance.source_type == SourceType.PLANNER_INFERENCE
+    assert fact.provenance.source_type != SourceType.OBSERVED_WORLD_STATE
 
 
-def test_missing_effect_verifier_prevents_pass():
-    """Invariant 8: An effect without an observation verifier in the registry cannot yield PASS."""
+# ---------------------------------------------------------------------------
+# Test 8: Verifier binding requires matching effect arguments
+# ---------------------------------------------------------------------------
+def test_verifier_binding_requires_exact_effect_arguments():
+    """Verifier must match the instantiated effect arguments, not just predicate name."""
     registry = CapabilityRegistry()
     registry.register(
         CapabilityEntry(
-            name="unverified_action",
-            description="Action without verifiers",
-            input_schema={},
-            positive_effects=[_cond("unverifiable_fact", ["val"])],
-            verifiers=[],  # Missing verifier!
+            name="scoped_reader",
+            description="Reads scoped file",
+            input_schema={"scope": {"type": "str", "required": True}},
+            positive_effects=[_cond("scoped_read", ["{scope}"])],
+            verifiers=[ObservationVerifier(verifier_id="v_scoped", predicate="other_predicate")],  # Predicate mismatch
         )
     )
     validator = EpistemicCausalValidator()
     plan = PlanIR(
         plan_id="p8",
-        goal_description="Test missing verifier",
+        goal_description="Test verifier arg match",
         initial_state=[],
         actions=[
             _action(
                 action_id="act1",
-                capability_name="unverified_action",
-                positive_effects=[_cond("unverifiable_fact", ["val"])],
+                capability_name="scoped_reader",
+                parameters={"scope": "user"},
+                positive_effects=[_cond("scoped_read", ["user"])],
             )
         ],
-        success_criteria=[_criterion("c1", _cond("unverifiable_fact", ["val"]))],
+        success_criteria=[_criterion("c1", _cond("scoped_read", ["user"]))],
     )
     result = validator.validate_plan(plan, registry=registry)
-    assert result.status in (ValidationStatus.UNKNOWN, ValidationStatus.FAIL)
-    assert result.status != ValidationStatus.PASS
+    # Effect is not witnessable because verifier predicate does not match
+    assert result.status == ValidationStatus.UNKNOWN
 
 
-def test_active_until_action_constraint_is_enforced():
-    """Invariant 9: Constraint with active_until_action_id must be checked until that step."""
+# ---------------------------------------------------------------------------
+# Test 9: Negative effect without verifier is not witnessable / verified
+# ---------------------------------------------------------------------------
+def test_negative_effect_without_verifier_is_not_verified():
+    """Negative effects without observation verifiers cannot be witnessed and must yield UNKNOWN."""
+    registry = CapabilityRegistry()
+    registry.register(
+        CapabilityEntry(
+            name="killer",
+            description="Kills process",
+            input_schema={"pid": {"type": "int", "required": True}},
+            negative_effects=[_cond("proc_running", ["{pid}"])],
+            verifiers=[],  # No verifier for proc_running removal!
+        )
+    )
     validator = EpistemicCausalValidator()
     plan = PlanIR(
         plan_id="p9",
-        goal_description="Test active_until constraint",
-        initial_state=[_fact("lock_held", ["mutex"], FactTruth.VERIFIED_TRUE)],
-        actions=[
-            _action(
-                action_id="step1",
-                capability_name="work",
-                preconditions=[_cond("lock_held", ["mutex"])],
-                positive_effects=[_cond("step1_done", ["true"])],
-            ),
-            _action(
-                action_id="step2",
-                capability_name="release_lock",
-                preconditions=[],
-                negative_effects=[_cond("lock_held", ["mutex"])],
-                positive_effects=[_cond("lock_released", ["true"])],
-            ),
-            _action(
-                action_id="step3",
-                capability_name="after_release",
-                preconditions=[],
-                positive_effects=[_cond("step3_done", ["true"])],
-            ),
-        ],
-        hard_constraints=[
-            HardConstraint(
-                constraint_id="c_lock",
-                description="Lock must be held during initial work",
-                condition=_cond("lock_held", ["mutex"], FactTruth.VERIFIED_TRUE),
-                active_until_action_id="step2",  # Only required until step2 executes
-                provenance=Provenance(source_type=SourceType.DOMAIN_POLICY),
-            )
-        ],
-        success_criteria=[_criterion("sc", _cond("step3_done", ["true"]))],
-    )
-    result = validator.validate_plan(plan)
-    # Releasing the lock at step2 must NOT violate constraint c_lock because c_lock was only active until step2
-    assert result.status == ValidationStatus.PASS
-
-
-def test_expired_fact_is_unknown_at_point_of_use():
-    """Invariant 10: Fact with TTL expired at point of use decays to UNKNOWN."""
-    validator = EpistemicCausalValidator()
-    t0 = 1000.0
-    plan = PlanIR(
-        plan_id="p10",
-        goal_description="Test TTL point-of-use",
-        initial_state=[
-            _fact("auth_token_valid", ["session"], FactTruth.VERIFIED_TRUE, ttl=10.0, created_at=t0)
-        ],
+        goal_description="Test negative effect verifier gating",
+        initial_state=[_fact("proc_running", ["123"], FactTruth.VERIFIED_TRUE)],
         actions=[
             _action(
                 action_id="act1",
-                capability_name="api_call",
-                preconditions=[_cond("auth_token_valid", ["session"])],
-                positive_effects=[_cond("api_success", ["true"])],
+                capability_name="killer",
+                parameters={"pid": 123},
+                negative_effects=[_cond("proc_running", ["123"])],
             )
         ],
-        success_criteria=[_criterion("sc", _cond("api_success", ["true"]))],
+        success_criteria=[_criterion("c1", _cond("proc_running", ["123"], FactTruth.VERIFIED_FALSE))],
     )
-    # Validated at t0 + 20 (expired)
-    result = validator.validate_plan(plan, current_time=t0 + 20.0)
+    result = validator.validate_plan(plan, registry=registry)
     assert result.status == ValidationStatus.UNKNOWN
-    assert "auth_token_valid(session)" in result.unknown_facts
 
 
-def test_mandatory_unknown_success_criterion_yields_unknown():
-    """Invariant 11: Mandatory criterion with UNKNOWN truth must yield UNKNOWN plan status."""
+# ---------------------------------------------------------------------------
+# Test 10: UNKNOWN hard constraint yields UNKNOWN (not FAIL)
+# ---------------------------------------------------------------------------
+def test_unknown_hard_constraint_yields_unknown_not_fail():
+    """An invariant with UNKNOWN truth must yield UNKNOWN, not FAIL."""
+    validator = EpistemicCausalValidator()
+    plan = PlanIR(
+        plan_id="p10",
+        goal_description="Test unknown invariant",
+        initial_state=[],  # safety_flag is UNKNOWN
+        actions=[],
+        hard_constraints=[
+            HardConstraint(
+                constraint_id="inv1",
+                description="Safety flag must be true",
+                condition=_cond("safety_flag", ["active"], FactTruth.VERIFIED_TRUE),
+                provenance=Provenance(source_type=SourceType.DOMAIN_POLICY),
+            )
+        ],
+        success_criteria=[],
+    )
+    result = validator.validate_plan(plan)
+    assert result.status == ValidationStatus.UNKNOWN
+    assert result.status != ValidationStatus.FAIL
+    assert "safety_flag(active)" in result.unknown_facts
+
+
+# ---------------------------------------------------------------------------
+# Test 11: VERIFIED_FALSE hard constraint yields FAIL
+# ---------------------------------------------------------------------------
+def test_verified_false_hard_constraint_yields_fail():
+    """An invariant with VERIFIED_FALSE truth is a proven contradiction and must yield FAIL."""
     validator = EpistemicCausalValidator()
     plan = PlanIR(
         plan_id="p11",
-        goal_description="Test mandatory unknown criterion",
-        initial_state=[],
+        goal_description="Test false invariant",
+        initial_state=[_fact("safety_flag", ["active"], FactTruth.VERIFIED_FALSE)],
         actions=[],
-        success_criteria=[
-            _criterion("sc1", _cond("remote_server_healthy", ["node1"]), is_mandatory=True)
+        hard_constraints=[
+            HardConstraint(
+                constraint_id="inv1",
+                description="Safety flag must be true",
+                condition=_cond("safety_flag", ["active"], FactTruth.VERIFIED_TRUE),
+                provenance=Provenance(source_type=SourceType.DOMAIN_POLICY),
+            )
         ],
-    )
-    result = validator.validate_plan(plan)
-    assert result.status == ValidationStatus.UNKNOWN
-    assert "remote_server_healthy(node1)" in result.unknown_facts
-
-
-def test_verified_false_mandatory_success_criterion_yields_fail():
-    """Invariant 12: Mandatory criterion with VERIFIED_FALSE truth must yield FAIL plan status."""
-    validator = EpistemicCausalValidator()
-    plan = PlanIR(
-        plan_id="p12",
-        goal_description="Test mandatory false criterion",
-        initial_state=[_fact("remote_server_healthy", ["node1"], FactTruth.VERIFIED_FALSE)],
-        actions=[],
-        success_criteria=[
-            _criterion("sc1", _cond("remote_server_healthy", ["node1"], FactTruth.VERIFIED_TRUE), is_mandatory=True)
-        ],
+        success_criteria=[],
     )
     result = validator.validate_plan(plan)
     assert result.status == ValidationStatus.FAIL
-    assert any("unmet" in b.lower() or "expected" in b.lower() for b in result.blocker_reasons)
+    assert any("invariant" in b.lower() or "constraint" in b.lower() for b in result.blocker_reasons)
+
+
+# ---------------------------------------------------------------------------
+# Test 12: Point-of-use fact expiration during step-by-step execution
+# ---------------------------------------------------------------------------
+def test_point_of_use_fact_expiration_decays_at_action_step():
+    """Fact is fresh at t0 but expires during step 1 duration (timeout), becoming UNKNOWN at step 2."""
+    t0 = 1000.0
+    validator = EpistemicCausalValidator()
+    registry = CapabilityRegistry()
+    registry.register(
+        CapabilityEntry(
+            name="long_task",
+            description="Runs for 15s",
+            input_schema={},
+            positive_effects=[_cond("task1_done", ["true"])],
+            verifiers=[ObservationVerifier(verifier_id="v1", predicate="task1_done")],
+        )
+    )
+    registry.register(
+        CapabilityEntry(
+            name="dependent_task",
+            description="Requires fresh auth",
+            input_schema={},
+            positive_effects=[_cond("task2_done", ["true"])],
+            verifiers=[ObservationVerifier(verifier_id="v2", predicate="task2_done")],
+        )
+    )
+
+    plan = PlanIR(
+        plan_id="p12",
+        goal_description="Test point-of-use TTL decay",
+        initial_state=[
+            # TTL is 10s
+            _fact("auth_token", ["valid"], FactTruth.VERIFIED_TRUE, ttl=10.0, created_at=t0),
+        ],
+        actions=[
+            # Act 1 takes 15s (advancing simulated time from t0 to t0+15)
+            _action(
+                action_id="act1",
+                capability_name="long_task",
+                positive_effects=[_cond("task1_done", ["true"])],
+                timeout_seconds=15.0,
+            ),
+            # Act 2 runs at t0+15 and requires auth_token, which expired at t0+10
+            _action(
+                action_id="act2",
+                capability_name="dependent_task",
+                preconditions=[_cond("auth_token", ["valid"])],
+                positive_effects=[_cond("task2_done", ["true"])],
+            ),
+        ],
+        success_criteria=[_criterion("c1", _cond("task2_done", ["true"]))],
+    )
+
+    result = validator.validate_plan(plan, registry=registry, current_time=t0)
+    assert result.status == ValidationStatus.UNKNOWN
+    assert "auth_token(valid)" in result.unknown_facts

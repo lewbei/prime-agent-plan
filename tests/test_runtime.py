@@ -91,6 +91,7 @@ def test_execution_plan_manager_success():
             description="Echoes string",
             is_idempotent=True,
             input_schema={"text": {"type": "str", "required": True}},
+            positive_effects=[PredicateCondition(predicate="echoed_text", args=["{text}"])],
             verifiers=[
                 ObservationVerifier(
                     verifier_id="v_echo",

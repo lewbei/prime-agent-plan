@@ -54,8 +54,8 @@ class GroundedEpistemicJudge:
     def __init__(self, validator: Optional[CausalValidator] = None):
         self.validator = validator or CausalValidator()
 
-    def evaluate(self, plan_ir: PlanIR) -> JudgeVerdict:
-        val_res = self.validator.validate_plan(plan_ir)
+    def evaluate(self, plan_ir: PlanIR, registry: Optional[CapabilityRegistry] = None) -> JudgeVerdict:
+        val_res = self.validator.validate_plan(plan_ir, registry=registry)
         
         if val_res.status == ValidationStatus.PASS:
             return JudgeVerdict(
@@ -90,9 +90,9 @@ class DualJudgeEvaluator:
         self.blind_judge = blind_judge or BlindJudge()
         self.grounded_judge = grounded_judge or GroundedEpistemicJudge()
 
-    def evaluate_plan(self, plan_ir: PlanIR) -> DualJudgeComparison:
+    def evaluate_plan(self, plan_ir: PlanIR, registry: Optional[CapabilityRegistry] = None) -> DualJudgeComparison:
         blind = self.blind_judge.evaluate(plan_ir)
-        grounded = self.grounded_judge.evaluate(plan_ir)
+        grounded = self.grounded_judge.evaluate(plan_ir, registry=registry)
 
         concordance = (blind.verdict == grounded.verdict)
         blind_optimism = (blind.verdict == "PASS" and grounded.verdict in ("FAIL", "UNKNOWN"))

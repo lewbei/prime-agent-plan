@@ -17,9 +17,14 @@ from plan_mode.ir import (
     Provenance,
     SourceType,
     SuccessCriterion,
+    WitnessabilityStatus,
     WorldFact,
 )
-from plan_mode.registry import CapabilityRegistry
+from plan_mode.registry import (
+    CapabilityNotFoundError,
+    CapabilityRegistry,
+    SchemaMismatchError,
+)
 
 
 class ValidationStatus(str, Enum):
@@ -122,37 +127,87 @@ class EpistemicCausalValidator:
             plan_actions=plan_ir.actions,
             invariants_violated=invariants_violated,
             blocker_reasons=blocker_reasons,
+            unknown_facts=unknown_facts,
         )
-        if invariants_violated:
+        if invariants_violated or blocker_reasons:
             return PlanValidationResult(
                 status=ValidationStatus.FAIL,
                 failed_step_id="INITIAL_STATE",
                 blocker_reasons=blocker_reasons,
+                unknown_facts=unknown_facts,
                 invariants_violated=invariants_violated,
                 intermediate_states=intermediate_states,
             )
+
+        current_sim_time = now
 
         # 2. Iterate through each action step
         for idx, action in enumerate(plan_ir.actions):
             step_id = action.action_id
             cap_entry = None
+            step_unknown = False
 
-            # If registry provided, validate action schema and effect declarations
+            # Advance simulated time by duration of previous action step
+            if idx > 0:
+                current_sim_time += plan_ir.actions[idx - 1].timeout_seconds
+
+            # Recheck fact freshness at point-of-use (t = current_sim_time)
+            for key, f in list(current_state.items()):
+                if self.default_ttl_decay_to_unknown and not f.is_fresh(current_sim_time):
+                    if f.truth != FactTruth.UNKNOWN:
+                        f_decayed = f.model_copy(deep=True)
+                        f_decayed.truth = FactTruth.UNKNOWN
+                        f_decayed.provenance = Provenance(
+                            source_type=SourceType.OBSERVED_WORLD_STATE,
+                            confidence=0.0,
+                            rationale=f"Fact TTL expired at t={current_sim_time}; decayed to UNKNOWN",
+                        )
+                        current_state[key] = f_decayed
+
+            # Validate capability against registry
+            has_effects = bool(action.positive_effects or action.negative_effects)
             if registry is not None:
                 try:
                     registry.validate_action(action)
                     cap_entry = registry.get(action.capability_name)
-                except Exception as e:
+                except CapabilityNotFoundError:
+                    # Unregistered capability is lack of knowledge (UNKNOWN), not a proven contradiction (FAIL)
+                    step_unknown = True
+                    if first_unknown_step is None:
+                        first_unknown_step = step_id
+                    for pos in action.positive_effects:
+                        if pos.fact_key not in unknown_facts:
+                            unknown_facts.append(pos.fact_key)
+                    for neg in action.negative_effects:
+                        if neg.fact_key not in unknown_facts:
+                            unknown_facts.append(neg.fact_key)
+                    for pre in action.preconditions:
+                        if pre.fact_key not in unknown_facts:
+                            unknown_facts.append(pre.fact_key)
+                except SchemaMismatchError as e:
+                    # Known malformed capability contract is FAIL
                     return PlanValidationResult(
                         status=ValidationStatus.FAIL,
                         failed_step_id=step_id,
-                        blocker_reasons=[f"Capability/schema validation failed: {str(e)}"],
+                        blocker_reasons=[f"Capability contract validation failed on '{step_id}': {str(e)}"],
                         intermediate_states=intermediate_states,
                     )
+            elif has_effects:
+                # Effectful action with registry=None lacks grounding -> UNKNOWN
+                step_unknown = True
+                if first_unknown_step is None:
+                    first_unknown_step = step_id
+                missing_reg_tag = f"missing_registry_grounding({step_id})"
+                if missing_reg_tag not in unknown_facts:
+                    unknown_facts.append(missing_reg_tag)
+                for pos in action.positive_effects:
+                    if pos.fact_key not in unknown_facts:
+                        unknown_facts.append(pos.fact_key)
+                for neg in action.negative_effects:
+                    if neg.fact_key not in unknown_facts:
+                        unknown_facts.append(neg.fact_key)
 
             # Check preconditions against current state W_t
-            step_unknown = False
-
             for pre in action.preconditions:
                 key = pre.fact_key
                 fact = current_state.get(key)
@@ -188,40 +243,58 @@ class EpistemicCausalValidator:
                     )
 
             # 3. Transition: W_{t+1}
-            # INVARIANT: If precondition is UNKNOWN or CONFLICT, effects MUST NOT be applied as VERIFIED
             next_state = copy.deepcopy(current_state)
             
             if not step_unknown:
-                # Apply negative effects
+                # Apply negative effects (checking verifier presence)
                 for neg in action.negative_effects:
                     neg_key = neg.fact_key
+                    has_neg_verifier = False
+                    if cap_entry is not None:
+                        has_neg_verifier = any(v.predicate == neg.predicate for v in cap_entry.verifiers)
+
+                    if has_neg_verifier:
+                        neg_truth = FactTruth.VERIFIED_FALSE if neg.expected_truth == FactTruth.VERIFIED_TRUE else neg.expected_truth
+                        neg_witness = WitnessabilityStatus.WITNESSABLE
+                        neg_rationale = f"Negative effect of {step_id}"
+                    else:
+                        neg_truth = FactTruth.UNKNOWN
+                        neg_witness = WitnessabilityStatus.UNWITNESSABLE
+                        neg_rationale = f"Negative effect of {step_id} (missing observation verifier)"
+                        if neg_key not in unknown_facts:
+                            unknown_facts.append(neg_key)
+                        if first_unknown_step is None:
+                            first_unknown_step = step_id
+
                     next_state[neg_key] = WorldFact(
                         predicate=neg.predicate,
                         args=neg.args,
-                        truth=neg.expected_truth if neg.expected_truth != FactTruth.VERIFIED_TRUE else FactTruth.VERIFIED_FALSE,
-                        created_at=now,
-                        updated_at=now,
+                        truth=neg_truth,
+                        witnessability=neg_witness,
+                        created_at=current_sim_time,
+                        updated_at=current_sim_time,
                         provenance=Provenance(
                             source_type=SourceType.PLANNER_INFERENCE,
                             source_id=step_id,
-                            rationale=f"Negative effect of {step_id}",
+                            rationale=neg_rationale,
                         ),
                     )
 
-                # Apply positive effects (checking verifier presence if registry available)
+                # Apply positive effects (checking verifier presence)
                 for pos in action.positive_effects:
                     pos_key = pos.fact_key
-                    # If registry is active, check if a verifier exists for this effect
-                    has_verifier = True
+                    has_pos_verifier = False
                     if cap_entry is not None:
-                        has_verifier = any(v.predicate == pos.predicate for v in cap_entry.verifiers)
+                        has_pos_verifier = any(v.predicate == pos.predicate for v in cap_entry.verifiers)
 
-                    if has_verifier:
-                        effect_truth = pos.expected_truth
-                        rationale = f"Positive effect of {step_id}"
+                    if has_pos_verifier:
+                        pos_truth = pos.expected_truth
+                        pos_witness = WitnessabilityStatus.WITNESSABLE
+                        pos_rationale = f"Positive effect of {step_id}"
                     else:
-                        effect_truth = FactTruth.UNKNOWN
-                        rationale = f"Positive effect of {step_id} (missing observation verifier in capability)"
+                        pos_truth = FactTruth.UNKNOWN
+                        pos_witness = WitnessabilityStatus.UNWITNESSABLE
+                        pos_rationale = f"Positive effect of {step_id} (missing observation verifier)"
                         if pos_key not in unknown_facts:
                             unknown_facts.append(pos_key)
                         if first_unknown_step is None:
@@ -230,17 +303,18 @@ class EpistemicCausalValidator:
                     next_state[pos_key] = WorldFact(
                         predicate=pos.predicate,
                         args=pos.args,
-                        truth=effect_truth,
-                        created_at=now,
-                        updated_at=now,
+                        truth=pos_truth,
+                        witnessability=pos_witness,
+                        created_at=current_sim_time,
+                        updated_at=current_sim_time,
                         provenance=Provenance(
                             source_type=SourceType.PLANNER_INFERENCE,
                             source_id=step_id,
-                            rationale=rationale,
+                            rationale=pos_rationale,
                         ),
                     )
             else:
-                # Precondition was UNKNOWN: action cannot produce verified effects
+                # Precondition was UNKNOWN or capability ungrounded: action cannot produce verified effects
                 for pos in action.positive_effects:
                     pos_key = pos.fact_key
                     if pos_key not in unknown_facts:
@@ -249,13 +323,32 @@ class EpistemicCausalValidator:
                         predicate=pos.predicate,
                         args=pos.args,
                         truth=FactTruth.UNKNOWN,
-                        created_at=now,
-                        updated_at=now,
+                        witnessability=WitnessabilityStatus.UNWITNESSABLE,
+                        created_at=current_sim_time,
+                        updated_at=current_sim_time,
                         provenance=Provenance(
                             source_type=SourceType.PLANNER_INFERENCE,
                             source_id=step_id,
                             confidence=0.0,
-                            rationale=f"Uncertain effect due to UNKNOWN precondition on {step_id}",
+                            rationale=f"Uncertain effect due to UNKNOWN precondition / ungrounded capability on {step_id}",
+                        ),
+                    )
+                for neg in action.negative_effects:
+                    neg_key = neg.fact_key
+                    if neg_key not in unknown_facts:
+                        unknown_facts.append(neg_key)
+                    next_state[neg_key] = WorldFact(
+                        predicate=neg.predicate,
+                        args=neg.args,
+                        truth=FactTruth.UNKNOWN,
+                        witnessability=WitnessabilityStatus.UNWITNESSABLE,
+                        created_at=current_sim_time,
+                        updated_at=current_sim_time,
+                        provenance=Provenance(
+                            source_type=SourceType.PLANNER_INFERENCE,
+                            source_id=step_id,
+                            confidence=0.0,
+                            rationale=f"Uncertain effect due to UNKNOWN precondition / ungrounded capability on {step_id}",
                         ),
                     )
 
@@ -270,12 +363,14 @@ class EpistemicCausalValidator:
                 plan_actions=plan_ir.actions,
                 invariants_violated=invariants_violated,
                 blocker_reasons=blocker_reasons,
+                unknown_facts=unknown_facts,
             )
             if invariants_violated:
                 return PlanValidationResult(
                     status=ValidationStatus.FAIL,
                     failed_step_id=step_id,
                     blocker_reasons=blocker_reasons,
+                    unknown_facts=unknown_facts,
                     invariants_violated=invariants_violated,
                     intermediate_states=intermediate_states,
                 )
@@ -349,6 +444,7 @@ class EpistemicCausalValidator:
         plan_actions: List[ActionIR],
         invariants_violated: List[str],
         blocker_reasons: List[str],
+        unknown_facts: List[str],
     ) -> None:
         for hc in constraints:
             if hc.active_until_action_id:
@@ -365,7 +461,10 @@ class EpistemicCausalValidator:
             key = hc.condition.fact_key
             fact = state.get(key)
             fact_truth = fact.truth if fact is not None else FactTruth.UNKNOWN
-            if fact_truth != hc.condition.expected_truth:
+            if fact_truth == FactTruth.UNKNOWN:
+                if key not in unknown_facts:
+                    unknown_facts.append(key)
+            elif fact_truth != hc.condition.expected_truth:
                 invariants_violated.append(hc.constraint_id)
                 blocker_reasons.append(
                     f"Hard constraint '{hc.constraint_id}' violated: expected {key} == {hc.condition.expected_truth.value}, got {fact_truth.value}"

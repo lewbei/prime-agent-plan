@@ -53,7 +53,19 @@ def test_blind_vs_grounded_divergence_optimism():
 
 
 def test_concordance_when_plan_is_grounded_pass():
+    from plan_mode.registry import CapabilityRegistry, CapabilityEntry, ObservationVerifier
     prov = Provenance(source_type=SourceType.OBSERVED_WORLD_STATE)
+    reg = CapabilityRegistry()
+    reg.register(
+        CapabilityEntry(
+            name="system.restart_service",
+            description="Restart service",
+            input_schema={"name": "str"},
+            positive_effects=[PredicateCondition(predicate="service_running", args=["{name}"])],
+            verifiers=[ObservationVerifier(verifier_id="v_svc", predicate="service_running")],
+        )
+    )
+
     plan = PlanIR(
         plan_id="plan_concord_001",
         goal_description="Restart web service",
@@ -73,7 +85,7 @@ def test_concordance_when_plan_is_grounded_pass():
     )
 
     evaluator = DualJudgeEvaluator()
-    comparison = evaluator.evaluate_plan(plan)
+    comparison = evaluator.evaluate_plan(plan, registry=reg)
 
     assert comparison.blind_verdict.verdict == "PASS"
     assert comparison.grounded_verdict.verdict == "PASS"

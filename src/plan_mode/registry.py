@@ -141,23 +141,55 @@ class CapabilityRegistry(BaseModel):
                         f"Action '{action.action_id}' parameter '{param_name}' has invalid value '{val}'. Expected type '{expected_type}', got '{type(val).__name__}'."
                     )
 
-        # Check declared positive effects against capability schema
-        if cap.positive_effects:
-            allowed_predicates = {p.predicate for p in cap.positive_effects}
-            for pos in action.positive_effects:
-                if pos.predicate not in allowed_predicates:
-                    raise SchemaMismatchError(
-                        f"Action '{action.action_id}' claims undeclared positive effect '{pos.predicate}' not supported by capability '{cap.name}'."
-                    )
+        # Check declared positive effects against instantiated capability schema
+        instantiated_positive = [
+            self._instantiate_condition(p, params) for p in cap.positive_effects
+        ]
+        for pos in action.positive_effects:
+            matched = any(
+                pos.predicate == cap_p.predicate
+                and [str(a) for a in pos.args] == [str(a) for a in cap_p.args]
+                and pos.expected_truth == cap_p.expected_truth
+                for cap_p in instantiated_positive
+            )
+            if not matched:
+                allowed_str = ", ".join(f"{p.fact_key} ({p.expected_truth.value})" for p in instantiated_positive) or "[]"
+                raise SchemaMismatchError(
+                    f"Action '{action.action_id}' claims undeclared or mismatched positive effect '{pos.fact_key}' ({pos.expected_truth.value}) not supported by capability '{cap.name}'. Allowed instantiated effects: [{allowed_str}]."
+                )
 
-        # Check declared negative effects against capability schema
-        if cap.negative_effects:
-            allowed_neg_predicates = {p.predicate for p in cap.negative_effects}
-            for neg in action.negative_effects:
-                if neg.predicate not in allowed_neg_predicates:
-                    raise SchemaMismatchError(
-                        f"Action '{action.action_id}' claims undeclared negative effect '{neg.predicate}' not supported by capability '{cap.name}'."
-                    )
+        # Check declared negative effects against instantiated capability schema
+        instantiated_negative = [
+            self._instantiate_condition(n, params) for n in cap.negative_effects
+        ]
+        for neg in action.negative_effects:
+            matched = any(
+                neg.predicate == cap_n.predicate
+                and [str(a) for a in neg.args] == [str(a) for a in cap_n.args]
+                and neg.expected_truth == cap_n.expected_truth
+                for cap_n in instantiated_negative
+            )
+            if not matched:
+                allowed_str = ", ".join(f"{n.fact_key} ({n.expected_truth.value})" for n in instantiated_negative) or "[]"
+                raise SchemaMismatchError(
+                    f"Action '{action.action_id}' claims undeclared or mismatched negative effect '{neg.fact_key}' ({neg.expected_truth.value}) not supported by capability '{cap.name}'. Allowed instantiated negative effects: [{allowed_str}]."
+                )
+
+    def _instantiate_condition(self, cond: PredicateCondition, params: Dict[str, Any]) -> PredicateCondition:
+        """Instantiate template variables in predicate arguments with action parameter values."""
+        instantiated_args: List[Any] = []
+        for arg in cond.args:
+            if isinstance(arg, str) and arg.startswith("{") and arg.endswith("}"):
+                var_name = arg[1:-1]
+                val = params.get(var_name, arg)
+                instantiated_args.append(val)
+            else:
+                instantiated_args.append(arg)
+        return PredicateCondition(
+            predicate=cond.predicate,
+            args=instantiated_args,
+            expected_truth=cond.expected_truth,
+        )
 
     def _check_type(self, val: Any, type_name: str) -> bool:
         if type_name in ("any", "*"):
