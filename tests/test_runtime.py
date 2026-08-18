@@ -125,7 +125,7 @@ def test_execution_plan_manager_success():
 
     session = PlanningSession(session_id="sess_exec_001")
     session.submit_draft(plan)
-    session.validate_candidate(1, reg)
+    session.validate_candidate(1, reg, observed_world_state=plan.initial_state)
     session.select_version(1)
     cert = session.authorize_selected(reg, policy_hash="policy_v1")
     session.start_execution(reg, policy_hash="policy_v1")

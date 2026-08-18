@@ -178,7 +178,7 @@ class EpistemicCausalValidator:
                     f_clone.projected_truth = ProjectedTruth.UNSUPPORTED
             current_state[key] = f_clone
 
-        # 1b. Process initial facts from plan_ir
+        # 1b. Process initial facts from plan_ir against trusted boundary
         for fact in plan_ir.initial_state:
             f_clone = fact.model_copy(deep=True)
             key = f_clone.fact_key
@@ -206,48 +206,23 @@ class EpistemicCausalValidator:
                             else ProjectedTruth.UNSUPPORTED
                         )
                 else:
-                    # Untrusted assumption
-                    if f_clone.metadata.get("evidence_ref"):
-                        f_clone.projected_truth = (
-                            ProjectedTruth.SUPPORTED_TRUE
-                            if f_clone.truth == FactTruth.VERIFIED_TRUE
-                            else ProjectedTruth.SUPPORTED_FALSE
-                            if f_clone.truth == FactTruth.VERIFIED_FALSE
-                            else ProjectedTruth.UNSUPPORTED
-                        )
-                    else:
-                        f_clone.truth = FactTruth.UNKNOWN
-                        f_clone.projected_truth = ProjectedTruth.UNSUPPORTED
-                        f_clone.provenance = Provenance(
-                            source_type=SourceType.EXPLICIT_ASSUMPTION,
-                            confidence=0.0,
-                            rationale="Planner assumption ungrounded by trusted observation snapshot",
-                        )
-            else:
-                # No trusted snapshot provided: enforce untrusted boundaries
-                if f_clone.provenance.source_type in (
-                    SourceType.PLANNER_INFERENCE,
-                    SourceType.EXPLICIT_ASSUMPTION,
-                ):
-                    f_clone.truth = FactTruth.UNKNOWN
-                    f_clone.projected_truth = ProjectedTruth.UNSUPPORTED
-                elif f_clone.metadata.get("evidence_ref"):
-                    f_clone.projected_truth = (
-                        ProjectedTruth.SUPPORTED_TRUE
-                        if f_clone.truth == FactTruth.VERIFIED_TRUE
-                        else ProjectedTruth.SUPPORTED_FALSE
-                        if f_clone.truth == FactTruth.VERIFIED_FALSE
-                        else ProjectedTruth.UNSUPPORTED
-                    )
-                else:
-                    # Self-labeled OBSERVED_WORLD_STATE without snapshot or evidence_ref is untrusted
+                    # Omitted from trusted snapshot -> untrusted assumption
                     f_clone.truth = FactTruth.UNKNOWN
                     f_clone.projected_truth = ProjectedTruth.UNSUPPORTED
                     f_clone.provenance = Provenance(
                         source_type=SourceType.EXPLICIT_ASSUMPTION,
                         confidence=0.0,
-                        rationale="Untrusted self-labeled OBSERVED_WORLD_STATE fact without evidence reference or trusted snapshot",
+                        rationale="Planner assumption ungrounded by trusted observation snapshot",
                     )
+            else:
+                # No trusted snapshot provided: all initial claims are untrusted
+                f_clone.truth = FactTruth.UNKNOWN
+                f_clone.projected_truth = ProjectedTruth.UNSUPPORTED
+                f_clone.provenance = Provenance(
+                    source_type=SourceType.EXPLICIT_ASSUMPTION,
+                    confidence=0.0,
+                    rationale="Initial state fact ungrounded by trusted observed world state snapshot",
+                )
 
             if self.default_ttl_decay_to_unknown and not f_clone.is_fresh(now):
                 f_clone.truth = FactTruth.UNKNOWN

@@ -86,7 +86,7 @@ def test_causal_validator_simple_pass():
     )
 
     validator = CausalValidator()
-    result = validator.validate_plan(plan, registry=reg)
+    result = validator.validate_plan(plan, registry=reg, observed_world_state=[f1, f2])
 
     assert result.status == ValidationStatus.PASS
     assert len(result.blocker_reasons) == 0
@@ -173,7 +173,7 @@ def test_causal_validator_failed_precondition_yields_fail():
     )
     
     validator = CausalValidator()
-    result = validator.validate_plan(plan)
+    result = validator.validate_plan(plan, observed_world_state=[f1])
     
     assert result.status == ValidationStatus.FAIL
     assert result.failed_step_id == "step_1"

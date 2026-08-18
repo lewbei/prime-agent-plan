@@ -74,7 +74,7 @@ def test_session_lifecycle_happy_path(valid_plan: PlanIR, mock_registry: Capabil
     assert session.best_candidate_version == 1
 
     # 2. Validate Candidate
-    val_res = session.validate_candidate(1, mock_registry)
+    val_res = session.validate_candidate(1, mock_registry, observed_world_state=valid_plan.initial_state)
     assert session.current_state == SessionState.FEASIBILITY
     assert val_res.status.value == "PASS"
     assert session.best_verified_version == 1
@@ -109,7 +109,7 @@ def test_invalid_state_transition(valid_plan: PlanIR):
 def test_certificate_expired_rejection(valid_plan: PlanIR, mock_registry: CapabilityRegistry):
     session = PlanningSession(session_id="sess_003")
     session.submit_draft(valid_plan)
-    session.validate_candidate(1, mock_registry)
+    session.validate_candidate(1, mock_registry, observed_world_state=valid_plan.initial_state)
     session.select_version(1)
     # Authorize with TTL = -1.0 (already expired)
     session.authorize_selected(mock_registry, policy_hash="policy_v1", ttl_seconds=-1.0)
@@ -121,7 +121,7 @@ def test_certificate_expired_rejection(valid_plan: PlanIR, mock_registry: Capabi
 def test_state_drift_rejection(valid_plan: PlanIR, mock_registry: CapabilityRegistry):
     session = PlanningSession(session_id="sess_004")
     session.submit_draft(valid_plan)
-    session.validate_candidate(1, mock_registry)
+    session.validate_candidate(1, mock_registry, observed_world_state=valid_plan.initial_state)
     session.select_version(1)
     session.authorize_selected(mock_registry, policy_hash="policy_v1", ttl_seconds=60.0)
 
@@ -142,7 +142,7 @@ def test_state_drift_rejection(valid_plan: PlanIR, mock_registry: CapabilityRegi
 def test_signature_tamper_detection(valid_plan: PlanIR, mock_registry: CapabilityRegistry):
     session = PlanningSession(session_id="sess_005")
     session.submit_draft(valid_plan)
-    session.validate_candidate(1, mock_registry)
+    session.validate_candidate(1, mock_registry, observed_world_state=valid_plan.initial_state)
     session.select_version(1)
     cert = session.authorize_selected(mock_registry, policy_hash="policy_v1")
     

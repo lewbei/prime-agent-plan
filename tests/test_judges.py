@@ -85,7 +85,7 @@ def test_concordance_when_plan_is_grounded_pass():
     )
 
     evaluator = DualJudgeEvaluator()
-    comparison = evaluator.evaluate_plan(plan, registry=reg)
+    comparison = evaluator.evaluate_plan(plan, registry=reg, observed_world_state=plan.initial_state)
 
     assert comparison.blind_verdict.verdict == "PASS"
     assert comparison.grounded_verdict.verdict == "PASS"

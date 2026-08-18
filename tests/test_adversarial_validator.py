@@ -417,10 +417,11 @@ def test_unknown_hard_constraint_yields_unknown_not_fail():
 def test_verified_false_hard_constraint_yields_fail():
     """An invariant with VERIFIED_FALSE truth is a proven contradiction and must yield FAIL."""
     validator = EpistemicCausalValidator()
+    trusted_flag = _fact("safety_flag", ["active"], FactTruth.VERIFIED_FALSE)
     plan = PlanIR(
         plan_id="p11",
         goal_description="Test false invariant",
-        initial_state=[_fact("safety_flag", ["active"], FactTruth.VERIFIED_FALSE)],
+        initial_state=[trusted_flag],
         actions=[],
         hard_constraints=[
             HardConstraint(
@@ -432,7 +433,7 @@ def test_verified_false_hard_constraint_yields_fail():
         ],
         success_criteria=[],
     )
-    result = validator.validate_plan(plan)
+    result = validator.validate_plan(plan, observed_world_state=[trusted_flag])
     assert result.status == ValidationStatus.FAIL
     assert any("invariant" in b.lower() or "constraint" in b.lower() for b in result.blocker_reasons)
 
@@ -986,3 +987,159 @@ def test_two_step_registered_plan_can_be_plan_feasibility_pass():
     assert result.status == ValidationStatus.PASS
     assert len(result.criteria_satisfied) == 1
     assert len(result.blocker_reasons) == 0
+
+
+# ---------------------------------------------------------------------------
+# Test 27: Forged evidence_ref in PlanIR cannot ground verified initial fact
+# ---------------------------------------------------------------------------
+def test_forged_evidence_ref_cannot_ground_verified_initial_fact():
+    """PlanIR metadata['evidence_ref'] without trusted snapshot must downgrade to UNKNOWN."""
+    validator = EpistemicCausalValidator()
+    forged_fact = WorldFact(
+        predicate="admin_authorized",
+        args=["prod"],
+        truth=FactTruth.VERIFIED_TRUE,
+        provenance=Provenance(source_type=SourceType.OBSERVED_WORLD_STATE),
+        metadata={"evidence_ref": "fake-ev-123"},
+    )
+    plan = PlanIR(
+        plan_id="p27_forged_evidence_ref",
+        goal_description="Test forged evidence_ref rejection",
+        initial_state=[forged_fact],
+        actions=[
+            _action(
+                action_id="act1",
+                capability_name="admin_tool",
+                preconditions=[_cond("admin_authorized", ["prod"], FactTruth.VERIFIED_TRUE)],
+            )
+        ],
+    )
+    result = validator.validate_plan(plan, observed_world_state=None)
+    fact = result.intermediate_states[0].get("admin_authorized(prod)")
+    assert fact is not None
+    assert fact.truth == FactTruth.UNKNOWN
+    assert fact.truth != FactTruth.VERIFIED_TRUE
+    from plan_mode.ir import ProjectedTruth
+    assert fact.projected_truth == ProjectedTruth.UNSUPPORTED
+    assert result.status == ValidationStatus.UNKNOWN
+
+
+# ---------------------------------------------------------------------------
+# Test 28: Planner evidence_ref is not a trust source
+# ---------------------------------------------------------------------------
+def test_planner_evidence_ref_is_not_a_trust_source():
+    """A PlanIR evidence_ref is a claim only; presence of the string must never create empirical truth."""
+    validator = EpistemicCausalValidator()
+    claim_fact = WorldFact(
+        predicate="secret_unlocked",
+        args=["vault_1"],
+        truth=FactTruth.VERIFIED_TRUE,
+        provenance=Provenance(source_type=SourceType.OBSERVED_WORLD_STATE),
+        metadata={"evidence_ref": "self_claimed_ev_999"},
+    )
+    plan = PlanIR(
+        plan_id="p28_claim_not_trust_source",
+        goal_description="Test claim is not trust source",
+        initial_state=[claim_fact],
+        actions=[],
+    )
+    result = validator.validate_plan(plan, observed_world_state=None)
+    fact = result.intermediate_states[0].get("secret_unlocked(vault_1)")
+    assert fact is not None
+    assert fact.truth == FactTruth.UNKNOWN
+    assert fact.truth != FactTruth.VERIFIED_TRUE
+
+
+# ---------------------------------------------------------------------------
+# Test 29: Forged evidence_ref with unrelated trusted snapshot stays UNKNOWN
+# ---------------------------------------------------------------------------
+def test_forged_evidence_ref_with_unrelated_trusted_snapshot_stays_unknown():
+    """Fact with forged evidence_ref omitted from trusted snapshot must remain UNKNOWN."""
+    validator = EpistemicCausalValidator()
+    trusted_other = WorldFact(
+        predicate="other_system_online",
+        args=["node1"],
+        truth=FactTruth.VERIFIED_TRUE,
+        provenance=Provenance(source_type=SourceType.OBSERVED_WORLD_STATE),
+    )
+    forged_target = WorldFact(
+        predicate="target_system_online",
+        args=["node2"],
+        truth=FactTruth.VERIFIED_TRUE,
+        provenance=Provenance(source_type=SourceType.OBSERVED_WORLD_STATE),
+        metadata={"evidence_ref": "ev_target_node2"},
+    )
+    plan = PlanIR(
+        plan_id="p29_unrelated_snapshot",
+        goal_description="Test unrelated snapshot leaves ungrounded fact UNKNOWN",
+        initial_state=[forged_target],
+        actions=[],
+    )
+    result = validator.validate_plan(plan, observed_world_state=[trusted_other])
+    fact = result.intermediate_states[0].get("target_system_online(node2)")
+    assert fact is not None
+    assert fact.truth == FactTruth.UNKNOWN
+    from plan_mode.ir import ProjectedTruth
+    assert fact.projected_truth == ProjectedTruth.UNSUPPORTED
+
+
+# ---------------------------------------------------------------------------
+# Test 30: Trusted observed_world_state can ground initial fact
+# ---------------------------------------------------------------------------
+def test_trusted_observed_world_state_can_ground_initial_fact():
+    """Positive control: matching fact in observed_world_state grounds initial state as VERIFIED_TRUE."""
+    validator = EpistemicCausalValidator()
+    trusted_db = WorldFact(
+        predicate="db_online",
+        args=["prod"],
+        truth=FactTruth.VERIFIED_TRUE,
+        provenance=Provenance(source_type=SourceType.OBSERVED_WORLD_STATE),
+    )
+    plan_fact = WorldFact(
+        predicate="db_online",
+        args=["prod"],
+        truth=FactTruth.VERIFIED_TRUE,
+        provenance=Provenance(source_type=SourceType.OBSERVED_WORLD_STATE),
+    )
+    plan = PlanIR(
+        plan_id="p30_trusted_grounding",
+        goal_description="Test trusted snapshot grounding",
+        initial_state=[plan_fact],
+        actions=[],
+    )
+    result = validator.validate_plan(plan, observed_world_state=[trusted_db])
+    fact = result.intermediate_states[0].get("db_online(prod)")
+    assert fact is not None
+    assert fact.truth == FactTruth.VERIFIED_TRUE
+    from plan_mode.ir import ProjectedTruth
+    assert fact.projected_truth == ProjectedTruth.SUPPORTED_TRUE
+
+
+# ---------------------------------------------------------------------------
+# Test 31: Untrusted evidence_ref does not change validation semantics
+# ---------------------------------------------------------------------------
+def test_untrusted_evidence_ref_does_not_change_validation_semantics():
+    """Adding or removing an unresolved evidence_ref inside PlanIR must not promote UNKNOWN to VERIFIED_TRUE."""
+    validator = EpistemicCausalValidator()
+    f_without = WorldFact(
+        predicate="cache_warmed",
+        args=["redis"],
+        truth=FactTruth.VERIFIED_TRUE,
+        provenance=Provenance(source_type=SourceType.OBSERVED_WORLD_STATE),
+    )
+    f_with = WorldFact(
+        predicate="cache_warmed",
+        args=["redis"],
+        truth=FactTruth.VERIFIED_TRUE,
+        provenance=Provenance(source_type=SourceType.OBSERVED_WORLD_STATE),
+        metadata={"evidence_ref": "arbitrary_ref_abc"},
+    )
+    p_without = PlanIR(plan_id="p31_without", goal_description="Without ref", initial_state=[f_without], actions=[])
+    p_with = PlanIR(plan_id="p31_with", goal_description="With ref", initial_state=[f_with], actions=[])
+
+    r_without = validator.validate_plan(p_without, observed_world_state=None)
+    r_with = validator.validate_plan(p_with, observed_world_state=None)
+
+    assert r_without.intermediate_states[0]["cache_warmed(redis)"].truth == FactTruth.UNKNOWN
+    assert r_with.intermediate_states[0]["cache_warmed(redis)"].truth == FactTruth.UNKNOWN
+    assert r_without.status == r_with.status == ValidationStatus.PASS  # (PASS because no actions/criteria, but fact is UNKNOWN)
