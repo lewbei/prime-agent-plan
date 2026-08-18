@@ -40,10 +40,10 @@ def test_lattice_truth_merge():
 
 def test_causal_validator_simple_pass():
     prov = Provenance(source_type=SourceType.OBSERVED_WORLD_STATE)
-    
+
     f1 = WorldFact(predicate="file_exists", args=["/tmp/src.txt"], truth=FactTruth.VERIFIED_TRUE, provenance=prov)
     f2 = WorldFact(predicate="dest_clean", args=["/tmp/dest.txt"], truth=FactTruth.VERIFIED_TRUE, provenance=prov)
-    
+
     reg = CapabilityRegistry()
     reg.register(
         CapabilityEntry(
@@ -53,12 +53,12 @@ def test_causal_validator_simple_pass():
             positive_effects=[PredicateCondition(predicate="file_exists", args=["{dst}"])],
             negative_effects=[PredicateCondition(predicate="dest_clean", args=["{dst}"], expected_truth=FactTruth.VERIFIED_FALSE)],
             verifiers=[
-                ObservationVerifier(verifier_id="v_exists", predicate="file_exists"),
-                ObservationVerifier(verifier_id="v_clean", predicate="dest_clean"),
+                ObservationVerifier(verifier_id="v_exists", predicate="file_exists", target_args_mapping=["{dst}"]),
+                ObservationVerifier(verifier_id="v_clean", predicate="dest_clean", target_args_mapping=["{dst}"]),
             ],
         )
     )
-    
+
     act1 = ActionIR(
         action_id="step_1",
         capability_name="fs.copy",
@@ -75,29 +75,25 @@ def test_causal_validator_simple_pass():
         ],
         provenance=prov,
     )
-    
+
     plan = PlanIR(
         plan_id="plan_pass_001",
         goal_description="Copy source file to destination",
         initial_state=[f1, f2],
         actions=[act1],
         hard_constraints=[],
-        success_criteria=[
-            SuccessCriterion(
-                criterion_id="sc_001",
-                description="Dest file exists",
-                condition=PredicateCondition(predicate="file_exists", args=["/tmp/dest.txt"]),
-            )
-        ],
+        success_criteria=[],
     )
-    
+
     validator = CausalValidator()
     result = validator.validate_plan(plan, registry=reg)
-    
+
     assert result.status == ValidationStatus.PASS
-    assert len(result.criteria_satisfied) == 1
-    assert len(result.criteria_unmet) == 0
     assert len(result.blocker_reasons) == 0
+    final_fact = result.intermediate_states[-1]["file_exists(/tmp/dest.txt)"]
+    assert final_fact.witnessability == WitnessabilityStatus.WITNESSABLE
+    assert final_fact.truth == FactTruth.UNKNOWN
+    assert final_fact.metadata.get("predicted_truth") == FactTruth.VERIFIED_TRUE.value
 
 
 def test_causal_validator_unknown_precondition_yields_unknown():

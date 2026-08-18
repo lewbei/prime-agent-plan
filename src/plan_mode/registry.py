@@ -30,11 +30,21 @@ class PermissionDeniedError(Exception):
     pass
 
 
+def typed_args_equal(args1: List[Any], args2: List[Any]) -> bool:
+    """Compare argument lists ensuring exact type identity and value equality."""
+    if len(args1) != len(args2):
+        return False
+    for a1, a2 in zip(args1, args2):
+        if type(a1) is not type(a2) or a1 != a2:
+            return False
+    return True
+
+
 class ObservationVerifier(BaseModel):
     """Deterministic verifier used to witness world state post-execution."""
     verifier_id: str
     predicate: str
-    target_args_mapping: List[str] = Field(default_factory=list)
+    target_args_mapping: List[Any] = Field(default_factory=list)
     command_template: List[str] = Field(default_factory=list)
     expected_output_pattern: Optional[str] = None
     json_path: Optional[str] = None
@@ -148,7 +158,7 @@ class CapabilityRegistry(BaseModel):
         for pos in action.positive_effects:
             matched = any(
                 pos.predicate == cap_p.predicate
-                and [str(a) for a in pos.args] == [str(a) for a in cap_p.args]
+                and typed_args_equal(pos.args, cap_p.args)
                 and pos.expected_truth == cap_p.expected_truth
                 for cap_p in instantiated_positive
             )
@@ -165,7 +175,7 @@ class CapabilityRegistry(BaseModel):
         for neg in action.negative_effects:
             matched = any(
                 neg.predicate == cap_n.predicate
-                and [str(a) for a in neg.args] == [str(a) for a in cap_n.args]
+                and typed_args_equal(neg.args, cap_n.args)
                 and neg.expected_truth == cap_n.expected_truth
                 for cap_n in instantiated_negative
             )
@@ -179,10 +189,19 @@ class CapabilityRegistry(BaseModel):
         """Instantiate template variables in predicate arguments with action parameter values."""
         instantiated_args: List[Any] = []
         for arg in cond.args:
-            if isinstance(arg, str) and arg.startswith("{") and arg.endswith("}"):
-                var_name = arg[1:-1]
-                val = params.get(var_name, arg)
-                instantiated_args.append(val)
+            if isinstance(arg, str):
+                if arg.startswith("{") and arg.endswith("}"):
+                    var_name = arg[1:-1]
+                    val = params.get(var_name, arg)
+                    instantiated_args.append(val)
+                elif arg.startswith("$"):
+                    var_name = arg[1:]
+                    val = params.get(var_name, arg)
+                    instantiated_args.append(val)
+                elif arg in params:
+                    instantiated_args.append(params[arg])
+                else:
+                    instantiated_args.append(arg)
             else:
                 instantiated_args.append(arg)
         return PredicateCondition(

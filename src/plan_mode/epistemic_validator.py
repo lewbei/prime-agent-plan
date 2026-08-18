@@ -5,7 +5,7 @@ from __future__ import annotations
 import copy
 import time
 from enum import Enum
-from typing import Dict, List, Optional
+from typing import Any, Dict, List, Optional
 from pydantic import BaseModel, Field
 
 from plan_mode.ir import (
@@ -21,9 +21,11 @@ from plan_mode.ir import (
     WorldFact,
 )
 from plan_mode.registry import (
+    CapabilityEntry,
     CapabilityNotFoundError,
     CapabilityRegistry,
     SchemaMismatchError,
+    typed_args_equal,
 )
 
 
@@ -47,6 +49,66 @@ def merge_fact_truth(a: FactTruth, b: FactTruth) -> FactTruth:
         return FactTruth.CONFLICT
     # One is TRUE, one is FALSE
     return FactTruth.CONFLICT
+
+
+def _matches_verifier(
+    cond: PredicateCondition,
+    cap_entry: Optional[CapabilityEntry],
+    params: Dict[str, Any],
+    declared_effects: List[PredicateCondition],
+) -> bool:
+    """Check whether cond has a matching observation verifier bound to its exact predicate and arguments."""
+    if cap_entry is None:
+        return False
+
+    for v in cap_entry.verifiers:
+        if v.predicate != cond.predicate:
+            continue
+
+        # If verifier has explicit target_args_mapping, resolve it and compare
+        if v.target_args_mapping:
+            resolved_args: List[Any] = []
+            for arg in v.target_args_mapping:
+                if isinstance(arg, str):
+                    if arg.startswith("{") and arg.endswith("}"):
+                        var_name = arg[1:-1]
+                        resolved_args.append(params.get(var_name, arg))
+                    elif arg.startswith("$"):
+                        var_name = arg[1:]
+                        resolved_args.append(params.get(var_name, arg))
+                    elif arg in params:
+                        resolved_args.append(params[arg])
+                    else:
+                        resolved_args.append(arg)
+                else:
+                    resolved_args.append(arg)
+
+            if typed_args_equal(resolved_args, cond.args):
+                return True
+        else:
+            # target_args_mapping omitted: check if cond.args is empty or matches declared instantiated effect
+            if not cond.args:
+                return True
+            for decl in declared_effects:
+                if decl.predicate == cond.predicate:
+                    inst_args: List[Any] = []
+                    for arg in decl.args:
+                        if isinstance(arg, str):
+                            if arg.startswith("{") and arg.endswith("}"):
+                                var_name = arg[1:-1]
+                                inst_args.append(params.get(var_name, arg))
+                            elif arg.startswith("$"):
+                                var_name = arg[1:]
+                                inst_args.append(params.get(var_name, arg))
+                            elif arg in params:
+                                inst_args.append(params[arg])
+                            else:
+                                inst_args.append(arg)
+                        else:
+                            inst_args.append(arg)
+                    if typed_args_equal(inst_args, cond.args):
+                        return True
+    return False
 
 
 class PlanValidationResult(BaseModel):
@@ -75,7 +137,7 @@ class EpistemicCausalValidator:
         current_time: Optional[float] = None,
     ) -> PlanValidationResult:
         now = current_time if current_time is not None else time.time()
-        
+
         # 1. Initialize world state W_0 from initial facts with 4-state lattice merging
         current_state: Dict[str, WorldFact] = {}
         blocker_reasons: List[str] = []
@@ -211,7 +273,7 @@ class EpistemicCausalValidator:
             for pre in action.preconditions:
                 key = pre.fact_key
                 fact = current_state.get(key)
-                
+
                 # If not present in state, it is implicitly UNKNOWN
                 fact_truth = fact.truth if fact is not None else FactTruth.UNKNOWN
 
@@ -244,19 +306,28 @@ class EpistemicCausalValidator:
 
             # 3. Transition: W_{t+1}
             next_state = copy.deepcopy(current_state)
-            
+
             if not step_unknown:
-                # Apply negative effects (checking verifier presence)
+                # Apply negative effects (checking verifier presence and arg binding)
                 for neg in action.negative_effects:
                     neg_key = neg.fact_key
-                    has_neg_verifier = False
-                    if cap_entry is not None:
-                        has_neg_verifier = any(v.predicate == neg.predicate for v in cap_entry.verifiers)
+                    has_neg_verifier = _matches_verifier(
+                        neg,
+                        cap_entry,
+                        action.parameters,
+                        cap_entry.negative_effects if cap_entry else [],
+                    )
+
+                    expected_truth_val = (
+                        FactTruth.VERIFIED_FALSE.value
+                        if neg.expected_truth == FactTruth.VERIFIED_TRUE
+                        else neg.expected_truth.value
+                    )
 
                     if has_neg_verifier:
-                        neg_truth = FactTruth.VERIFIED_FALSE if neg.expected_truth == FactTruth.VERIFIED_TRUE else neg.expected_truth
+                        neg_truth = FactTruth.UNKNOWN
                         neg_witness = WitnessabilityStatus.WITNESSABLE
-                        neg_rationale = f"Negative effect of {step_id}"
+                        neg_rationale = f"Negative effect of {step_id} (witnessable, pending runtime execution)"
                     else:
                         neg_truth = FactTruth.UNKNOWN
                         neg_witness = WitnessabilityStatus.UNWITNESSABLE
@@ -276,21 +347,26 @@ class EpistemicCausalValidator:
                         provenance=Provenance(
                             source_type=SourceType.PLANNER_INFERENCE,
                             source_id=step_id,
+                            confidence=1.0 if has_neg_verifier else 0.0,
                             rationale=neg_rationale,
                         ),
+                        metadata={"predicted_truth": expected_truth_val},
                     )
 
-                # Apply positive effects (checking verifier presence)
+                # Apply positive effects (checking verifier presence and arg binding)
                 for pos in action.positive_effects:
                     pos_key = pos.fact_key
-                    has_pos_verifier = False
-                    if cap_entry is not None:
-                        has_pos_verifier = any(v.predicate == pos.predicate for v in cap_entry.verifiers)
+                    has_pos_verifier = _matches_verifier(
+                        pos,
+                        cap_entry,
+                        action.parameters,
+                        cap_entry.positive_effects if cap_entry else [],
+                    )
 
                     if has_pos_verifier:
-                        pos_truth = pos.expected_truth
+                        pos_truth = FactTruth.UNKNOWN
                         pos_witness = WitnessabilityStatus.WITNESSABLE
-                        pos_rationale = f"Positive effect of {step_id}"
+                        pos_rationale = f"Positive effect of {step_id} (witnessable, pending runtime execution)"
                     else:
                         pos_truth = FactTruth.UNKNOWN
                         pos_witness = WitnessabilityStatus.UNWITNESSABLE
@@ -310,8 +386,10 @@ class EpistemicCausalValidator:
                         provenance=Provenance(
                             source_type=SourceType.PLANNER_INFERENCE,
                             source_id=step_id,
+                            confidence=1.0 if has_pos_verifier else 0.0,
                             rationale=pos_rationale,
                         ),
+                        metadata={"predicted_truth": pos.expected_truth.value},
                     )
             else:
                 # Precondition was UNKNOWN or capability ungrounded: action cannot produce verified effects
@@ -332,6 +410,7 @@ class EpistemicCausalValidator:
                             confidence=0.0,
                             rationale=f"Uncertain effect due to UNKNOWN precondition / ungrounded capability on {step_id}",
                         ),
+                        metadata={"predicted_truth": pos.expected_truth.value},
                     )
                 for neg in action.negative_effects:
                     neg_key = neg.fact_key
@@ -350,6 +429,7 @@ class EpistemicCausalValidator:
                             confidence=0.0,
                             rationale=f"Uncertain effect due to UNKNOWN precondition / ungrounded capability on {step_id}",
                         ),
+                        metadata={"predicted_truth": neg.expected_truth.value},
                     )
 
             current_state = next_state
@@ -461,9 +541,17 @@ class EpistemicCausalValidator:
             key = hc.condition.fact_key
             fact = state.get(key)
             fact_truth = fact.truth if fact is not None else FactTruth.UNKNOWN
+            predicted_truth = fact.metadata.get("predicted_truth") if fact is not None else None
+
             if fact_truth == FactTruth.UNKNOWN:
-                if key not in unknown_facts:
-                    unknown_facts.append(key)
+                if predicted_truth is not None and predicted_truth != hc.condition.expected_truth.value:
+                    invariants_violated.append(hc.constraint_id)
+                    blocker_reasons.append(
+                        f"Hard constraint '{hc.constraint_id}' violated: expected {key} == {hc.condition.expected_truth.value}, predicted {predicted_truth}"
+                    )
+                else:
+                    if key not in unknown_facts:
+                        unknown_facts.append(key)
             elif fact_truth != hc.condition.expected_truth:
                 invariants_violated.append(hc.constraint_id)
                 blocker_reasons.append(

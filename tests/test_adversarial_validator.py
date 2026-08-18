@@ -306,6 +306,7 @@ def test_verifier_predicate_match_does_not_mean_effect_witnessed():
     assert fact.witnessability == WitnessabilityStatus.WITNESSABLE
     assert fact.provenance.source_type == SourceType.PLANNER_INFERENCE
     assert fact.provenance.source_type != SourceType.OBSERVED_WORLD_STATE
+    assert fact.truth != FactTruth.VERIFIED_TRUE
 
 
 # ---------------------------------------------------------------------------
@@ -362,16 +363,16 @@ def test_negative_effect_without_verifier_is_not_verified():
     plan = PlanIR(
         plan_id="p9",
         goal_description="Test negative effect verifier gating",
-        initial_state=[_fact("proc_running", ["123"], FactTruth.VERIFIED_TRUE)],
+        initial_state=[_fact("proc_running", [123], FactTruth.VERIFIED_TRUE)],
         actions=[
             _action(
                 action_id="act1",
                 capability_name="killer",
                 parameters={"pid": 123},
-                negative_effects=[_cond("proc_running", ["123"])],
+                negative_effects=[_cond("proc_running", [123])],
             )
         ],
-        success_criteria=[_criterion("c1", _cond("proc_running", ["123"], FactTruth.VERIFIED_FALSE))],
+        success_criteria=[_criterion("c1", _cond("proc_running", [123], FactTruth.VERIFIED_FALSE))],
     )
     result = validator.validate_plan(plan, registry=registry)
     assert result.status == ValidationStatus.UNKNOWN
@@ -486,3 +487,241 @@ def test_point_of_use_fact_expiration_decays_at_action_step():
     result = validator.validate_plan(plan, registry=registry, current_time=t0)
     assert result.status == ValidationStatus.UNKNOWN
     assert "auth_token(valid)" in result.unknown_facts
+
+
+# ---------------------------------------------------------------------------
+# Test 13: Witnessable planner effect is NOT FactTruth.VERIFIED_TRUE
+# ---------------------------------------------------------------------------
+def test_witnessable_planner_effect_is_not_verified_true():
+    """A planner-predicted positive effect with a registered ObservationVerifier must NOT become FactTruth.VERIFIED_TRUE merely because the verifier exists."""
+    registry = CapabilityRegistry()
+    registry.register(
+        CapabilityEntry(
+            name="service_manager",
+            description="Manage service",
+            input_schema={"svc": {"type": "str", "required": True}},
+            positive_effects=[_cond("service_running", ["{svc}"])],
+            verifiers=[ObservationVerifier(verifier_id="v_svc", predicate="service_running", target_args_mapping=["{svc}"])],
+        )
+    )
+    validator = EpistemicCausalValidator()
+    plan = PlanIR(
+        plan_id="p_witnessable_not_verified",
+        goal_description="Test witnessable effect is not verified true",
+        initial_state=[],
+        actions=[
+            _action(
+                action_id="act1",
+                capability_name="service_manager",
+                parameters={"svc": "web"},
+                positive_effects=[_cond("service_running", ["web"])],
+            )
+        ],
+        success_criteria=[],
+    )
+    result = validator.validate_plan(plan, registry=registry)
+    final_state = result.intermediate_states[-1]
+    fact = final_state.get("service_running(web)")
+    assert fact is not None
+    assert fact.provenance.source_type == SourceType.PLANNER_INFERENCE
+    assert fact.witnessability == WitnessabilityStatus.WITNESSABLE
+    # Empirical truth MUST remain UNKNOWN until Phase 2 runtime executes the verifier
+    assert fact.truth == FactTruth.UNKNOWN
+    assert fact.truth != FactTruth.VERIFIED_TRUE
+    assert fact.metadata.get("predicted_truth") == FactTruth.VERIFIED_TRUE.value
+
+
+# ---------------------------------------------------------------------------
+# Test 14: Witnessable predicted effect cannot satisfy verified precondition
+# ---------------------------------------------------------------------------
+def test_witnessable_predicted_effect_cannot_satisfy_verified_precondition():
+    """Action A predicts X and X is witnessable but not yet empirically witnessed. Action B requires X == VERIFIED_TRUE.
+    At planning-only validation, Action B must NOT treat X as empirically verified. The plan must remain UNKNOWN / require runtime witnessing."""
+    registry = CapabilityRegistry()
+    registry.register(
+        CapabilityEntry(
+            name="step_a_tool",
+            description="Tool A",
+            input_schema={},
+            positive_effects=[_cond("state_x", ["ready"])],
+            verifiers=[ObservationVerifier(verifier_id="v_x", predicate="state_x", target_args_mapping=["ready"])],
+        )
+    )
+    registry.register(
+        CapabilityEntry(
+            name="step_b_tool",
+            description="Tool B",
+            input_schema={},
+            positive_effects=[_cond("state_y", ["done"])],
+            verifiers=[ObservationVerifier(verifier_id="v_y", predicate="state_y", target_args_mapping=["done"])],
+        )
+    )
+    validator = EpistemicCausalValidator()
+    plan = PlanIR(
+        plan_id="p_predicted_precondition",
+        goal_description="Test predicted effect cannot satisfy verified precondition",
+        initial_state=[],
+        actions=[
+            _action(
+                action_id="actA",
+                capability_name="step_a_tool",
+                positive_effects=[_cond("state_x", ["ready"])],
+            ),
+            _action(
+                action_id="actB",
+                capability_name="step_b_tool",
+                preconditions=[_cond("state_x", ["ready"], FactTruth.VERIFIED_TRUE)],
+                positive_effects=[_cond("state_y", ["done"])],
+            ),
+        ],
+    )
+    result = validator.validate_plan(plan, registry=registry)
+    # Plan must remain UNKNOWN because actB requires empirical VERIFIED_TRUE which has only been predicted
+    assert result.status == ValidationStatus.UNKNOWN
+    assert "state_x(ready)" in result.unknown_facts
+
+
+# ---------------------------------------------------------------------------
+# Test 15: Verifier binding rejects same predicate with wrong target arguments
+# ---------------------------------------------------------------------------
+def test_verifier_binding_rejects_same_predicate_wrong_arguments():
+    """Verifier has same predicate but bound to different target arguments. It must not witness the effect."""
+    registry = CapabilityRegistry()
+    registry.register(
+        CapabilityEntry(
+            name="db_deployer",
+            description="Deploy database",
+            input_schema={"env": {"type": "str", "required": True}},
+            positive_effects=[_cond("service_running", ["{env}"])],
+            verifiers=[ObservationVerifier(verifier_id="v_staging", predicate="service_running", target_args_mapping=["staging"])],
+        )
+    )
+    validator = EpistemicCausalValidator()
+    plan = PlanIR(
+        plan_id="p_wrong_verifier_args",
+        goal_description="Test verifier wrong arguments",
+        initial_state=[],
+        actions=[
+            _action(
+                action_id="act1",
+                capability_name="db_deployer",
+                parameters={"env": "prod"},
+                positive_effects=[_cond("service_running", ["prod"])],
+            )
+        ],
+    )
+    result = validator.validate_plan(plan, registry=registry)
+    final_state = result.intermediate_states[-1]
+    fact = final_state.get("service_running(prod)")
+    assert fact is not None
+    # Because verifier targets 'staging', effect on 'prod' is unwitnessable
+    assert fact.witnessability == WitnessabilityStatus.UNWITNESSABLE
+    assert "service_running(prod)" in result.unknown_facts
+
+
+# ---------------------------------------------------------------------------
+# Test 16: Verifier binding accepts same predicate with exact bound arguments
+# ---------------------------------------------------------------------------
+def test_verifier_binding_accepts_same_predicate_exact_bound_arguments():
+    """Positive control: verifier predicate and bound arguments match exact effect arguments."""
+    registry = CapabilityRegistry()
+    registry.register(
+        CapabilityEntry(
+            name="db_deployer",
+            description="Deploy database",
+            input_schema={"env": {"type": "str", "required": True}},
+            positive_effects=[_cond("service_running", ["{env}"])],
+            verifiers=[ObservationVerifier(verifier_id="v_env", predicate="service_running", target_args_mapping=["{env}"])],
+        )
+    )
+    validator = EpistemicCausalValidator()
+    plan = PlanIR(
+        plan_id="p_exact_verifier_args",
+        goal_description="Test verifier exact arguments match",
+        initial_state=[],
+        actions=[
+            _action(
+                action_id="act1",
+                capability_name="db_deployer",
+                parameters={"env": "prod"},
+                positive_effects=[_cond("service_running", ["prod"])],
+            )
+        ],
+    )
+    result = validator.validate_plan(plan, registry=registry)
+    final_state = result.intermediate_states[-1]
+    fact = final_state.get("service_running(prod)")
+    assert fact is not None
+    assert fact.witnessability == WitnessabilityStatus.WITNESSABLE
+
+
+# ---------------------------------------------------------------------------
+# Test 17: Negative effect verifier binding rejects wrong target arguments
+# ---------------------------------------------------------------------------
+def test_negative_verifier_binding_rejects_wrong_arguments():
+    """Negative effect verifier with wrong target arguments must reject witnessing."""
+    registry = CapabilityRegistry()
+    registry.register(
+        CapabilityEntry(
+            name="db_stopper",
+            description="Stop database",
+            input_schema={"env": {"type": "str", "required": True}},
+            negative_effects=[_cond("service_running", ["{env}"], FactTruth.VERIFIED_FALSE)],
+            verifiers=[ObservationVerifier(verifier_id="v_staging_stop", predicate="service_running", target_args_mapping=["staging"])],
+        )
+    )
+    validator = EpistemicCausalValidator()
+    plan = PlanIR(
+        plan_id="p_negative_wrong_verifier_args",
+        goal_description="Test negative effect verifier wrong arguments",
+        initial_state=[_fact("service_running", ["prod"], FactTruth.VERIFIED_TRUE)],
+        actions=[
+            _action(
+                action_id="act1",
+                capability_name="db_stopper",
+                parameters={"env": "prod"},
+                negative_effects=[_cond("service_running", ["prod"], FactTruth.VERIFIED_FALSE)],
+            )
+        ],
+    )
+    result = validator.validate_plan(plan, registry=registry)
+    final_state = result.intermediate_states[-1]
+    fact = final_state.get("service_running(prod)")
+    assert fact is not None
+    assert fact.witnessability == WitnessabilityStatus.UNWITNESSABLE
+    assert "service_running(prod)" in result.unknown_facts
+
+
+# ---------------------------------------------------------------------------
+# Test 18: Effect argument types are not collapsed to strings
+# ---------------------------------------------------------------------------
+def test_effect_argument_types_are_not_collapsed_to_strings():
+    """Registered effect arg = integer 123 vs action effect arg = string '123' must not match."""
+    registry = CapabilityRegistry()
+    registry.register(
+        CapabilityEntry(
+            name="proc_killer",
+            description="Kills process",
+            input_schema={"pid": {"type": "int", "required": True}},
+            negative_effects=[_cond("proc_running", [123], FactTruth.VERIFIED_FALSE)],  # integer 123
+            verifiers=[ObservationVerifier(verifier_id="v_proc", predicate="proc_running", target_args_mapping=[123])],
+        )
+    )
+    validator = EpistemicCausalValidator()
+    plan = PlanIR(
+        plan_id="p_type_collapse",
+        goal_description="Test type collapse rejection",
+        initial_state=[],
+        actions=[
+            _action(
+                action_id="act1",
+                capability_name="proc_killer",
+                parameters={"pid": 123},
+                negative_effects=[_cond("proc_running", ["123"], FactTruth.VERIFIED_FALSE)],  # string '123'!
+            )
+        ],
+    )
+    result = validator.validate_plan(plan, registry=registry)
+    # Schema validation must fail because type int != type str
+    assert result.status == ValidationStatus.FAIL
+    assert any("mismatch" in b.lower() or "undeclared" in b.lower() for b in result.blocker_reasons)
