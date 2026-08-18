@@ -1347,9 +1347,11 @@ def selfcheck(*, plans_dir: str | Path | None = None,
     # 2b) feature dependency status (reactive coeffects report)
     try:
         ds = deps_check()
-        required_missing = [u for u in ds.get("unsatisfied", []) if u != "corpus"]
+        required_deps = {"pytest"}
+        required_missing = [u for u in ds.get("unsatisfied", []) if u in required_deps]
+        optional_missing = [u for u in ds.get("unsatisfied", []) if u not in required_deps]
         checks.append({"name": "feature_deps", "ok": not required_missing,
-                       "detail": f"optional corpus: {'present' if 'corpus' not in ds.get('unsatisfied', []) else 'absent'}; required missing: {required_missing}"})
+                       "detail": f"optional missing: {optional_missing}; required missing: {required_missing}"})
         if required_missing:
             problems.append(f"required feature deps unsatisfied: {required_missing}")
     except Exception as e:
