@@ -593,3 +593,7 @@ angle$ asserting that step $a_i$ achieves condition $p$ consumed by step $a_j$.
 - **Execution Trace Alignment**: `verify_execution_trace(plan_text, evidence)` matches every declared output and symbol to a real trace and rejects executor/verifier provenance collisions.
 - **Expected-Output Exit Criteria**: `run_exit_criteria(contract, cwd=...)` checks `exit_code`, `must_contain`, `expected_stdout`, and `expected_count`.
 - **Negative Constraints**: `verify_negative_constraints(plan_text, evidence)` checks plan-declared falsifiers against execution evidence.
+- **Semantic Isolation**: `IsolationManager` / `acquire_artifact` / `detect_conflicts` implements ACID-Agent Section 2.2.3 with versioned workspaces and write-write/read-write conflict detection.
+- **Five-Node Drift Recovery Graph**: `RecoveryGraph` follows the 2608.14109 n1..n5 routing and terminal action decision.
+- **Typed Predicate Signatures**: `PredicateSignature` / `validate_typed_atom` enforce SymPlanner-style arity and argument types.
+- **Execution-Feedback MCTS/Beam**: `feedback_penalty()` and `search(execution_feedback=...)` apply FlowScout-style scalar reward penalties.

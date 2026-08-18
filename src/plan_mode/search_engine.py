@@ -84,6 +84,47 @@ def _rollout(plan_text: str, rubric: dict[str, Any]) -> dict[str, Any]:
 
 
 
+def feedback_penalty(plan_text: str, feedback: list[dict[str, Any]] | None) -> float:
+    """FlowScout-style scalar penalty for execution-feedback disagreement."""
+    if not feedback:
+        return 0.0
+    from .causal_validator import PlanParser
+    try:
+        ast = PlanParser.parse_plan(plan_text)
+    except Exception:
+        return 0.0
+    actions = {a.id: a for a in ast.actions}
+    penalty = 0.0
+    for item in feedback:
+        if not isinstance(item, dict):
+            continue
+        task_id = int(item.get("task_id") or item.get("task") or 0)
+        action = actions.get(task_id)
+        if action is None:
+            continue
+        missing = [str(x) for x in (item.get("missing_outputs") or [])]
+        if missing and any(out not in action.outputs for out in missing):
+            penalty += 0.10
+        detail = str(item.get("detail") or "")
+        if detail and "repair" not in action.name.lower():
+            penalty += 0.05
+    return min(0.30, penalty)
+
+
+def _feedback_critiques(feedback: list[dict[str, Any]] | None) -> list[dict[str, str]]:
+    if not feedback:
+        return []
+    out: list[dict[str, str]] = []
+    for item in feedback:
+        if not isinstance(item, dict):
+            continue
+        task_id = item.get("task_id") or item.get("task") or "?"
+        detail = item.get("detail") or item.get("expected") or "execution feedback mismatch"
+        out.append({"id": f"feedback:{task_id}", "section": "execution",
+                    "hint": f"[execution feedback task {task_id}] {detail}"})
+    return out
+
+
 def _recombine(plan_a: str, plan_b: str) -> str | None:
     """Evaluator-driven recombination (Mind Evolution 2501.09891 via digest;
     diversity maintenance 2509.22613): join the first half of one plan with
@@ -408,7 +449,7 @@ async def search(session: dict[str, Any] | str, *,
                 if len(nodes) >= max_nodes:
                     break
                 plan = nodes[nid]["plan_text"]
-                crits = nodes[nid]["critiques"]
+                crits = nodes[nid]["critiques"] + _feedback_critiques(execution_feedback)
                 if expansion == "llm" and api_key:
                     variants, tok = await _propose(plan, crits, width, api_key, model)
                     t["tokens_used"] += tok
@@ -417,6 +458,8 @@ async def search(session: dict[str, Any] | str, *,
                     variants = [m["text"] for m in _mutations(plan, width, crits)]
                 for v in variants:
                     ro = _rollout(v, rubric)
+                    ro["value"] = max(0.0, ro["value"] - feedback_penalty(v, execution_feedback))
+                    ro["feedback_penalty"] = feedback_penalty(v, execution_feedback)
                     cid = _new_node(t, v, nid, level + 1, "beam", ro)
                     next_frontier.append(cid)
                     t["rollouts"] += 1
@@ -436,7 +479,7 @@ async def search(session: dict[str, Any] | str, *,
                 break
             sel = _select(t, exploration, cost_penalty)
             plan = nodes[sel]["plan_text"]
-            crits = nodes[sel]["critiques"]
+            crits = nodes[sel]["critiques"] + _feedback_critiques(execution_feedback)
             if expansion == "llm" and api_key:
                 variants, tok = await _propose(plan, crits, width, api_key, model)
                 t["tokens_used"] += tok
@@ -457,6 +500,8 @@ async def search(session: dict[str, Any] | str, *,
             values = []
             for v in variants:
                 ro = _rollout(v, rubric)
+                ro["value"] = max(0.0, ro["value"] - feedback_penalty(v, execution_feedback))
+                ro["feedback_penalty"] = feedback_penalty(v, execution_feedback)
                 cid = _new_node(t, v, sel, nodes[sel]["depth"] + 1, f"mcts it{it}", ro)
                 t["rollouts"] += 1
                 if judge_evals and api_key:

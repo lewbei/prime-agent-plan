@@ -32,7 +32,9 @@ from .causal_validator import (
     CausalValidator,
     PlanAST,
     PlanParser,
+    PredicateSignature,
     Proposition,
+    validate_typed_atom,
 )
 from .ast_search import (
     ASTSearchEngine,
@@ -42,6 +44,7 @@ from .ast_search import (
     mutate_exploratory,
     mutate_flaw_directed,
 )
+from .search_engine import feedback_penalty
 from .memory_distiller import (
     ContextBudgeter,
     ReplanningLadder,
@@ -60,6 +63,23 @@ from .execution_contract import (
     symbol_audit,
     validate_execution_contract,
     validate_exit_criteria,
+)
+from .isolation import (
+    AgentIsolation,
+    ArtifactVersion,
+    ConflictReport,
+    IsolationManager,
+    OperationIsolation,
+    acquire_artifact,
+    detect_conflicts,
+    release_artifact,
+)
+from .recovery_graph import (
+    DriftEvidence,
+    RecoveryDecision,
+    RecoveryGraph,
+    classify_drift,
+    recovery_decision,
 )
 from .execution_trace import (
     CommandResult,
@@ -602,7 +622,9 @@ def assess(session: dict[str, Any] | str, plan_text: str, *, note: str | None = 
            require_execution_contract: bool = False,
            run_probe: bool = False, probe_cwd: str | Path | None = None,
            execution_evidence: str | dict[str, Any] | None = None,
-           require_execution_evidence: bool = False) -> dict[str, Any]:
+           require_execution_evidence: bool = False,
+           conflicts: ConflictReport | None = None,
+           require_conflict_free: bool = False) -> dict[str, Any]:
     """Score a plan version, record it, and return critiques + loop status.
 
     session may be the session dict (from start) or a session_id string.
@@ -1003,6 +1025,8 @@ def release(session: dict[str, Any] | str, *, min_score: float = 90.0,
             execution_cwd: str | Path | None = None,
             execution_evidence: str | dict[str, Any] | None = None,
             require_execution_evidence: bool = False,
+            conflicts: ConflictReport | None = None,
+            require_conflict_free: bool = False,
             plans_dir: str | Path | None = None) -> dict[str, Any]:
     """Release gate (2602.08948 confidence-gated checkpoints, 2608.10729
     acceptance thresholds): a plan may only be released to execution after
@@ -1096,6 +1120,20 @@ def release(session: dict[str, Any] | str, *, min_score: float = 90.0,
         if not trace_ok:
             problems.extend(trace.get("errors", []))
 
+        conflict_ok = True
+        if conflicts is not None:
+            conflict_ok = bool(getattr(conflicts, "ok", True))
+            checks.append({"name": "isolation_conflicts", "ok": conflict_ok,
+                           "detail": str(getattr(conflicts, "conflicts", []))[:120]})
+            if not conflict_ok:
+                problems.extend(str(c) for c in getattr(conflicts, "conflicts", []))
+        elif require_conflict_free:
+            conflict_ok = False
+            problems.append("conflict report not provided; run plan.detect_conflicts() before release")
+            checks.append({"name": "isolation_conflicts", "ok": False, "detail": "missing conflict report"})
+        else:
+            checks.append({"name": "isolation_conflicts", "ok": True, "detail": "not required"})
+
         judge_ok = False
         judge_detail = "no judge verdict recorded"
         judges = s.get("judge_log", [])
@@ -1140,7 +1178,9 @@ def finish(session: dict[str, Any] | str, *, verdict: str = "converged",
            require_execution_contract: bool = False,
            execution_cwd: str | Path | None = None,
            execution_evidence: str | dict[str, Any] | None = None,
-           require_execution_evidence: bool = False) -> dict[str, Any]:
+           require_execution_evidence: bool = False,
+           conflicts: ConflictReport | None = None,
+           require_conflict_free: bool = False) -> dict[str, Any]:
     """Mark the session complete with full session locking across release validation."""
     plans_dir = Path(plans_dir) if plans_dir else (Path(session.get("plans_dir")) if isinstance(session, dict) and session.get("plans_dir") else DEFAULT_PLANS_DIR)
     sid = session if isinstance(session, str) else session.get("session_id", "default")
@@ -1158,6 +1198,8 @@ def finish(session: dict[str, Any] | str, *, verdict: str = "converged",
                            execution_cwd=execution_cwd,
                            execution_evidence=execution_evidence,
                            require_execution_evidence=require_execution_evidence,
+                           conflicts=conflicts,
+                           require_conflict_free=require_conflict_free,
                            plans_dir=plans_dir)
             if not gate["ok"]:
                 raise RuntimeError("release gate failed: " + "; ".join(gate["problems"]))
@@ -1328,6 +1370,23 @@ def log_progress(session: dict[str, Any] | str, task: str, status: str = "done",
                 )
                 s["replan_scope"] = scope
                 s["replan_tier"] = scope.get("tier", s.get("replan_tier", 1))
+            except Exception:
+                pass
+            # Drift recovery graph (2608.14109): n1..n5 routing + terminal action.
+            try:
+                drift = DriftEvidence(
+                    task=task,
+                    step=retry_count,
+                    suspected_onset=max(1, retry_count - 1),
+                    why=evidence or status,
+                    risk=0.7 if "irreversible" in (evidence or "").lower() else 0.2,
+                    checkpoint_available=bool(s.get("checkpoints")),
+                )
+                graph = RecoveryGraph()
+                decision = graph.decide(drift)
+                s["recovery_graph_path"] = decision.node_path
+                s["recovery_decision"] = decision.action
+                s["recovery_reason"] = decision.reason
             except Exception:
                 pass
         _save_session(plans_dir, s)
@@ -2149,6 +2208,10 @@ __all__ = [
     "ExecutionEvidence", "TaskExecution", "CommandResult",
     "parse_execution_evidence", "extract_declared_obligations",
     "align_task_evidence", "verify_execution_trace", "verify_negative_constraints",
+    "AgentIsolation", "OperationIsolation", "ArtifactVersion", "ConflictReport",
+    "IsolationManager", "acquire_artifact", "release_artifact", "detect_conflicts",
+    "DriftEvidence", "RecoveryDecision", "RecoveryGraph", "classify_drift", "recovery_decision",
+    "PredicateSignature", "validate_typed_atom", "feedback_penalty",
     "RoTRuleBase", "RoTRule", "ReplanningLadder", "ContextBudgeter",
     "mutate_flaw_directed", "mutate_exploratory", "crossover_ast", "ast_distance",
     "PopulationMember", "ASTSearchEngine", "Proposition", "PlanParser", "PlanAST",

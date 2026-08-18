@@ -96,6 +96,34 @@ class CausalFlaw:
 
 
 @dataclass
+class PredicateSignature:
+    """SymPlanner-style typed predicate signature (2505.01479).
+
+    The paper models a planning problem as P = (F, A, I, G) where F is a
+    set of ground atoms over typed predicates. This class makes that type
+    information explicit for validation.
+    """
+    name: str
+    arity: int
+    arg_types: tuple[str, ...] = field(default_factory=tuple)
+
+    @classmethod
+    def parse(cls, text: str) -> PredicateSignature:
+        text = text.strip()
+        m = re.match(r"^([\w:-]+)\((.*?)\)$", text)
+        if not m:
+            return cls(name=text, arity=0, arg_types=())
+        raw_args = [a.strip() for a in m.group(2).split(",") if a.strip()]
+        arg_types: list[str] = []
+        for raw in raw_args:
+            if ":" in raw:
+                arg_types.append(raw.rsplit(":", 1)[1].strip())
+            else:
+                arg_types.append("object")
+        return cls(name=m.group(1), arity=len(raw_args), arg_types=tuple(arg_types))
+
+
+@dataclass
 class PlanAST:
     """Structured Abstract Syntax Tree of a plan."""
     goal: str
@@ -103,6 +131,7 @@ class PlanAST:
     initial_state: set[str] = field(default_factory=set)
     target_propositions: list[Proposition] = field(default_factory=list)
     constraints: dict[str, Any] = field(default_factory=dict)
+    predicate_signatures: list[PredicateSignature] = field(default_factory=list)
     metadata: dict[str, Any] = field(default_factory=dict)
 
     def get_action(self, action_id: int) -> Optional[ActionSchema]:
@@ -247,6 +276,14 @@ class PlanParser:
             )
             actions.append(action)
 
+        # 2b. Parse SymPlanner-style typed predicate signatures
+        predicate_signatures: list[PredicateSignature] = []
+        for sig_m in re.finditer(r"^\s*(?:#{1,6}\s*)?(?:Predicate\s+Signature|Signature|Predicate)\s*:\s*(\w[\w:-]*\([^\n]*\))", plan_text, re.I | re.M):
+            try:
+                predicate_signatures.append(PredicateSignature.parse(sig_m.group(1)))
+            except Exception:
+                pass
+
         # 3. Extract Global Constraints
         constraints: dict[str, Any] = {}
         for cons_m in re.finditer(r"(at most|at least|no more than|maximum of|minimum of)\s+(\d+(?:\.\d+)?)\s*(tasks?|steps?|hours?|minutes?|tokens?|USD|\$)", plan_text, re.I):
@@ -259,8 +296,25 @@ class PlanParser:
             goal=goal or "Execute multi-step plan",
             actions=actions,
             target_propositions=target_props,
-            constraints=constraints
+            constraints=constraints,
+            predicate_signatures=predicate_signatures
         )
+
+
+def validate_typed_atom(prop: Proposition, signature: PredicateSignature) -> list[str]:
+    """Validate one ground atom against a typed predicate signature."""
+    errors: list[str] = []
+    if prop.name.lower() != signature.name.lower():
+        return errors  # signature does not govern this proposition
+    if len(prop.args) != signature.arity:
+        errors.append(f"predicate {signature.name}: expected arity {signature.arity}, got {len(prop.args)} for {prop}")
+    for i, arg in enumerate(prop.args):
+        declared = signature.arg_types[i] if i < len(signature.arg_types) else "object"
+        if ":" in arg:
+            actual = arg.rsplit(":", 1)[1].strip()
+            if actual.lower() != declared.lower():
+                errors.append(f"predicate {signature.name}: argument {arg!r} has type {actual!r}, expected {declared!r}")
+    return errors
 
 
 # ---------------------------------------------------------------------------
@@ -291,6 +345,22 @@ class CausalValidator:
 
         actions = sorted(ast.actions, key=lambda a: a.id)
         action_ids = [a.id for a in actions]
+
+        # 0. Typed predicate validation (SymPlanner 2505.01479)
+        sigs = {sig.name.lower(): sig for sig in ast.predicate_signatures}
+        if sigs:
+            for action in actions:
+                for prop in list(action.preconditions) + list(action.add_effects) + list(action.del_effects):
+                    sig = sigs.get(prop.name.lower())
+                    if sig is None:
+                        continue
+                    for err in validate_typed_atom(prop, sig):
+                        flaws.append(CausalFlaw(
+                            flaw_type="type_mismatch", task_id=action.id,
+                            detail=f"Task {action.id}: {err}",
+                            remedy_hint=f"Fix argument count or type to match {sig.name}/{sig.arity}",
+                            involved_tasks=[action.id], involved_proposition=prop
+                        ))
 
         # 1. Contiguity and sequence check
         if action_ids:

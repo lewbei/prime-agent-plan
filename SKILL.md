@@ -100,6 +100,19 @@ A plan may also declare falsifiers:
 - NF-1: declared output exists but symbol audit fails.
 - NF-2: command exits 0 but stdout lacks `must_contain`.
 ```
+For concurrent subagents, use paper-grounded isolation before execution:
+```python
+plan.acquire_artifact(path, agent_id, operation="write", workspace="main")
+conflicts = plan.detect_conflicts()
+```
+Route execution failures through the five-node recovery graph from 2608.14109:
+```python
+plan.RecoveryGraph().decide(plan.DriftEvidence(task=task, why=evidence))
+```
+Use execution feedback in search (FlowScout 2608.10039):
+```python
+await plan.search(session, mode="mcts", execution_feedback=feedback)
+```
 
 ### 3. Assess Draft and Probe Feasibility
 ```python
@@ -180,6 +193,10 @@ results = await plan.execute_plan(best_plan_text, task_handlers={1: run_task1})
 | `plan.run_exit_criteria(contract, cwd=None)` | Run structured exit criteria; checks stdout/must_contain/expected_count, not only exit code. |
 | `plan.verify_execution_trace(plan_text, evidence)` | Align plan obligations with real execution evidence; rejects stubs and missing symbols. |
 | `plan.verify_negative_constraints(plan_text, evidence)` | Check declared falsifiers against execution evidence. |
+| `plan.acquire_artifact` / `plan.release_artifact` / `plan.detect_conflicts` | ACID-Agent semantic isolation with versioned workspaces. |
+| `plan.RecoveryGraph` / `plan.DriftEvidence` | Five-node drift recovery graph from 2608.14109. |
+| `plan.validate_typed_atom` / `plan.PredicateSignature` | SymPlanner-style typed predicate validation. |
+| `plan.feedback_penalty` | FlowScout-style execution-feedback rollout penalty. |
 | `plan.checkpoint(session, note=None)` / `plan.rewind(session, checkpoint_id=None)` | AgentRewind-style aligned session checkpoints and rollback. |
 | `plan.release(session, min_score=90.0, require_judge=True)` | Confidence-gated checkpoint release validation; successful release commits `best` -> `committed`. |
 | `plan.finish(session, require_release=True, min_score=90.0)` | Complete session after verifying release gate. |
