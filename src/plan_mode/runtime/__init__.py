@@ -1,4 +1,4 @@
-"""Trusted Runtime Subsystem."""
+"""Runtime Subsystem Prototype Scaffolding: in-memory event chain, structured process runner, and secret scrubber."""
 
 from plan_mode.runtime.ledger import EvidenceLedger, LedgerEventType, LedgerRecord, LedgerTamperError
 from plan_mode.runtime.secret_scrubber import SecretScrubber

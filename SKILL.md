@@ -5,7 +5,7 @@ description: "Plan mode - formal planning engine, STRIPS causal validator, evolu
 
 # Plan Mode (/plan)
 
-Plan mode drafts a formal plan for an objective and iteratively refines it round by round until convergence. Every version, score, and critique is persisted under `plans/<session_id>.json`, guaranteeing auditable convergence, STRIPS causal soundness, and zero unaddressed flaws.
+Plan mode drafts a formal plan for an objective and iteratively refines it round by round until convergence. Every version, score, and critique is persisted under `plans/<session_id>.json`, providing auditable convergence tracking, STRIPS causal consistency checks, and structured flaw diagnosis.
 
 ## Theoretical Foundations
 
@@ -203,7 +203,7 @@ results = await plan.execute_plan(best_plan_text, task_handlers={1: run_task1})
 | `plan.log_progress(session, task, status, evidence=None)` | Record execution progress; triggers 4-tier replanning ladder on failure (L1 local -> L4 drift recovery). |
 | `plan.fold_history(session, keep_last=2, max_context_tokens=4000)` | HIPIF context token compression for older rounds. |
 | `await plan.execute_plan(plan_text, task_handlers=None, timeout_per_task=None)` | Transactional plan execution with Cordis LIFO rollback. |
-| `plan.speculative_rollout(plan_text, eval_fn)` | Isolated speculative execution with guaranteed 100% clean recovery. |
+| `plan.speculative_rollout(plan_text, eval_fn)` | Speculative execution with Cordis LIFO context unwinding. |
 | `plan.create_subagent_context(name)` | Derive an isolated child context ($\Gamma_\infty$) for subagent sandboxing. |
 | `plan.provide_tool(key, value)` | Ephemeral tool/capability provision with LIFO inverse cleanup. |
 | `plan.selfcheck(plans_dir=None, run_pytest=True)` | Mandatory self-evaluation audit of rubric, sessions, and test suites. |

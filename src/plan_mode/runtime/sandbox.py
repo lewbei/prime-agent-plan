@@ -1,4 +1,8 @@
-"""Isolated Process Execution Sandbox with Structured argv Pipeline Chaining."""
+"""Structured Subprocess Runner with argv Pipeline Chaining (No Shell Interpolation).
+
+Note: This runner executes explicit argument vectors via native OS pipes and stripped environment variables.
+It does NOT provide hostile-code containment or OS-level container isolation.
+"""
 
 from __future__ import annotations
 
@@ -12,7 +16,7 @@ from plan_mode.runtime.secret_scrubber import SecretScrubber
 
 
 class SandboxExecutionResult(BaseModel):
-    """Execution telemetry and scrubbed outputs from sandboxed execution."""
+    """Execution telemetry and scrubbed outputs from structured subprocess execution."""
     stdout: str = ""
     stderr: str = ""
     returncode: int = 0
@@ -21,7 +25,7 @@ class SandboxExecutionResult(BaseModel):
 
 
 class ExecutionSandbox:
-    """Safely executes structured argv pipelines in an isolated subprocess environment without shell expansion."""
+    """Executes structured argv pipelines with direct OS pipes and whitelisted environment variables."""
 
     DEFAULT_ENV_WHITELIST = {
         "PATH": "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",

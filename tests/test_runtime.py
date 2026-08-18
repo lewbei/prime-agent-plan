@@ -1,4 +1,4 @@
-"""Tests for Trusted Runtime Subsystem: Hash-Chained Ledger, Sandbox, Secret Scrubber, and Executor."""
+"""Tests for Runtime Prototype Components: Event Chain, Structured Process Runner, Secret Scrubber, and Executor."""
 
 import pytest
 import time

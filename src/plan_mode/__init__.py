@@ -2128,7 +2128,7 @@ async def execute_plan(plan_text: str,
 
     Each task runs inside a managed fiber context. Side effects are tracked in
     the twisted monoid accumulator. If any task fails, all completed tasks'
-    inverses are automatically executed in reverse (LIFO) order to guarantee
+    inverses are executed in reverse (LIFO) order to support
     Terminal Recovery Exactness (Corollary 62).
     """
     ctx = context or get_root_context().derive(name="plan_execution")
@@ -2244,7 +2244,7 @@ def speculative_rollout(plan_text: str,
     except Exception as e:
         return {"ok": False, "score": 0.0, "error": str(e)}
     finally:
-        # Guarantee 100% clean teardown
+        # Clean teardown via context disposal
         ctx.dispose()
 
 __all__ = [

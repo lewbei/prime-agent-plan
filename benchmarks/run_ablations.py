@@ -51,16 +51,16 @@ from plan_mode.session import PlanningSession
 
 
 ARM_CONFIGS = [
-    ("Arm_A_Blind_LLM", "Blind LLM Baseline (Unverified Direct Execution)"),
-    ("Arm_B_Linear_PlanIR", "Linear PlanIR (Boolean State Only)"),
-    ("Arm_C_4State_Lattice", "4-State Lattice (Rejects UNKNOWN Without Probing)"),
-    ("Arm_D_Random_Probing", "4-State Lattice + Random Probing"),
-    ("Arm_E_VOI_Probing", "4-State Lattice + VOI-Guided Probing"),
-    ("Arm_F_Auth_Certificates", "VOI Probing + HMAC Authorization Certificates"),
-    ("Arm_G_Sandbox_Containment", "Certificates + Sandbox argv Containment"),
-    ("Arm_H_Evidence_Ledger", "Sandbox + Hash-Chained Evidence Ledger"),
-    ("Arm_I_Saga_Dual_Judges", "Saga Recovery + Dual Divergence Judges"),
-    ("Arm_J_Full_Epistemic_Runtime", "Full Epistemic Planning & Verification Runtime (All TCB Features)"),
+    ("Arm_A_Blind_LLM", "Synthetic fixture: unverified direct execution"),
+    ("Arm_B_Linear_PlanIR", "Synthetic fixture: boolean state only"),
+    ("Arm_C_4State_Lattice", "Synthetic fixture: 4-state lattice (rejects UNKNOWN without probing)"),
+    ("Arm_D_Random_Probing", "Synthetic fixture: 4-state lattice + random probing"),
+    ("Arm_E_VOI_Probing", "Synthetic fixture: 4-state lattice + VOI-guided probing"),
+    ("Arm_F_Auth_Certificates", "Synthetic fixture: VOI probing + HMAC authorization certificates"),
+    ("Arm_G_Sandbox_Containment", "Synthetic fixture: certificates + structured process runner"),
+    ("Arm_H_Evidence_Ledger", "Synthetic fixture: process runner + in-memory event chain"),
+    ("Arm_I_Saga_Dual_Judges", "Synthetic fixture: saga recovery + dual heuristic judges"),
+    ("Arm_J_Full_Epistemic_Runtime", "Synthetic fixture: proposed full configuration"),
 ]
 
 
@@ -271,17 +271,26 @@ def run_all_ablations() -> List[AblationArmSummary]:
         summary = evaluate_arm(arm_id, arm_name, tasks)
         summaries.append(summary)
 
-    # Save results to JSON
+    # Save results to JSON with explicit smoke test metadata
     out_json_path = os.path.join(os.path.dirname(__file__), "ablation_results.json")
+    payload = {
+        "evaluation_type": "synthetic_metrics_smoke_test",
+        "empirical_claims_supported": False,
+        "note": "Outcomes are synthetic test fixtures for validating metric calculation pipelines; no architecture performance conclusion may be drawn from these values.",
+        "results": [s.model_dump() for s in summaries],
+    }
     with open(out_json_path, "w") as f:
-        json.dump([s.model_dump() for s in summaries], f, indent=2)
+        json.dump(payload, f, indent=2)
 
     # Generate Markdown summary report
     report_lines = [
-        "# Epistemic Planning & Verification Runtime: Ablation Benchmark Report",
+        "# Synthetic Metrics Smoke Test",
+        "",
+        "> **Notice:** This is not an empirical planning benchmark. Outcomes are synthetic fixtures used only to test metrics calculation. No architecture performance conclusion may be drawn from these values.",
+        "",
         f"**Evaluation Date**: {time.strftime('%Y-%m-%d %H:%M:%S UTC', time.gmtime())}\n",
-        "## Summary Evaluation Across Arms A–J\n",
-        "| Arm ID | Description | False-PASS Rate | Safety Score | UNKNOWN Resolution | Rollback Recovery | Composite Score |",
+        "## Summary Across Synthetic Smoke Configurations\n",
+        "| Configuration ID | Fixture Description | False-PASS Rate | Safety Score | UNKNOWN Resolution | Rollback Recovery | Composite Score |",
         "| :--- | :--- | :--- | :--- | :--- | :--- | :--- |",
     ]
 
@@ -290,7 +299,7 @@ def run_all_ablations() -> List[AblationArmSummary]:
             f"| `{s.arm_id}` | {s.arm_name} | **{s.track_a.false_pass_rate * 100:.1f}%** | {s.track_a.epistemic_safety_score:.2f} | {s.track_a.unknown_resolution_rate * 100:.1f}% | {s.track_b.rollback_recovery_rate * 100:.1f}% | **{s.composite_epistemic_score:.4f}** |"
         )
 
-    out_md_path = os.path.join(os.path.dirname(__file__), "ABBREVIATED_ABLATION_REPORT.md")
+    out_md_path = os.path.join(os.path.dirname(__file__), "SYNTHETIC_METRICS_SMOKE_REPORT.md")
     with open(out_md_path, "w") as f:
         f.write("\n".join(report_lines))
 

@@ -1,4 +1,4 @@
-"""Cryptographic Append-Only Hash-Chained Evidence Ledger."""
+"""In-Memory Integrity-Linked Event Hash Chain Prototype."""
 
 from __future__ import annotations
 
@@ -11,12 +11,12 @@ from pydantic import BaseModel, Field
 
 
 class LedgerTamperError(Exception):
-    """Raised when ledger integrity verification fails due to record tampering or hash breakage."""
+    """Raised when in-memory chain verification fails due to record tampering or hash breakage."""
     pass
 
 
 class LedgerEventType(str, Enum):
-    """Categorical event types recorded in the evidence ledger."""
+    """Categorical event types recorded in the event chain."""
     SESSION_INIT = "SESSION_INIT"
     PLAN_SUBMITTED = "PLAN_SUBMITTED"
     PLAN_VALIDATED = "PLAN_VALIDATED"
@@ -33,7 +33,7 @@ class LedgerEventType(str, Enum):
 
 
 class LedgerRecord(BaseModel):
-    """Single immutable block in the append-only ledger chain."""
+    """Single record in the in-memory event hash chain."""
     index: int
     prev_hash: str
     timestamp: float
@@ -62,7 +62,7 @@ class LedgerRecord(BaseModel):
 
 
 class EvidenceLedger(BaseModel):
-    """Append-only evidence ledger guaranteeing causal auditability and tamper-detection."""
+    """In-memory event chain providing sequential hash linking and in-process tamper detection."""
     session_id: str
     records: List[LedgerRecord] = Field(default_factory=list)
 
