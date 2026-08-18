@@ -71,8 +71,13 @@ class EpistemicCausalValidator:
     ) -> PlanValidationResult:
         now = current_time if current_time is not None else time.time()
         
-        # 1. Initialize world state W_0 from initial facts
+        # 1. Initialize world state W_0 from initial facts with 4-state lattice merging
         current_state: Dict[str, WorldFact] = {}
+        blocker_reasons: List[str] = []
+        unknown_facts: List[str] = []
+        invariants_violated: List[str] = []
+        first_unknown_step: Optional[str] = None
+
         for fact in plan_ir.initial_state:
             f_clone = fact.model_copy(deep=True)
             if self.default_ttl_decay_to_unknown and not f_clone.is_fresh(now):
@@ -82,19 +87,39 @@ class EpistemicCausalValidator:
                     confidence=0.0,
                     rationale="Fact TTL expired; decayed to UNKNOWN",
                 )
-            current_state[f_clone.fact_key] = f_clone
+            key = f_clone.fact_key
+            if key in current_state:
+                merged_truth = merge_fact_truth(current_state[key].truth, f_clone.truth)
+                current_state[key].truth = merged_truth
+                if merged_truth == FactTruth.CONFLICT:
+                    current_state[key].provenance = Provenance(
+                        source_type=SourceType.OBSERVED_WORLD_STATE,
+                        confidence=0.0,
+                        rationale=f"Contradictory duplicate fact definitions for '{key}'",
+                    )
+            else:
+                current_state[key] = f_clone
+
+        # If any initial fact is in CONFLICT, fail immediately
+        for key, f in current_state.items():
+            if f.truth == FactTruth.CONFLICT:
+                blocker_reasons.append(f"Initial state conflict / contradiction for fact '{key}'")
+                return PlanValidationResult(
+                    status=ValidationStatus.FAIL,
+                    failed_step_id="INITIAL_STATE",
+                    failed_predicate=key,
+                    blocker_reasons=blocker_reasons,
+                    intermediate_states=[copy.deepcopy(current_state)],
+                )
 
         intermediate_states: List[Dict[str, WorldFact]] = [copy.deepcopy(current_state)]
-        blocker_reasons: List[str] = []
-        unknown_facts: List[str] = []
-        invariants_violated: List[str] = []
-        first_unknown_step: Optional[str] = None
 
         # Check invariants on initial state W_0
         self._check_invariants(
             current_state,
             plan_ir.hard_constraints,
             action_idx=0,
+            plan_actions=plan_ir.actions,
             invariants_violated=invariants_violated,
             blocker_reasons=blocker_reasons,
         )
@@ -110,21 +135,22 @@ class EpistemicCausalValidator:
         # 2. Iterate through each action step
         for idx, action in enumerate(plan_ir.actions):
             step_id = action.action_id
+            cap_entry = None
 
-            # If registry provided, validate action parameter schema
+            # If registry provided, validate action schema and effect declarations
             if registry is not None:
                 try:
                     registry.validate_action(action)
+                    cap_entry = registry.get(action.capability_name)
                 except Exception as e:
                     return PlanValidationResult(
                         status=ValidationStatus.FAIL,
                         failed_step_id=step_id,
-                        blocker_reasons=[f"Schema validation failed: {str(e)}"],
+                        blocker_reasons=[f"Capability/schema validation failed: {str(e)}"],
                         intermediate_states=intermediate_states,
                     )
 
             # Check preconditions against current state W_t
-            step_failed = False
             step_unknown = False
 
             for pre in action.preconditions:
@@ -135,7 +161,6 @@ class EpistemicCausalValidator:
                 fact_truth = fact.truth if fact is not None else FactTruth.UNKNOWN
 
                 if fact_truth == FactTruth.CONFLICT:
-                    step_failed = True
                     reason = f"Precondition conflict for '{key}' on action '{step_id}'"
                     blocker_reasons.append(reason)
                     return PlanValidationResult(
@@ -152,7 +177,6 @@ class EpistemicCausalValidator:
                     if first_unknown_step is None:
                         first_unknown_step = step_id
                 elif fact_truth != pre.expected_truth:
-                    step_failed = True
                     reason = f"Precondition failed on '{step_id}': expected {key} == {pre.expected_truth.value}, got {fact_truth.value}"
                     blocker_reasons.append(reason)
                     return PlanValidationResult(
@@ -163,40 +187,77 @@ class EpistemicCausalValidator:
                         intermediate_states=intermediate_states,
                     )
 
-            # 3. Transition: W_{t+1} = (W_t \ NegativeEffects) U PositiveEffects
+            # 3. Transition: W_{t+1}
+            # INVARIANT: If precondition is UNKNOWN or CONFLICT, effects MUST NOT be applied as VERIFIED
             next_state = copy.deepcopy(current_state)
             
-            # Apply negative effects
-            for neg in action.negative_effects:
-                neg_key = neg.fact_key
-                next_state[neg_key] = WorldFact(
-                    predicate=neg.predicate,
-                    args=neg.args,
-                    truth=neg.expected_truth if neg.expected_truth != FactTruth.VERIFIED_TRUE else FactTruth.VERIFIED_FALSE,
-                    created_at=now,
-                    updated_at=now,
-                    provenance=Provenance(
-                        source_type=SourceType.PLANNER_INFERENCE,
-                        source_id=step_id,
-                        rationale=f"Negative effect of {step_id}",
-                    ),
-                )
+            if not step_unknown:
+                # Apply negative effects
+                for neg in action.negative_effects:
+                    neg_key = neg.fact_key
+                    next_state[neg_key] = WorldFact(
+                        predicate=neg.predicate,
+                        args=neg.args,
+                        truth=neg.expected_truth if neg.expected_truth != FactTruth.VERIFIED_TRUE else FactTruth.VERIFIED_FALSE,
+                        created_at=now,
+                        updated_at=now,
+                        provenance=Provenance(
+                            source_type=SourceType.PLANNER_INFERENCE,
+                            source_id=step_id,
+                            rationale=f"Negative effect of {step_id}",
+                        ),
+                    )
 
-            # Apply positive effects
-            for pos in action.positive_effects:
-                pos_key = pos.fact_key
-                next_state[pos_key] = WorldFact(
-                    predicate=pos.predicate,
-                    args=pos.args,
-                    truth=pos.expected_truth,
-                    created_at=now,
-                    updated_at=now,
-                    provenance=Provenance(
-                        source_type=SourceType.PLANNER_INFERENCE,
-                        source_id=step_id,
-                        rationale=f"Positive effect of {step_id}",
-                    ),
-                )
+                # Apply positive effects (checking verifier presence if registry available)
+                for pos in action.positive_effects:
+                    pos_key = pos.fact_key
+                    # If registry is active, check if a verifier exists for this effect
+                    has_verifier = True
+                    if cap_entry is not None:
+                        has_verifier = any(v.predicate == pos.predicate for v in cap_entry.verifiers)
+
+                    if has_verifier:
+                        effect_truth = pos.expected_truth
+                        rationale = f"Positive effect of {step_id}"
+                    else:
+                        effect_truth = FactTruth.UNKNOWN
+                        rationale = f"Positive effect of {step_id} (missing observation verifier in capability)"
+                        if pos_key not in unknown_facts:
+                            unknown_facts.append(pos_key)
+                        if first_unknown_step is None:
+                            first_unknown_step = step_id
+
+                    next_state[pos_key] = WorldFact(
+                        predicate=pos.predicate,
+                        args=pos.args,
+                        truth=effect_truth,
+                        created_at=now,
+                        updated_at=now,
+                        provenance=Provenance(
+                            source_type=SourceType.PLANNER_INFERENCE,
+                            source_id=step_id,
+                            rationale=rationale,
+                        ),
+                    )
+            else:
+                # Precondition was UNKNOWN: action cannot produce verified effects
+                for pos in action.positive_effects:
+                    pos_key = pos.fact_key
+                    if pos_key not in unknown_facts:
+                        unknown_facts.append(pos_key)
+                    next_state[pos_key] = WorldFact(
+                        predicate=pos.predicate,
+                        args=pos.args,
+                        truth=FactTruth.UNKNOWN,
+                        created_at=now,
+                        updated_at=now,
+                        provenance=Provenance(
+                            source_type=SourceType.PLANNER_INFERENCE,
+                            source_id=step_id,
+                            confidence=0.0,
+                            rationale=f"Uncertain effect due to UNKNOWN precondition on {step_id}",
+                        ),
+                    )
 
             current_state = next_state
             intermediate_states.append(copy.deepcopy(current_state))
@@ -206,6 +267,7 @@ class EpistemicCausalValidator:
                 current_state,
                 plan_ir.hard_constraints,
                 action_idx=idx + 1,
+                plan_actions=plan_ir.actions,
                 invariants_violated=invariants_violated,
                 blocker_reasons=blocker_reasons,
             )
@@ -284,10 +346,22 @@ class EpistemicCausalValidator:
         state: Dict[str, WorldFact],
         constraints: List[HardConstraint],
         action_idx: int,
+        plan_actions: List[ActionIR],
         invariants_violated: List[str],
         blocker_reasons: List[str],
     ) -> None:
         for hc in constraints:
+            if hc.active_until_action_id:
+                until_idx = None
+                for i, act in enumerate(plan_actions):
+                    if act.action_id == hc.active_until_action_id:
+                        until_idx = i
+                        break
+                # Constraint is active from step 0 up to execution of until_idx
+                # When action_idx (1-based after step execution) > until_idx, the constraint is inactive
+                if until_idx is not None and action_idx > until_idx:
+                    continue
+
             key = hc.condition.fact_key
             fact = state.get(key)
             fact_truth = fact.truth if fact is not None else FactTruth.UNKNOWN

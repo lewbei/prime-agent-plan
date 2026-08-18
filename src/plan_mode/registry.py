@@ -141,6 +141,24 @@ class CapabilityRegistry(BaseModel):
                         f"Action '{action.action_id}' parameter '{param_name}' has invalid value '{val}'. Expected type '{expected_type}', got '{type(val).__name__}'."
                     )
 
+        # Check declared positive effects against capability schema
+        if cap.positive_effects:
+            allowed_predicates = {p.predicate for p in cap.positive_effects}
+            for pos in action.positive_effects:
+                if pos.predicate not in allowed_predicates:
+                    raise SchemaMismatchError(
+                        f"Action '{action.action_id}' claims undeclared positive effect '{pos.predicate}' not supported by capability '{cap.name}'."
+                    )
+
+        # Check declared negative effects against capability schema
+        if cap.negative_effects:
+            allowed_neg_predicates = {p.predicate for p in cap.negative_effects}
+            for neg in action.negative_effects:
+                if neg.predicate not in allowed_neg_predicates:
+                    raise SchemaMismatchError(
+                        f"Action '{action.action_id}' claims undeclared negative effect '{neg.predicate}' not supported by capability '{cap.name}'."
+                    )
+
     def _check_type(self, val: Any, type_name: str) -> bool:
         if type_name in ("any", "*"):
             return True

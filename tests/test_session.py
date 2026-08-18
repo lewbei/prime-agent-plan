@@ -27,12 +27,15 @@ from plan_mode.session import (
 
 @pytest.fixture
 def mock_registry() -> CapabilityRegistry:
+    from plan_mode.registry import ObservationVerifier
     reg = CapabilityRegistry()
     reg.register(
         CapabilityEntry(
             name="system.test_action",
             description="Test action",
             input_schema={"msg": {"type": "str", "required": True}},
+            positive_effects=[PredicateCondition(predicate="task_done", args=[])],
+            verifiers=[ObservationVerifier(verifier_id="v_done", predicate="task_done")],
         )
     )
     return reg

@@ -101,6 +101,7 @@ class HardConstraint(BaseModel):
     description: str
     condition: PredicateCondition
     enforcement_level: str = "ERROR"
+    active_until_action_id: Optional[str] = None
     provenance: Provenance
 
 
