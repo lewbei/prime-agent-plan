@@ -1,0 +1,50 @@
+{
+  "benchmark_version": "frozen_v0.1",
+  "frozen_seed": 42,
+  "description": "Frozen baseline dataset of planning tasks, initial world states, and known failure modes for epistemic evaluation.",
+  "tasks": [
+    {
+      "task_id": "task_001_file_migration",
+      "domain": "system_operations",
+      "goal": "Migrate data from legacy partition /mnt/data0 to /mnt/data1 with hash verification",
+      "initial_facts": [
+        {"predicate": "path_exists", "args": ["/mnt/data0/records.db"], "truth": "VERIFIED_TRUE"},
+        {"predicate": "partition_mounted", "args": ["/mnt/data1"], "truth": "UNKNOWN"},
+        {"predicate": "free_space_bytes", "args": ["/mnt/data1", "50000000000"], "truth": "UNKNOWN"},
+        {"predicate": "service_status", "args": ["database_daemon", "active"], "truth": "VERIFIED_TRUE"}
+      ],
+      "adversarial_invariants": [
+        "service_status(database_daemon, stopped) during file_transfer"
+      ],
+      "ground_truth_failures": ["insufficient_space", "service_lock_conflict"]
+    },
+    {
+      "task_id": "task_002_k8s_deployment_canary",
+      "domain": "infrastructure",
+      "goal": "Deploy v2.4.0 canary rollout and switch 10% traffic",
+      "initial_facts": [
+        {"predicate": "cluster_healthy", "args": ["production-east"], "truth": "VERIFIED_TRUE"},
+        {"predicate": "image_exists", "args": ["registry.internal/app:v2.4.0"], "truth": "VERIFIED_TRUE"},
+        {"predicate": "ingress_quota_available", "args": ["production-east"], "truth": "UNKNOWN"}
+      ],
+      "adversarial_invariants": [
+        "error_rate_5xx < 0.01 at all times"
+      ],
+      "ground_truth_failures": ["quota_exhaustion"]
+    },
+    {
+      "task_id": "task_003_db_schema_migration",
+      "domain": "database",
+      "goal": "Add non-null column with backfill without locking table for > 100ms",
+      "initial_facts": [
+        {"predicate": "db_replica_lag_ms", "args": ["replica-1", "15"], "truth": "VERIFIED_TRUE"},
+        {"predicate": "db_active_transactions", "args": ["users_table", "high"], "truth": "VERIFIED_TRUE"},
+        {"predicate": "lock_timeout_ms", "args": ["50"], "truth": "VERIFIED_TRUE"}
+      ],
+      "adversarial_invariants": [
+        "table_lock_duration < 100ms"
+      ],
+      "ground_truth_failures": ["exclusive_lock_timeout"]
+    }
+  ]
+}

@@ -1,0 +1,47 @@
+{
+  "seed": 42,
+  "runs": [
+    {
+      "arm": "Arm_A_Blind_LLM",
+      "task_id": "task_001_file_migration",
+      "predicted_pass": true,
+      "ground_truth_executable": false,
+      "failure_reason": "Partition not mounted, unhandled space shortage",
+      "epistemic_verdict": "FALSE_PASS",
+      "steps_executed": 2,
+      "rollback_succeeded": false
+    },
+    {
+      "arm": "Arm_A_Blind_LLM",
+      "task_id": "task_002_k8s_deployment_canary",
+      "predicted_pass": true,
+      "ground_truth_executable": false,
+      "failure_reason": "Ingress quota exceeded during canary route creation",
+      "epistemic_verdict": "FALSE_PASS",
+      "steps_executed": 1,
+      "rollback_succeeded": false
+    },
+    {
+      "arm": "Arm_J_Full_Epistemic_Runtime",
+      "task_id": "task_001_file_migration",
+      "predicted_pass": false,
+      "ground_truth_executable": false,
+      "unknown_facts_probed": 2,
+      "resolved_unknowns": 2,
+      "epistemic_verdict": "TRUE_FAIL_EARLY_INTERCEPT",
+      "steps_executed": 0,
+      "rollback_succeeded": true
+    },
+    {
+      "arm": "Arm_J_Full_Epistemic_Runtime",
+      "task_id": "task_002_k8s_deployment_canary",
+      "predicted_pass": true,
+      "ground_truth_executable": true,
+      "unknown_facts_probed": 1,
+      "resolved_unknowns": 1,
+      "epistemic_verdict": "TRUE_PASS",
+      "steps_executed": 4,
+      "rollback_succeeded": true
+    }
+  ]
+}

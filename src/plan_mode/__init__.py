@@ -90,6 +90,59 @@ from .execution_trace import (
     parse_execution_evidence,
     verify_execution_trace,
 )
+from .ir import (
+    ActionIR,
+    FactTruth,
+    HardConstraint,
+    PlanIR,
+    PredicateCondition,
+    Provenance,
+    SourceType,
+    SuccessCriterion,
+    WitnessabilityStatus,
+    WorldFact,
+    render_markdown_view,
+)
+from .registry import (
+    CapabilityEntry,
+    CapabilityRegistry,
+    CompensationAction,
+    ObservationVerifier,
+)
+from .epistemic_validator import (
+    EpistemicCausalValidator,
+    PlanValidationResult,
+    ValidationStatus,
+    merge_fact_truth,
+)
+from .session import (
+    AuthorizationCertificate,
+    PlanningSession,
+    PlanVersion,
+    SessionState,
+)
+from .probing import (
+    DiagnosticProbe,
+    VOIProbingEngine,
+)
+from .recovery import (
+    RecoveryStatus,
+    SagaRecoveryManager,
+    SagaRecoveryReport,
+)
+from .judges import (
+    BlindJudge,
+    DualJudgeComparison,
+    DualJudgeEvaluator,
+    GroundedEpistemicJudge,
+    JudgeVerdict,
+)
+from .ir_search import (
+    EpistemicPlanSearch,
+    causal_crossover,
+    insert_disambiguation_action,
+    mutate_action_parameters,
+)
 
 import asyncio
 import copy
@@ -2216,6 +2269,17 @@ __all__ = [
     "mutate_flaw_directed", "mutate_exploratory", "crossover_ast", "ast_distance",
     "PopulationMember", "ASTSearchEngine", "Proposition", "PlanParser", "PlanAST",
     "CausalValidator", "CausalLink", "CausalFlaw", "ActionSchema",
+    "ActionIR", "FactTruth", "HardConstraint", "PlanIR", "PredicateCondition",
+    "Provenance", "SourceType", "SuccessCriterion", "WitnessabilityStatus",
+    "WorldFact", "render_markdown_view", "CapabilityEntry", "CapabilityRegistry",
+    "CompensationAction", "ObservationVerifier", "EpistemicCausalValidator",
+    "PlanValidationResult", "ValidationStatus", "merge_fact_truth",
+    "AuthorizationCertificate", "PlanningSession", "PlanVersion", "SessionState",
+    "DiagnosticProbe", "VOIProbingEngine", "RecoveryStatus", "SagaRecoveryManager",
+    "SagaRecoveryReport", "BlindJudge", "DualJudgeComparison", "DualJudgeEvaluator",
+    "GroundedEpistemicJudge", "JudgeVerdict",
+    "EpistemicPlanSearch", "causal_crossover", "insert_disambiguation_action",
+    "mutate_action_parameters",
     "DEFAULT_PLANS_DIR", "RUBRIC_PATH", "REPO_ROOT", "DEFAULT_MAX_ROUNDS",
     "MAX_PLATEAU_ROUNDS", "MIN_DELTA_TO_CONTINUE", "JOURNAL_PATH", "DEFAULT_RUBRIC",
 ]

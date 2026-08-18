@@ -1,0 +1,302 @@
+[
+  {
+    "arm_id": "Arm_A_Blind_LLM",
+    "arm_name": "Blind LLM Baseline (Unverified Direct Execution)",
+    "track_a": {
+      "total_plans": 3,
+      "true_pass_count": 0,
+      "true_fail_count": 0,
+      "false_pass_count": 3,
+      "false_fail_count": 0,
+      "unknown_rejected_count": 0,
+      "unknown_resolved_count": 0,
+      "false_pass_rate": 1.0,
+      "epistemic_precision": 0.0,
+      "epistemic_safety_score": 0.0,
+      "unknown_resolution_rate": 0.0,
+      "probing_efficiency": 1.0
+    },
+    "track_b": {
+      "total_runs": 3,
+      "completed_runs": 0,
+      "failed_runs": 3,
+      "execution_success_rate": 0.0,
+      "rollback_attempts": 3,
+      "rollback_successes": 0,
+      "rollback_recovery_rate": 0.0,
+      "compensation_containment_rate": 0.0,
+      "step_attestation_accuracy": 0.5
+    },
+    "composite_epistemic_score": 0.0
+  },
+  {
+    "arm_id": "Arm_B_Linear_PlanIR",
+    "arm_name": "Linear PlanIR (Boolean State Only)",
+    "track_a": {
+      "total_plans": 3,
+      "true_pass_count": 0,
+      "true_fail_count": 0,
+      "false_pass_count": 3,
+      "false_fail_count": 0,
+      "unknown_rejected_count": 0,
+      "unknown_resolved_count": 0,
+      "false_pass_rate": 1.0,
+      "epistemic_precision": 0.0,
+      "epistemic_safety_score": 0.0,
+      "unknown_resolution_rate": 0.0,
+      "probing_efficiency": 1.0
+    },
+    "track_b": {
+      "total_runs": 3,
+      "completed_runs": 0,
+      "failed_runs": 3,
+      "execution_success_rate": 0.0,
+      "rollback_attempts": 0,
+      "rollback_successes": 0,
+      "rollback_recovery_rate": 1.0,
+      "compensation_containment_rate": 0.0,
+      "step_attestation_accuracy": 0.5
+    },
+    "composite_epistemic_score": 0.0
+  },
+  {
+    "arm_id": "Arm_C_4State_Lattice",
+    "arm_name": "4-State Lattice (Rejects UNKNOWN Without Probing)",
+    "track_a": {
+      "total_plans": 3,
+      "true_pass_count": 0,
+      "true_fail_count": 1,
+      "false_pass_count": 0,
+      "false_fail_count": 0,
+      "unknown_rejected_count": 2,
+      "unknown_resolved_count": 0,
+      "false_pass_rate": 0.0,
+      "epistemic_precision": 1.0,
+      "epistemic_safety_score": 1.0,
+      "unknown_resolution_rate": 0.0,
+      "probing_efficiency": 1.0
+    },
+    "track_b": {
+      "total_runs": 3,
+      "completed_runs": 0,
+      "failed_runs": 3,
+      "execution_success_rate": 0.0,
+      "rollback_attempts": 0,
+      "rollback_successes": 3,
+      "rollback_recovery_rate": 1.0,
+      "compensation_containment_rate": 1.0,
+      "step_attestation_accuracy": 1.0
+    },
+    "composite_epistemic_score": 0.7
+  },
+  {
+    "arm_id": "Arm_D_Random_Probing",
+    "arm_name": "4-State Lattice + Random Probing",
+    "track_a": {
+      "total_plans": 3,
+      "true_pass_count": 0,
+      "true_fail_count": 3,
+      "false_pass_count": 0,
+      "false_fail_count": 0,
+      "unknown_rejected_count": 0,
+      "unknown_resolved_count": 0,
+      "false_pass_rate": 0.0,
+      "epistemic_precision": 1.0,
+      "epistemic_safety_score": 1.0,
+      "unknown_resolution_rate": 0.75,
+      "probing_efficiency": 0.3333
+    },
+    "track_b": {
+      "total_runs": 3,
+      "completed_runs": 0,
+      "failed_runs": 3,
+      "execution_success_rate": 0.0,
+      "rollback_attempts": 3,
+      "rollback_successes": 0,
+      "rollback_recovery_rate": 0.0,
+      "compensation_containment_rate": 1.0,
+      "step_attestation_accuracy": 0.5
+    },
+    "composite_epistemic_score": 0.925
+  },
+  {
+    "arm_id": "Arm_E_VOI_Probing",
+    "arm_name": "4-State Lattice + VOI-Guided Probing",
+    "track_a": {
+      "total_plans": 3,
+      "true_pass_count": 0,
+      "true_fail_count": 2,
+      "false_pass_count": 0,
+      "false_fail_count": 0,
+      "unknown_rejected_count": 0,
+      "unknown_resolved_count": 1,
+      "false_pass_rate": 0.0,
+      "epistemic_precision": 1.0,
+      "epistemic_safety_score": 1.0,
+      "unknown_resolution_rate": 1.0,
+      "probing_efficiency": 1.0
+    },
+    "track_b": {
+      "total_runs": 3,
+      "completed_runs": 1,
+      "failed_runs": 2,
+      "execution_success_rate": 0.3333,
+      "rollback_attempts": 2,
+      "rollback_successes": 0,
+      "rollback_recovery_rate": 0.0,
+      "compensation_containment_rate": 1.0,
+      "step_attestation_accuracy": 0.6667
+    },
+    "composite_epistemic_score": 1.0
+  },
+  {
+    "arm_id": "Arm_F_Auth_Certificates",
+    "arm_name": "VOI Probing + HMAC Authorization Certificates",
+    "track_a": {
+      "total_plans": 3,
+      "true_pass_count": 0,
+      "true_fail_count": 3,
+      "false_pass_count": 0,
+      "false_fail_count": 0,
+      "unknown_rejected_count": 0,
+      "unknown_resolved_count": 0,
+      "false_pass_rate": 0.0,
+      "epistemic_precision": 1.0,
+      "epistemic_safety_score": 1.0,
+      "unknown_resolution_rate": 1.0,
+      "probing_efficiency": 1.0
+    },
+    "track_b": {
+      "total_runs": 3,
+      "completed_runs": 0,
+      "failed_runs": 3,
+      "execution_success_rate": 0.0,
+      "rollback_attempts": 3,
+      "rollback_successes": 0,
+      "rollback_recovery_rate": 0.0,
+      "compensation_containment_rate": 1.0,
+      "step_attestation_accuracy": 0.5
+    },
+    "composite_epistemic_score": 1.0
+  },
+  {
+    "arm_id": "Arm_G_Sandbox_Containment",
+    "arm_name": "Certificates + Sandbox argv Containment",
+    "track_a": {
+      "total_plans": 3,
+      "true_pass_count": 0,
+      "true_fail_count": 3,
+      "false_pass_count": 0,
+      "false_fail_count": 0,
+      "unknown_rejected_count": 0,
+      "unknown_resolved_count": 0,
+      "false_pass_rate": 0.0,
+      "epistemic_precision": 1.0,
+      "epistemic_safety_score": 1.0,
+      "unknown_resolution_rate": 1.0,
+      "probing_efficiency": 1.0
+    },
+    "track_b": {
+      "total_runs": 3,
+      "completed_runs": 0,
+      "failed_runs": 3,
+      "execution_success_rate": 0.0,
+      "rollback_attempts": 3,
+      "rollback_successes": 0,
+      "rollback_recovery_rate": 0.0,
+      "compensation_containment_rate": 1.0,
+      "step_attestation_accuracy": 0.5
+    },
+    "composite_epistemic_score": 1.0
+  },
+  {
+    "arm_id": "Arm_H_Evidence_Ledger",
+    "arm_name": "Sandbox + Hash-Chained Evidence Ledger",
+    "track_a": {
+      "total_plans": 3,
+      "true_pass_count": 0,
+      "true_fail_count": 3,
+      "false_pass_count": 0,
+      "false_fail_count": 0,
+      "unknown_rejected_count": 0,
+      "unknown_resolved_count": 0,
+      "false_pass_rate": 0.0,
+      "epistemic_precision": 1.0,
+      "epistemic_safety_score": 1.0,
+      "unknown_resolution_rate": 1.0,
+      "probing_efficiency": 1.0
+    },
+    "track_b": {
+      "total_runs": 3,
+      "completed_runs": 0,
+      "failed_runs": 3,
+      "execution_success_rate": 0.0,
+      "rollback_attempts": 3,
+      "rollback_successes": 0,
+      "rollback_recovery_rate": 0.0,
+      "compensation_containment_rate": 1.0,
+      "step_attestation_accuracy": 0.5
+    },
+    "composite_epistemic_score": 1.0
+  },
+  {
+    "arm_id": "Arm_I_Saga_Dual_Judges",
+    "arm_name": "Saga Recovery + Dual Divergence Judges",
+    "track_a": {
+      "total_plans": 3,
+      "true_pass_count": 0,
+      "true_fail_count": 3,
+      "false_pass_count": 0,
+      "false_fail_count": 0,
+      "unknown_rejected_count": 0,
+      "unknown_resolved_count": 0,
+      "false_pass_rate": 0.0,
+      "epistemic_precision": 1.0,
+      "epistemic_safety_score": 1.0,
+      "unknown_resolution_rate": 1.0,
+      "probing_efficiency": 1.0
+    },
+    "track_b": {
+      "total_runs": 3,
+      "completed_runs": 0,
+      "failed_runs": 3,
+      "execution_success_rate": 0.0,
+      "rollback_attempts": 3,
+      "rollback_successes": 3,
+      "rollback_recovery_rate": 1.0,
+      "compensation_containment_rate": 1.0,
+      "step_attestation_accuracy": 0.5
+    },
+    "composite_epistemic_score": 1.0
+  },
+  {
+    "arm_id": "Arm_J_Full_Epistemic_Runtime",
+    "arm_name": "Full Epistemic Planning & Verification Runtime (All TCB Features)",
+    "track_a": {
+      "total_plans": 3,
+      "true_pass_count": 0,
+      "true_fail_count": 3,
+      "false_pass_count": 0,
+      "false_fail_count": 0,
+      "unknown_rejected_count": 0,
+      "unknown_resolved_count": 0,
+      "false_pass_rate": 0.0,
+      "epistemic_precision": 1.0,
+      "epistemic_safety_score": 1.0,
+      "unknown_resolution_rate": 1.0,
+      "probing_efficiency": 1.0
+    },
+    "track_b": {
+      "total_runs": 3,
+      "completed_runs": 0,
+      "failed_runs": 3,
+      "execution_success_rate": 0.0,
+      "rollback_attempts": 3,
+      "rollback_successes": 3,
+      "rollback_recovery_rate": 1.0,
+      "compensation_containment_rate": 1.0,
+      "step_attestation_accuracy": 0.5
+    },
+    "composite_epistemic_score": 1.0
+  }
+]
