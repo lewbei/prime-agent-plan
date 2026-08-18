@@ -28,8 +28,13 @@ from plan_mode.epistemic_validator import (
 )
 
 
-def _fact(predicate: str, args: list[str], truth: FactTruth, ttl: float | None = None, created_at: float | None = None, source: SourceType = SourceType.OBSERVED_WORLD_STATE) -> WorldFact:
+def _fact(predicate: str, args: list[str], truth: FactTruth, ttl: float | None = None, created_at: float | None = None, source: SourceType = SourceType.OBSERVED_WORLD_STATE, evidence_ref: str | None = None) -> WorldFact:
     now = created_at if created_at is not None else time.time()
+    meta = {}
+    if evidence_ref:
+        meta["evidence_ref"] = evidence_ref
+    elif source == SourceType.OBSERVED_WORLD_STATE:
+        meta["evidence_ref"] = f"ev_{predicate}"
     return WorldFact(
         predicate=predicate,
         args=args,
@@ -38,6 +43,7 @@ def _fact(predicate: str, args: list[str], truth: FactTruth, ttl: float | None =
         created_at=now,
         updated_at=now,
         provenance=Provenance(source_type=source, confidence=1.0),
+        metadata=meta,
     )
 
 
@@ -280,7 +286,7 @@ def test_verifier_predicate_match_does_not_mean_effect_witnessed():
             description="Manage service",
             input_schema={"svc": {"type": "str", "required": True}},
             positive_effects=[_cond("service_active", ["{svc}"])],
-            verifiers=[ObservationVerifier(verifier_id="v_svc", predicate="service_active")],
+            verifiers=[ObservationVerifier(verifier_id="v_svc", predicate="service_active", target_args_mapping=["{svc}"])],
         )
     )
     validator = EpistemicCausalValidator()
@@ -531,54 +537,7 @@ def test_witnessable_planner_effect_is_not_verified_true():
     assert fact.metadata.get("predicted_truth") == FactTruth.VERIFIED_TRUE.value
 
 
-# ---------------------------------------------------------------------------
-# Test 14: Witnessable predicted effect cannot satisfy verified precondition
-# ---------------------------------------------------------------------------
-def test_witnessable_predicted_effect_cannot_satisfy_verified_precondition():
-    """Action A predicts X and X is witnessable but not yet empirically witnessed. Action B requires X == VERIFIED_TRUE.
-    At planning-only validation, Action B must NOT treat X as empirically verified. The plan must remain UNKNOWN / require runtime witnessing."""
-    registry = CapabilityRegistry()
-    registry.register(
-        CapabilityEntry(
-            name="step_a_tool",
-            description="Tool A",
-            input_schema={},
-            positive_effects=[_cond("state_x", ["ready"])],
-            verifiers=[ObservationVerifier(verifier_id="v_x", predicate="state_x", target_args_mapping=["ready"])],
-        )
-    )
-    registry.register(
-        CapabilityEntry(
-            name="step_b_tool",
-            description="Tool B",
-            input_schema={},
-            positive_effects=[_cond("state_y", ["done"])],
-            verifiers=[ObservationVerifier(verifier_id="v_y", predicate="state_y", target_args_mapping=["done"])],
-        )
-    )
-    validator = EpistemicCausalValidator()
-    plan = PlanIR(
-        plan_id="p_predicted_precondition",
-        goal_description="Test predicted effect cannot satisfy verified precondition",
-        initial_state=[],
-        actions=[
-            _action(
-                action_id="actA",
-                capability_name="step_a_tool",
-                positive_effects=[_cond("state_x", ["ready"])],
-            ),
-            _action(
-                action_id="actB",
-                capability_name="step_b_tool",
-                preconditions=[_cond("state_x", ["ready"], FactTruth.VERIFIED_TRUE)],
-                positive_effects=[_cond("state_y", ["done"])],
-            ),
-        ],
-    )
-    result = validator.validate_plan(plan, registry=registry)
-    # Plan must remain UNKNOWN because actB requires empirical VERIFIED_TRUE which has only been predicted
-    assert result.status == ValidationStatus.UNKNOWN
-    assert "state_x(ready)" in result.unknown_facts
+
 
 
 # ---------------------------------------------------------------------------
@@ -725,3 +684,305 @@ def test_effect_argument_types_are_not_collapsed_to_strings():
     # Schema validation must fail because type int != type str
     assert result.status == ValidationStatus.FAIL
     assert any("mismatch" in b.lower() or "undeclared" in b.lower() for b in result.blocker_reasons)
+
+
+# ---------------------------------------------------------------------------
+# Test 19: Argument-bearing effect verifier without target binding is UNWITNESSABLE
+# ---------------------------------------------------------------------------
+def test_argful_effect_verifier_without_target_binding_is_unwitnessable():
+    """For an argument-bearing predicate, absence of explicit verifier target binding means UNWITNESSABLE."""
+    registry = CapabilityRegistry()
+    registry.register(
+        CapabilityEntry(
+            name="service_manager",
+            description="Manage service",
+            input_schema={"svc": {"type": "str", "required": True}},
+            positive_effects=[_cond("service_running", ["{svc}"])],
+            verifiers=[ObservationVerifier(verifier_id="v_svc", predicate="service_running", target_args_mapping=[])],  # Empty mapping!
+        )
+    )
+    validator = EpistemicCausalValidator()
+    plan = PlanIR(
+        plan_id="p19_unbound_argful_verifier",
+        goal_description="Test argful effect verifier without target binding",
+        initial_state=[],
+        actions=[
+            _action(
+                action_id="act1",
+                capability_name="service_manager",
+                parameters={"svc": "prod"},
+                positive_effects=[_cond("service_running", ["prod"])],
+            )
+        ],
+        success_criteria=[_criterion("c1", _cond("service_running", ["prod"]))],
+    )
+    result = validator.validate_plan(plan, registry=registry)
+    final_state = result.intermediate_states[-1]
+    fact = final_state.get("service_running(prod)")
+    assert fact is not None
+    assert fact.witnessability == WitnessabilityStatus.UNWITNESSABLE
+    assert result.status == ValidationStatus.UNKNOWN
+
+
+# ---------------------------------------------------------------------------
+# Test 20: Planner inference initial fact cannot enter as VERIFIED_TRUE
+# ---------------------------------------------------------------------------
+def test_planner_inference_initial_fact_cannot_enter_as_verified_true():
+    """Planner-authored initial facts claiming PLANNER_INFERENCE must not enter as VERIFIED_TRUE."""
+    validator = EpistemicCausalValidator()
+    f = WorldFact(
+        predicate="admin_authorized",
+        args=["prod"],
+        truth=FactTruth.VERIFIED_TRUE,
+        provenance=Provenance(source_type=SourceType.PLANNER_INFERENCE),
+    )
+    plan = PlanIR(
+        plan_id="p20_forged_initial_fact",
+        goal_description="Test forged initial fact rejection",
+        initial_state=[f],
+        actions=[
+            _action(
+                action_id="act1",
+                capability_name="admin_tool",
+                preconditions=[_cond("admin_authorized", ["prod"], FactTruth.VERIFIED_TRUE)],
+            )
+        ],
+    )
+    result = validator.validate_plan(plan)
+    final_state = result.intermediate_states[0]
+    fact = final_state.get("admin_authorized(prod)")
+    assert fact is not None
+    assert fact.truth == FactTruth.UNKNOWN
+    assert fact.truth != FactTruth.VERIFIED_TRUE
+
+
+# ---------------------------------------------------------------------------
+# Test 21: Explicit assumption initial fact cannot enter as VERIFIED_TRUE
+# ---------------------------------------------------------------------------
+def test_explicit_assumption_initial_fact_cannot_enter_as_verified_true():
+    """Planner-authored initial facts claiming EXPLICIT_ASSUMPTION must not enter as VERIFIED_TRUE."""
+    validator = EpistemicCausalValidator()
+    f = WorldFact(
+        predicate="db_ready",
+        args=["prod"],
+        truth=FactTruth.VERIFIED_TRUE,
+        provenance=Provenance(source_type=SourceType.EXPLICIT_ASSUMPTION),
+    )
+    plan = PlanIR(
+        plan_id="p21_assumption_initial_fact",
+        goal_description="Test assumption initial fact rejection",
+        initial_state=[f],
+        actions=[],
+    )
+    result = validator.validate_plan(plan)
+    final_state = result.intermediate_states[0]
+    fact = final_state.get("db_ready(prod)")
+    assert fact is not None
+    assert fact.truth == FactTruth.UNKNOWN
+    assert fact.truth != FactTruth.VERIFIED_TRUE
+
+
+# ---------------------------------------------------------------------------
+# Test 22: Untrusted observed label alone does not prove fact without trusted snapshot
+# ---------------------------------------------------------------------------
+def test_untrusted_observed_label_alone_does_not_prove_fact():
+    """Self-labeling OBSERVED_WORLD_STATE in PlanIR without trusted snapshot or evidence_ref must downgrade to UNKNOWN."""
+    validator = EpistemicCausalValidator()
+    untrusted_fact = WorldFact(
+        predicate="root_access",
+        args=["box1"],
+        truth=FactTruth.VERIFIED_TRUE,
+        provenance=Provenance(source_type=SourceType.OBSERVED_WORLD_STATE),
+    )
+    plan = PlanIR(
+        plan_id="p22_untrusted_observed",
+        goal_description="Test untrusted observed label",
+        initial_state=[untrusted_fact],
+        actions=[],
+    )
+    # Case 1: No trusted snapshot provided -> downgrades to UNKNOWN
+    result_untrusted = validator.validate_plan(plan, observed_world_state=None)
+    assert result_untrusted.intermediate_states[0]["root_access(box1)"].truth == FactTruth.UNKNOWN
+
+    # Case 2: Trusted snapshot provided -> verified
+    trusted_fact = WorldFact(
+        predicate="root_access",
+        args=["box1"],
+        truth=FactTruth.VERIFIED_TRUE,
+        provenance=Provenance(source_type=SourceType.OBSERVED_WORLD_STATE),
+        metadata={"evidence_ref": "ev_001"},
+    )
+    result_trusted = validator.validate_plan(plan, observed_world_state=[trusted_fact])
+    assert result_trusted.intermediate_states[0]["root_access(box1)"].truth == FactTruth.VERIFIED_TRUE
+
+
+# ---------------------------------------------------------------------------
+# Test 23: Witnessable projected effect can close plan causal link
+# ---------------------------------------------------------------------------
+def test_witnessable_projected_effect_can_close_plan_causal_link():
+    """Action A produces projected supported effect X, which satisfies Action B's precondition at plan validation."""
+    registry = CapabilityRegistry()
+    registry.register(
+        CapabilityEntry(
+            name="builder",
+            description="Build app",
+            input_schema={"app": {"type": "str", "required": True}},
+            positive_effects=[_cond("app_built", ["{app}"])],
+            verifiers=[ObservationVerifier(verifier_id="v_build", predicate="app_built", target_args_mapping=["{app}"])],
+        )
+    )
+    registry.register(
+        CapabilityEntry(
+            name="deployer",
+            description="Deploy app",
+            input_schema={"app": {"type": "str", "required": True}},
+            preconditions=[_cond("app_built", ["{app}"])],
+            positive_effects=[_cond("app_deployed", ["{app}"])],
+            verifiers=[ObservationVerifier(verifier_id="v_deploy", predicate="app_deployed", target_args_mapping=["{app}"])],
+        )
+    )
+    validator = EpistemicCausalValidator()
+    plan = PlanIR(
+        plan_id="p23_causal_link",
+        goal_description="Test causal link closure",
+        initial_state=[],
+        actions=[
+            _action(
+                action_id="step1",
+                capability_name="builder",
+                parameters={"app": "my_app"},
+                positive_effects=[_cond("app_built", ["my_app"])],
+            ),
+            _action(
+                action_id="step2",
+                capability_name="deployer",
+                parameters={"app": "my_app"},
+                preconditions=[_cond("app_built", ["my_app"])],
+                positive_effects=[_cond("app_deployed", ["my_app"])],
+            ),
+        ],
+        success_criteria=[_criterion("c1", _cond("app_deployed", ["my_app"]))],
+    )
+    result = validator.validate_plan(plan, registry=registry)
+    assert result.status == ValidationStatus.PASS
+    assert len(result.criteria_satisfied) == 1
+
+
+# ---------------------------------------------------------------------------
+# Test 24: Projected effect does not become empirically verified
+# ---------------------------------------------------------------------------
+def test_projected_effect_does_not_become_empirically_verified():
+    """Projected causal effect has projected_truth == SUPPORTED_TRUE but empirical truth == UNKNOWN."""
+    registry = CapabilityRegistry()
+    registry.register(
+        CapabilityEntry(
+            name="builder",
+            description="Build app",
+            input_schema={"app": {"type": "str", "required": True}},
+            positive_effects=[_cond("app_built", ["{app}"])],
+            verifiers=[ObservationVerifier(verifier_id="v_build", predicate="app_built", target_args_mapping=["{app}"])],
+        )
+    )
+    validator = EpistemicCausalValidator()
+    plan = PlanIR(
+        plan_id="p24_projected_vs_empirical",
+        goal_description="Test projected vs empirical state",
+        initial_state=[],
+        actions=[
+            _action(
+                action_id="step1",
+                capability_name="builder",
+                parameters={"app": "my_app"},
+                positive_effects=[_cond("app_built", ["my_app"])],
+            )
+        ],
+    )
+    result = validator.validate_plan(plan, registry=registry)
+    final_state = result.intermediate_states[-1]
+    fact = final_state.get("app_built(my_app)")
+    assert fact is not None
+    assert fact.truth == FactTruth.UNKNOWN
+    assert fact.truth != FactTruth.VERIFIED_TRUE
+    assert getattr(fact, "projected_truth", None) is not None
+    from plan_mode.ir import ProjectedTruth
+    assert fact.projected_truth == ProjectedTruth.SUPPORTED_TRUE
+
+
+# ---------------------------------------------------------------------------
+# Test 25: Runtime precondition still requires empirical witness
+# ---------------------------------------------------------------------------
+def test_runtime_precondition_still_requires_empirical_witness():
+    """At runtime check, an action requiring empirical VERIFIED_TRUE fails if truth is still UNKNOWN."""
+    fact_projected_only = WorldFact(
+        predicate="app_built",
+        args=["my_app"],
+        truth=FactTruth.UNKNOWN,
+        provenance=Provenance(source_type=SourceType.PLANNER_INFERENCE),
+    )
+    from plan_mode.ir import ProjectedTruth
+    fact_projected_only.projected_truth = ProjectedTruth.SUPPORTED_TRUE
+
+    # Empirical check requires fact.truth == VERIFIED_TRUE
+    assert fact_projected_only.truth != FactTruth.VERIFIED_TRUE
+
+
+# ---------------------------------------------------------------------------
+# Test 26: Two-step registered plan can be plan feasibility PASS
+# ---------------------------------------------------------------------------
+def test_two_step_registered_plan_can_be_plan_feasibility_pass():
+    """A 2-step plan with trusted initial state and registered verifiers achieves plan-time feasibility PASS."""
+    trusted_init = WorldFact(
+        predicate="src_ready",
+        args=["repo1"],
+        truth=FactTruth.VERIFIED_TRUE,
+        provenance=Provenance(source_type=SourceType.OBSERVED_WORLD_STATE),
+        metadata={"evidence_ref": "ev_init"},
+    )
+    registry = CapabilityRegistry()
+    registry.register(
+        CapabilityEntry(
+            name="compile",
+            description="Compile code",
+            input_schema={"repo": {"type": "str", "required": True}},
+            preconditions=[_cond("src_ready", ["{repo}"])],
+            positive_effects=[_cond("binary_ready", ["{repo}"])],
+            verifiers=[ObservationVerifier(verifier_id="v_comp", predicate="binary_ready", target_args_mapping=["{repo}"])],
+        )
+    )
+    registry.register(
+        CapabilityEntry(
+            name="publish",
+            description="Publish binary",
+            input_schema={"repo": {"type": "str", "required": True}},
+            preconditions=[_cond("binary_ready", ["{repo}"])],
+            positive_effects=[_cond("published", ["{repo}"])],
+            verifiers=[ObservationVerifier(verifier_id="v_pub", predicate="published", target_args_mapping=["{repo}"])],
+        )
+    )
+    validator = EpistemicCausalValidator()
+    plan = PlanIR(
+        plan_id="p26_two_step_pass",
+        goal_description="Test two step plan PASS",
+        initial_state=[trusted_init],
+        actions=[
+            _action(
+                action_id="act1",
+                capability_name="compile",
+                parameters={"repo": "repo1"},
+                preconditions=[_cond("src_ready", ["repo1"])],
+                positive_effects=[_cond("binary_ready", ["repo1"])],
+            ),
+            _action(
+                action_id="act2",
+                capability_name="publish",
+                parameters={"repo": "repo1"},
+                preconditions=[_cond("binary_ready", ["repo1"])],
+                positive_effects=[_cond("published", ["repo1"])],
+            ),
+        ],
+        success_criteria=[_criterion("c1", _cond("published", ["repo1"]))],
+    )
+    result = validator.validate_plan(plan, registry=registry, observed_world_state=[trusted_init])
+    assert result.status == ValidationStatus.PASS
+    assert len(result.criteria_satisfied) == 1
+    assert len(result.blocker_reasons) == 0

@@ -41,8 +41,8 @@ def test_lattice_truth_merge():
 def test_causal_validator_simple_pass():
     prov = Provenance(source_type=SourceType.OBSERVED_WORLD_STATE)
 
-    f1 = WorldFact(predicate="file_exists", args=["/tmp/src.txt"], truth=FactTruth.VERIFIED_TRUE, provenance=prov)
-    f2 = WorldFact(predicate="dest_clean", args=["/tmp/dest.txt"], truth=FactTruth.VERIFIED_TRUE, provenance=prov)
+    f1 = WorldFact(predicate="file_exists", args=["/tmp/src.txt"], truth=FactTruth.VERIFIED_TRUE, provenance=prov, metadata={"evidence_ref": "ev_src"})
+    f2 = WorldFact(predicate="dest_clean", args=["/tmp/dest.txt"], truth=FactTruth.VERIFIED_TRUE, provenance=prov, metadata={"evidence_ref": "ev_dst"})
 
     reg = CapabilityRegistry()
     reg.register(
@@ -142,7 +142,7 @@ def test_causal_validator_failed_precondition_yields_fail():
     prov = Provenance(source_type=SourceType.OBSERVED_WORLD_STATE)
     
     # Precondition is verified FALSE
-    f1 = WorldFact(predicate="file_exists", args=["/tmp/src.txt"], truth=FactTruth.VERIFIED_FALSE, provenance=prov)
+    f1 = WorldFact(predicate="file_exists", args=["/tmp/src.txt"], truth=FactTruth.VERIFIED_FALSE, provenance=prov, metadata={"evidence_ref": "ev_src"})
     
     act1 = ActionIR(
         action_id="step_1",
@@ -184,7 +184,7 @@ def test_causal_validator_failed_precondition_yields_fail():
 def test_causal_validator_hard_constraint_violation():
     prov = Provenance(source_type=SourceType.USER_REQUIREMENT)
     
-    f1 = WorldFact(predicate="service_running", args=["web"], truth=FactTruth.VERIFIED_TRUE, provenance=prov)
+    f1 = WorldFact(predicate="service_running", args=["web"], truth=FactTruth.VERIFIED_TRUE, provenance=prov, metadata={"evidence_ref": "ev_web"})
     
     reg = CapabilityRegistry()
     reg.register(
@@ -193,7 +193,7 @@ def test_causal_validator_hard_constraint_violation():
             description="Stop service",
             input_schema={"name": "str"},
             negative_effects=[PredicateCondition(predicate="service_running", args=["{name}"], expected_truth=FactTruth.VERIFIED_FALSE)],
-            verifiers=[ObservationVerifier(verifier_id="v_stop", predicate="service_running")],
+            verifiers=[ObservationVerifier(verifier_id="v_stop", predicate="service_running", target_args_mapping=["{name}"])],
         )
     )
 
@@ -245,6 +245,7 @@ def test_causal_validator_fact_ttl_decay_during_execution():
         created_at=now - 20.0,
         updated_at=now - 15.0,
         provenance=prov,
+        metadata={"evidence_ref": "ev_auth"},
     )
     
     act1 = ActionIR(

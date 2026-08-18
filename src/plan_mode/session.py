@@ -204,6 +204,7 @@ class PlanningSession(BaseModel):
         registry: CapabilityRegistry,
         validator: Optional[CausalValidator] = None,
         current_time: Optional[float] = None,
+        observed_world_state: Optional[List[WorldFact] | Dict[str, WorldFact]] = None,
     ) -> PlanValidationResult:
         """Validate candidate plan version with CausalValidator."""
         if version_number not in self.versions:
@@ -214,7 +215,12 @@ class PlanningSession(BaseModel):
 
         v_obj = self.versions[version_number]
         val = validator or CausalValidator()
-        result = val.validate_plan(v_obj.plan_ir, registry=registry, current_time=current_time)
+        result = val.validate_plan(
+            v_obj.plan_ir,
+            registry=registry,
+            observed_world_state=observed_world_state,
+            current_time=current_time,
+        )
 
         updated_version = PlanVersion(
             version_number=v_obj.version_number,

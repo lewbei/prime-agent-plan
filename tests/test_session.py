@@ -48,7 +48,7 @@ def valid_plan() -> PlanIR:
         plan_id="plan_sess_001",
         goal_description="Session test goal",
         initial_state=[
-            WorldFact(predicate="init_ready", args=[], truth=FactTruth.VERIFIED_TRUE, provenance=prov)
+            WorldFact(predicate="init_ready", args=[], truth=FactTruth.VERIFIED_TRUE, provenance=prov, metadata={"evidence_ref": "ev_init"})
         ],
         actions=[
             ActionIR(

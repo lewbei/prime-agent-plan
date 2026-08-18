@@ -62,7 +62,7 @@ def test_concordance_when_plan_is_grounded_pass():
             description="Restart service",
             input_schema={"name": "str"},
             positive_effects=[PredicateCondition(predicate="service_running", args=["{name}"])],
-            verifiers=[ObservationVerifier(verifier_id="v_svc", predicate="service_running")],
+            verifiers=[ObservationVerifier(verifier_id="v_svc", predicate="service_running", target_args_mapping=["{name}"])],
         )
     )
 
@@ -70,7 +70,7 @@ def test_concordance_when_plan_is_grounded_pass():
         plan_id="plan_concord_001",
         goal_description="Restart web service",
         initial_state=[
-            WorldFact(predicate="service_installed", args=["nginx"], truth=FactTruth.VERIFIED_TRUE, provenance=prov)
+            WorldFact(predicate="service_installed", args=["nginx"], truth=FactTruth.VERIFIED_TRUE, provenance=prov, metadata={"evidence_ref": "ev_nginx"})
         ],
         actions=[
             ActionIR(

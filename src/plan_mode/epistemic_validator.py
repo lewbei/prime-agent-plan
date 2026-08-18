@@ -1,4 +1,4 @@
-"""4-State Fact Lattice and Causal Validator for Canonical Plan IR."""
+"""4-State Fact Lattice, Projected Causal State, and Epistemic Causal Validator for Plan IR."""
 
 from __future__ import annotations
 
@@ -14,6 +14,7 @@ from plan_mode.ir import (
     HardConstraint,
     PlanIR,
     PredicateCondition,
+    ProjectedTruth,
     Provenance,
     SourceType,
     SuccessCriterion,
@@ -55,7 +56,6 @@ def _matches_verifier(
     cond: PredicateCondition,
     cap_entry: Optional[CapabilityEntry],
     params: Dict[str, Any],
-    declared_effects: List[PredicateCondition],
 ) -> bool:
     """Check whether cond has a matching observation verifier bound to its exact predicate and arguments."""
     if cap_entry is None:
@@ -65,8 +65,11 @@ def _matches_verifier(
         if v.predicate != cond.predicate:
             continue
 
-        # If verifier has explicit target_args_mapping, resolve it and compare
-        if v.target_args_mapping:
+        # If condition has arguments: target_args_mapping MUST be non-empty and match
+        if cond.args:
+            if not v.target_args_mapping:
+                # Argument-bearing predicate without explicit target_args_mapping is UNWITNESSABLE
+                continue
             resolved_args: List[Any] = []
             for arg in v.target_args_mapping:
                 if isinstance(arg, str):
@@ -86,28 +89,27 @@ def _matches_verifier(
             if typed_args_equal(resolved_args, cond.args):
                 return True
         else:
-            # target_args_mapping omitted: check if cond.args is empty or matches declared instantiated effect
-            if not cond.args:
+            # Zero-argument predicate: matches if target_args_mapping is empty or resolves to empty
+            if not v.target_args_mapping:
                 return True
-            for decl in declared_effects:
-                if decl.predicate == cond.predicate:
-                    inst_args: List[Any] = []
-                    for arg in decl.args:
-                        if isinstance(arg, str):
-                            if arg.startswith("{") and arg.endswith("}"):
-                                var_name = arg[1:-1]
-                                inst_args.append(params.get(var_name, arg))
-                            elif arg.startswith("$"):
-                                var_name = arg[1:]
-                                inst_args.append(params.get(var_name, arg))
-                            elif arg in params:
-                                inst_args.append(params[arg])
-                            else:
-                                inst_args.append(arg)
-                        else:
-                            inst_args.append(arg)
-                    if typed_args_equal(inst_args, cond.args):
-                        return True
+            resolved_args = []
+            for arg in v.target_args_mapping:
+                if isinstance(arg, str):
+                    if arg.startswith("{") and arg.endswith("}"):
+                        var_name = arg[1:-1]
+                        resolved_args.append(params.get(var_name, arg))
+                    elif arg.startswith("$"):
+                        var_name = arg[1:]
+                        resolved_args.append(params.get(var_name, arg))
+                    elif arg in params:
+                        resolved_args.append(params[arg])
+                    else:
+                        resolved_args.append(arg)
+                else:
+                    resolved_args.append(arg)
+            if typed_args_equal(resolved_args, []):
+                return True
+
     return False
 
 
@@ -125,7 +127,7 @@ class PlanValidationResult(BaseModel):
 
 
 class EpistemicCausalValidator:
-    """Deterministic forward simulator and invariant checker over 4-state fact lattice."""
+    """Deterministic forward simulator and invariant checker over dual empirical & projected lattices."""
 
     def __init__(self, default_ttl_decay_to_unknown: bool = True):
         self.default_ttl_decay_to_unknown = default_ttl_decay_to_unknown
@@ -134,31 +136,133 @@ class EpistemicCausalValidator:
         self,
         plan_ir: PlanIR,
         registry: Optional[CapabilityRegistry] = None,
+        observed_world_state: Optional[List[WorldFact] | Dict[str, WorldFact]] = None,
         current_time: Optional[float] = None,
     ) -> PlanValidationResult:
         now = current_time if current_time is not None else time.time()
 
-        # 1. Initialize world state W_0 from initial facts with 4-state lattice merging
+        # Build trusted observations map if provided
+        trusted_map: Dict[str, WorldFact] = {}
+        if observed_world_state is not None:
+            if isinstance(observed_world_state, dict):
+                trusted_map = copy.deepcopy(observed_world_state)
+            elif isinstance(observed_world_state, list):
+                for f in observed_world_state:
+                    trusted_map[f.fact_key] = f.model_copy(deep=True)
+
         current_state: Dict[str, WorldFact] = {}
         blocker_reasons: List[str] = []
         unknown_facts: List[str] = []
         invariants_violated: List[str] = []
         first_unknown_step: Optional[str] = None
 
-        for fact in plan_ir.initial_state:
-            f_clone = fact.model_copy(deep=True)
+        # 1a. Load trusted snapshot facts if provided
+        for key, f in trusted_map.items():
+            f_clone = f.model_copy(deep=True)
             if self.default_ttl_decay_to_unknown and not f_clone.is_fresh(now):
                 f_clone.truth = FactTruth.UNKNOWN
+                f_clone.projected_truth = ProjectedTruth.UNSUPPORTED
                 f_clone.provenance = Provenance(
                     source_type=SourceType.OBSERVED_WORLD_STATE,
                     confidence=0.0,
                     rationale="Fact TTL expired; decayed to UNKNOWN",
                 )
+            else:
+                if f_clone.truth == FactTruth.VERIFIED_TRUE:
+                    f_clone.projected_truth = ProjectedTruth.SUPPORTED_TRUE
+                elif f_clone.truth == FactTruth.VERIFIED_FALSE:
+                    f_clone.projected_truth = ProjectedTruth.SUPPORTED_FALSE
+                elif f_clone.truth == FactTruth.CONFLICT:
+                    f_clone.projected_truth = ProjectedTruth.CONFLICT
+                else:
+                    f_clone.projected_truth = ProjectedTruth.UNSUPPORTED
+            current_state[key] = f_clone
+
+        # 1b. Process initial facts from plan_ir
+        for fact in plan_ir.initial_state:
+            f_clone = fact.model_copy(deep=True)
             key = f_clone.fact_key
+
+            if observed_world_state is not None:
+                if key in trusted_map:
+                    trusted_f = trusted_map[key]
+                    merged_truth = merge_fact_truth(trusted_f.truth, f_clone.truth)
+                    if merged_truth == FactTruth.CONFLICT:
+                        f_clone.truth = FactTruth.CONFLICT
+                        f_clone.projected_truth = ProjectedTruth.CONFLICT
+                        f_clone.provenance = Provenance(
+                            source_type=SourceType.OBSERVED_WORLD_STATE,
+                            confidence=0.0,
+                            rationale=f"Contradictory fact definitions for '{key}' against trusted world state",
+                        )
+                    else:
+                        f_clone.truth = trusted_f.truth
+                        f_clone.provenance = trusted_f.provenance
+                        f_clone.projected_truth = (
+                            ProjectedTruth.SUPPORTED_TRUE
+                            if trusted_f.truth == FactTruth.VERIFIED_TRUE
+                            else ProjectedTruth.SUPPORTED_FALSE
+                            if trusted_f.truth == FactTruth.VERIFIED_FALSE
+                            else ProjectedTruth.UNSUPPORTED
+                        )
+                else:
+                    # Untrusted assumption
+                    if f_clone.metadata.get("evidence_ref"):
+                        f_clone.projected_truth = (
+                            ProjectedTruth.SUPPORTED_TRUE
+                            if f_clone.truth == FactTruth.VERIFIED_TRUE
+                            else ProjectedTruth.SUPPORTED_FALSE
+                            if f_clone.truth == FactTruth.VERIFIED_FALSE
+                            else ProjectedTruth.UNSUPPORTED
+                        )
+                    else:
+                        f_clone.truth = FactTruth.UNKNOWN
+                        f_clone.projected_truth = ProjectedTruth.UNSUPPORTED
+                        f_clone.provenance = Provenance(
+                            source_type=SourceType.EXPLICIT_ASSUMPTION,
+                            confidence=0.0,
+                            rationale="Planner assumption ungrounded by trusted observation snapshot",
+                        )
+            else:
+                # No trusted snapshot provided: enforce untrusted boundaries
+                if f_clone.provenance.source_type in (
+                    SourceType.PLANNER_INFERENCE,
+                    SourceType.EXPLICIT_ASSUMPTION,
+                ):
+                    f_clone.truth = FactTruth.UNKNOWN
+                    f_clone.projected_truth = ProjectedTruth.UNSUPPORTED
+                elif f_clone.metadata.get("evidence_ref"):
+                    f_clone.projected_truth = (
+                        ProjectedTruth.SUPPORTED_TRUE
+                        if f_clone.truth == FactTruth.VERIFIED_TRUE
+                        else ProjectedTruth.SUPPORTED_FALSE
+                        if f_clone.truth == FactTruth.VERIFIED_FALSE
+                        else ProjectedTruth.UNSUPPORTED
+                    )
+                else:
+                    # Self-labeled OBSERVED_WORLD_STATE without snapshot or evidence_ref is untrusted
+                    f_clone.truth = FactTruth.UNKNOWN
+                    f_clone.projected_truth = ProjectedTruth.UNSUPPORTED
+                    f_clone.provenance = Provenance(
+                        source_type=SourceType.EXPLICIT_ASSUMPTION,
+                        confidence=0.0,
+                        rationale="Untrusted self-labeled OBSERVED_WORLD_STATE fact without evidence reference or trusted snapshot",
+                    )
+
+            if self.default_ttl_decay_to_unknown and not f_clone.is_fresh(now):
+                f_clone.truth = FactTruth.UNKNOWN
+                f_clone.projected_truth = ProjectedTruth.UNSUPPORTED
+                f_clone.provenance = Provenance(
+                    source_type=SourceType.OBSERVED_WORLD_STATE,
+                    confidence=0.0,
+                    rationale="Fact TTL expired; decayed to UNKNOWN",
+                )
+
             if key in current_state:
                 merged_truth = merge_fact_truth(current_state[key].truth, f_clone.truth)
                 current_state[key].truth = merged_truth
                 if merged_truth == FactTruth.CONFLICT:
+                    current_state[key].projected_truth = ProjectedTruth.CONFLICT
                     current_state[key].provenance = Provenance(
                         source_type=SourceType.OBSERVED_WORLD_STATE,
                         confidence=0.0,
@@ -169,7 +273,7 @@ class EpistemicCausalValidator:
 
         # If any initial fact is in CONFLICT, fail immediately
         for key, f in current_state.items():
-            if f.truth == FactTruth.CONFLICT:
+            if f.truth == FactTruth.CONFLICT or f.projected_truth == ProjectedTruth.CONFLICT:
                 blocker_reasons.append(f"Initial state conflict / contradiction for fact '{key}'")
                 return PlanValidationResult(
                     status=ValidationStatus.FAIL,
@@ -219,6 +323,7 @@ class EpistemicCausalValidator:
                     if f.truth != FactTruth.UNKNOWN:
                         f_decayed = f.model_copy(deep=True)
                         f_decayed.truth = FactTruth.UNKNOWN
+                        f_decayed.projected_truth = ProjectedTruth.UNSUPPORTED
                         f_decayed.provenance = Provenance(
                             source_type=SourceType.OBSERVED_WORLD_STATE,
                             confidence=0.0,
@@ -233,7 +338,6 @@ class EpistemicCausalValidator:
                     registry.validate_action(action)
                     cap_entry = registry.get(action.capability_name)
                 except CapabilityNotFoundError:
-                    # Unregistered capability is lack of knowledge (UNKNOWN), not a proven contradiction (FAIL)
                     step_unknown = True
                     if first_unknown_step is None:
                         first_unknown_step = step_id
@@ -247,7 +351,6 @@ class EpistemicCausalValidator:
                         if pre.fact_key not in unknown_facts:
                             unknown_facts.append(pre.fact_key)
                 except SchemaMismatchError as e:
-                    # Known malformed capability contract is FAIL
                     return PlanValidationResult(
                         status=ValidationStatus.FAIL,
                         failed_step_id=step_id,
@@ -255,7 +358,6 @@ class EpistemicCausalValidator:
                         intermediate_states=intermediate_states,
                     )
             elif has_effects:
-                # Effectful action with registry=None lacks grounding -> UNKNOWN
                 step_unknown = True
                 if first_unknown_step is None:
                     first_unknown_step = step_id
@@ -269,15 +371,15 @@ class EpistemicCausalValidator:
                     if neg.fact_key not in unknown_facts:
                         unknown_facts.append(neg.fact_key)
 
-            # Check preconditions against current state W_t
+            # Check preconditions against current state W_t (dual empirical/projected check)
             for pre in action.preconditions:
                 key = pre.fact_key
                 fact = current_state.get(key)
 
-                # If not present in state, it is implicitly UNKNOWN
-                fact_truth = fact.truth if fact is not None else FactTruth.UNKNOWN
+                emp_truth = fact.truth if fact is not None else FactTruth.UNKNOWN
+                proj_truth = fact.projected_truth if fact is not None else ProjectedTruth.UNSUPPORTED
 
-                if fact_truth == FactTruth.CONFLICT:
+                if emp_truth == FactTruth.CONFLICT or proj_truth == ProjectedTruth.CONFLICT:
                     reason = f"Precondition conflict for '{key}' on action '{step_id}'"
                     blocker_reasons.append(reason)
                     return PlanValidationResult(
@@ -287,49 +389,69 @@ class EpistemicCausalValidator:
                         blocker_reasons=blocker_reasons,
                         intermediate_states=intermediate_states,
                     )
-                elif fact_truth == FactTruth.UNKNOWN:
-                    step_unknown = True
-                    if key not in unknown_facts:
-                        unknown_facts.append(key)
-                    if first_unknown_step is None:
-                        first_unknown_step = step_id
-                elif fact_truth != pre.expected_truth:
-                    reason = f"Precondition failed on '{step_id}': expected {key} == {pre.expected_truth.value}, got {fact_truth.value}"
-                    blocker_reasons.append(reason)
-                    return PlanValidationResult(
-                        status=ValidationStatus.FAIL,
-                        failed_step_id=step_id,
-                        failed_predicate=key,
-                        blocker_reasons=blocker_reasons,
-                        intermediate_states=intermediate_states,
-                    )
+
+                if pre.expected_truth == FactTruth.VERIFIED_TRUE:
+                    if proj_truth == ProjectedTruth.SUPPORTED_TRUE or emp_truth == FactTruth.VERIFIED_TRUE:
+                        # Precondition is causally supported at plan-time
+                        continue
+                    elif proj_truth == ProjectedTruth.SUPPORTED_FALSE or emp_truth == FactTruth.VERIFIED_FALSE:
+                        reason = f"Precondition failed on '{step_id}': expected {key} == VERIFIED_TRUE, got {emp_truth.value}/{proj_truth.value}"
+                        blocker_reasons.append(reason)
+                        return PlanValidationResult(
+                            status=ValidationStatus.FAIL,
+                            failed_step_id=step_id,
+                            failed_predicate=key,
+                            blocker_reasons=blocker_reasons,
+                            intermediate_states=intermediate_states,
+                        )
+                    else:
+                        step_unknown = True
+                        if key not in unknown_facts:
+                            unknown_facts.append(key)
+                        if first_unknown_step is None:
+                            first_unknown_step = step_id
+
+                elif pre.expected_truth == FactTruth.VERIFIED_FALSE:
+                    if proj_truth == ProjectedTruth.SUPPORTED_FALSE or emp_truth == FactTruth.VERIFIED_FALSE:
+                        continue
+                    elif proj_truth == ProjectedTruth.SUPPORTED_TRUE or emp_truth == FactTruth.VERIFIED_TRUE:
+                        reason = f"Precondition failed on '{step_id}': expected {key} == VERIFIED_FALSE, got {emp_truth.value}/{proj_truth.value}"
+                        blocker_reasons.append(reason)
+                        return PlanValidationResult(
+                            status=ValidationStatus.FAIL,
+                            failed_step_id=step_id,
+                            failed_predicate=key,
+                            blocker_reasons=blocker_reasons,
+                            intermediate_states=intermediate_states,
+                        )
+                    else:
+                        step_unknown = True
+                        if key not in unknown_facts:
+                            unknown_facts.append(key)
+                        if first_unknown_step is None:
+                            first_unknown_step = step_id
 
             # 3. Transition: W_{t+1}
             next_state = copy.deepcopy(current_state)
 
             if not step_unknown:
-                # Apply negative effects (checking verifier presence and arg binding)
+                # Apply negative effects
                 for neg in action.negative_effects:
                     neg_key = neg.fact_key
                     has_neg_verifier = _matches_verifier(
                         neg,
                         cap_entry,
                         action.parameters,
-                        cap_entry.negative_effects if cap_entry else [],
-                    )
-
-                    expected_truth_val = (
-                        FactTruth.VERIFIED_FALSE.value
-                        if neg.expected_truth == FactTruth.VERIFIED_TRUE
-                        else neg.expected_truth.value
                     )
 
                     if has_neg_verifier:
                         neg_truth = FactTruth.UNKNOWN
+                        neg_proj = ProjectedTruth.SUPPORTED_FALSE
                         neg_witness = WitnessabilityStatus.WITNESSABLE
                         neg_rationale = f"Negative effect of {step_id} (witnessable, pending runtime execution)"
                     else:
                         neg_truth = FactTruth.UNKNOWN
+                        neg_proj = ProjectedTruth.UNSUPPORTED
                         neg_witness = WitnessabilityStatus.UNWITNESSABLE
                         neg_rationale = f"Negative effect of {step_id} (missing observation verifier)"
                         if neg_key not in unknown_facts:
@@ -341,6 +463,7 @@ class EpistemicCausalValidator:
                         predicate=neg.predicate,
                         args=neg.args,
                         truth=neg_truth,
+                        projected_truth=neg_proj,
                         witnessability=neg_witness,
                         created_at=current_sim_time,
                         updated_at=current_sim_time,
@@ -350,25 +473,26 @@ class EpistemicCausalValidator:
                             confidence=1.0 if has_neg_verifier else 0.0,
                             rationale=neg_rationale,
                         ),
-                        metadata={"predicted_truth": expected_truth_val},
+                        metadata={"predicted_truth": FactTruth.VERIFIED_FALSE.value},
                     )
 
-                # Apply positive effects (checking verifier presence and arg binding)
+                # Apply positive effects
                 for pos in action.positive_effects:
                     pos_key = pos.fact_key
                     has_pos_verifier = _matches_verifier(
                         pos,
                         cap_entry,
                         action.parameters,
-                        cap_entry.positive_effects if cap_entry else [],
                     )
 
                     if has_pos_verifier:
                         pos_truth = FactTruth.UNKNOWN
+                        pos_proj = ProjectedTruth.SUPPORTED_TRUE
                         pos_witness = WitnessabilityStatus.WITNESSABLE
                         pos_rationale = f"Positive effect of {step_id} (witnessable, pending runtime execution)"
                     else:
                         pos_truth = FactTruth.UNKNOWN
+                        pos_proj = ProjectedTruth.UNSUPPORTED
                         pos_witness = WitnessabilityStatus.UNWITNESSABLE
                         pos_rationale = f"Positive effect of {step_id} (missing observation verifier)"
                         if pos_key not in unknown_facts:
@@ -380,6 +504,7 @@ class EpistemicCausalValidator:
                         predicate=pos.predicate,
                         args=pos.args,
                         truth=pos_truth,
+                        projected_truth=pos_proj,
                         witnessability=pos_witness,
                         created_at=current_sim_time,
                         updated_at=current_sim_time,
@@ -392,7 +517,6 @@ class EpistemicCausalValidator:
                         metadata={"predicted_truth": pos.expected_truth.value},
                     )
             else:
-                # Precondition was UNKNOWN or capability ungrounded: action cannot produce verified effects
                 for pos in action.positive_effects:
                     pos_key = pos.fact_key
                     if pos_key not in unknown_facts:
@@ -401,6 +525,7 @@ class EpistemicCausalValidator:
                         predicate=pos.predicate,
                         args=pos.args,
                         truth=FactTruth.UNKNOWN,
+                        projected_truth=ProjectedTruth.UNSUPPORTED,
                         witnessability=WitnessabilityStatus.UNWITNESSABLE,
                         created_at=current_sim_time,
                         updated_at=current_sim_time,
@@ -420,6 +545,7 @@ class EpistemicCausalValidator:
                         predicate=neg.predicate,
                         args=neg.args,
                         truth=FactTruth.UNKNOWN,
+                        projected_truth=ProjectedTruth.UNSUPPORTED,
                         witnessability=WitnessabilityStatus.UNWITNESSABLE,
                         created_at=current_sim_time,
                         updated_at=current_sim_time,
@@ -462,19 +588,28 @@ class EpistemicCausalValidator:
         for crit in plan_ir.success_criteria:
             key = crit.condition.fact_key
             fact = current_state.get(key)
-            fact_truth = fact.truth if fact is not None else FactTruth.UNKNOWN
+            emp_truth = fact.truth if fact is not None else FactTruth.UNKNOWN
+            proj_truth = fact.projected_truth if fact is not None else ProjectedTruth.UNSUPPORTED
 
-            if fact_truth == crit.condition.expected_truth:
+            is_satisfied = False
+            if crit.condition.expected_truth == FactTruth.VERIFIED_TRUE:
+                if proj_truth == ProjectedTruth.SUPPORTED_TRUE or emp_truth == FactTruth.VERIFIED_TRUE:
+                    is_satisfied = True
+            elif crit.condition.expected_truth == FactTruth.VERIFIED_FALSE:
+                if proj_truth == ProjectedTruth.SUPPORTED_FALSE or emp_truth == FactTruth.VERIFIED_FALSE:
+                    is_satisfied = True
+
+            if is_satisfied:
                 criteria_satisfied.append(crit.criterion_id)
             else:
                 criteria_unmet.append(crit.criterion_id)
                 if crit.is_mandatory:
-                    if fact_truth == FactTruth.UNKNOWN:
+                    if (proj_truth == ProjectedTruth.UNSUPPORTED and emp_truth == FactTruth.UNKNOWN) or fact is None:
                         if key not in unknown_facts:
                             unknown_facts.append(key)
                     else:
                         blocker_reasons.append(
-                            f"Mandatory success criterion '{crit.criterion_id}' unmet: expected {key} == {crit.condition.expected_truth.value}, got {fact_truth.value}"
+                            f"Mandatory success criterion '{crit.criterion_id}' unmet: expected {key} == {crit.condition.expected_truth.value}, got {emp_truth.value}/{proj_truth.value}"
                         )
 
         # 5. Determine overall verdict
@@ -533,30 +668,46 @@ class EpistemicCausalValidator:
                     if act.action_id == hc.active_until_action_id:
                         until_idx = i
                         break
-                # Constraint is active from step 0 up to execution of until_idx
-                # When action_idx (1-based after step execution) > until_idx, the constraint is inactive
                 if until_idx is not None and action_idx > until_idx:
                     continue
 
             key = hc.condition.fact_key
             fact = state.get(key)
-            fact_truth = fact.truth if fact is not None else FactTruth.UNKNOWN
-            predicted_truth = fact.metadata.get("predicted_truth") if fact is not None else None
+            emp_truth = fact.truth if fact is not None else FactTruth.UNKNOWN
+            proj_truth = fact.projected_truth if fact is not None else ProjectedTruth.UNSUPPORTED
 
-            if fact_truth == FactTruth.UNKNOWN:
-                if predicted_truth is not None and predicted_truth != hc.condition.expected_truth.value:
+            if hc.condition.expected_truth == FactTruth.VERIFIED_TRUE:
+                if (
+                    proj_truth == ProjectedTruth.SUPPORTED_FALSE
+                    or emp_truth == FactTruth.VERIFIED_FALSE
+                    or proj_truth == ProjectedTruth.CONFLICT
+                    or emp_truth == FactTruth.CONFLICT
+                ):
                     invariants_violated.append(hc.constraint_id)
                     blocker_reasons.append(
-                        f"Hard constraint '{hc.constraint_id}' violated: expected {key} == {hc.condition.expected_truth.value}, predicted {predicted_truth}"
+                        f"Hard constraint '{hc.constraint_id}' violated: expected {key} == VERIFIED_TRUE, got {emp_truth.value}/{proj_truth.value}"
                     )
+                elif proj_truth == ProjectedTruth.SUPPORTED_TRUE or emp_truth == FactTruth.VERIFIED_TRUE:
+                    continue
                 else:
                     if key not in unknown_facts:
                         unknown_facts.append(key)
-            elif fact_truth != hc.condition.expected_truth:
-                invariants_violated.append(hc.constraint_id)
-                blocker_reasons.append(
-                    f"Hard constraint '{hc.constraint_id}' violated: expected {key} == {hc.condition.expected_truth.value}, got {fact_truth.value}"
-                )
+            elif hc.condition.expected_truth == FactTruth.VERIFIED_FALSE:
+                if (
+                    proj_truth == ProjectedTruth.SUPPORTED_TRUE
+                    or emp_truth == FactTruth.VERIFIED_TRUE
+                    or proj_truth == ProjectedTruth.CONFLICT
+                    or emp_truth == FactTruth.CONFLICT
+                ):
+                    invariants_violated.append(hc.constraint_id)
+                    blocker_reasons.append(
+                        f"Hard constraint '{hc.constraint_id}' violated: expected {key} == VERIFIED_FALSE, got {emp_truth.value}/{proj_truth.value}"
+                    )
+                elif proj_truth == ProjectedTruth.SUPPORTED_FALSE or emp_truth == FactTruth.VERIFIED_FALSE:
+                    continue
+                else:
+                    if key not in unknown_facts:
+                        unknown_facts.append(key)
 
 
 EpistemicValidator = EpistemicCausalValidator

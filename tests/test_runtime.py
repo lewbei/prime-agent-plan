@@ -109,7 +109,7 @@ def test_execution_plan_manager_success():
         plan_id="plan_exec_001",
         goal_description="Execute echo and witness result",
         initial_state=[
-            WorldFact(predicate="system_ready", args=[], truth=FactTruth.VERIFIED_TRUE, provenance=prov)
+            WorldFact(predicate="system_ready", args=[], truth=FactTruth.VERIFIED_TRUE, provenance=prov, metadata={"evidence_ref": "ev_sys"})
         ],
         actions=[
             ActionIR(

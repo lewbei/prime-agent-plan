@@ -133,6 +133,7 @@ from plan_mode import (  # noqa: E402
     ActionSchema,
     ActionIR,
     FactTruth,
+    ProjectedTruth,
     HardConstraint,
     PlanIR,
     PredicateCondition,

@@ -93,6 +93,7 @@ from .execution_trace import (
 from .ir import (
     ActionIR,
     FactTruth,
+    ProjectedTruth,
     HardConstraint,
     PlanIR,
     PredicateCondition,

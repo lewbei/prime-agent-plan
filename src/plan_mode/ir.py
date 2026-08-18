@@ -18,6 +18,14 @@ class FactTruth(str, Enum):
     CONFLICT = "CONFLICT"
 
 
+class ProjectedTruth(str, Enum):
+    """Projected causal truth state resulting from deterministic plan simulation."""
+    SUPPORTED_TRUE = "SUPPORTED_TRUE"
+    SUPPORTED_FALSE = "SUPPORTED_FALSE"
+    UNSUPPORTED = "UNSUPPORTED"
+    CONFLICT = "CONFLICT"
+
+
 class WitnessabilityStatus(str, Enum):
     """Observability / witnessability classification of world state facts."""
     WITNESSABLE = "WITNESSABLE"
@@ -55,6 +63,7 @@ class WorldFact(BaseModel):
     predicate: str
     args: List[Any] = Field(default_factory=list)
     truth: FactTruth = FactTruth.VERIFIED_TRUE
+    projected_truth: ProjectedTruth = ProjectedTruth.UNSUPPORTED
     witnessability: WitnessabilityStatus = WitnessabilityStatus.WITNESSABLE
     ttl_seconds: Optional[float] = None
     created_at: float = Field(default_factory=time.time)
