@@ -23,19 +23,19 @@ jobs:
         with:
           python-version: ${{ matrix.python-version }}
 
-      - name: Install dependencies
+      - name: Install package and test dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install pytest pytest-asyncio anyio httpx
+          python -m pip install -e ".[test]"
 
       - name: Run pytest (Full suite)
         run: |
-          PYTHONPATH=src pytest -v
+          python -m pytest -q
 
       - name: Verify test portability (without external corpus)
         run: |
-          PLANNING_CORPUS=/nonexistent PYTHONPATH=src pytest -v
+          PLANNING_CORPUS=/nonexistent python -m pytest -q
 
-      - name: Verify plan_mode.selfcheck()
+      - name: Verify clean installation and selfcheck
         run: |
-          PYTHONPATH=src python -c "import plan_mode; res = plan_mode.selfcheck(run_pytest=False); print(res); assert res['ok']"
+          python -c "import plan; import plan_mode; res = plan_mode.selfcheck(run_pytest=False); print(res); assert res['ok']"
