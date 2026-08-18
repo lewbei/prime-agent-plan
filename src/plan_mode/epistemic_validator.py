@@ -52,6 +52,72 @@ def merge_fact_truth(a: FactTruth, b: FactTruth) -> FactTruth:
     return FactTruth.CONFLICT
 
 
+def normalize_trusted_snapshot(
+    observed_world_state: Optional[List[WorldFact] | Dict[str, WorldFact]],
+    default_ttl_decay_to_unknown: bool = True,
+    now: Optional[float] = None,
+) -> Dict[str, WorldFact]:
+    """Normalize and canonicalize trusted observations using 4-state lattice merging and TTL decay."""
+    if observed_world_state is None:
+        return {}
+
+    current_time = now if now is not None else time.time()
+    trusted_map: Dict[str, WorldFact] = {}
+
+    # Extract all facts whether supplied as list or dict (canonicalizing by fact_key to prevent aliasing)
+    facts_iterable = (
+        observed_world_state.values()
+        if isinstance(observed_world_state, dict)
+        else observed_world_state
+    )
+
+    for f in facts_iterable:
+        f_clone = f.model_copy(deep=True)
+        key = f_clone.fact_key
+
+        # Check TTL decay
+        if default_ttl_decay_to_unknown and not f_clone.is_fresh(current_time):
+            f_clone.truth = FactTruth.UNKNOWN
+            f_clone.projected_truth = ProjectedTruth.UNSUPPORTED
+            f_clone.provenance = Provenance(
+                source_type=SourceType.OBSERVED_WORLD_STATE,
+                confidence=0.0,
+                rationale="Fact TTL expired; decayed to UNKNOWN",
+            )
+        else:
+            if f_clone.truth == FactTruth.VERIFIED_TRUE:
+                f_clone.projected_truth = ProjectedTruth.SUPPORTED_TRUE
+            elif f_clone.truth == FactTruth.VERIFIED_FALSE:
+                f_clone.projected_truth = ProjectedTruth.SUPPORTED_FALSE
+            elif f_clone.truth == FactTruth.CONFLICT:
+                f_clone.projected_truth = ProjectedTruth.CONFLICT
+            else:
+                f_clone.projected_truth = ProjectedTruth.UNSUPPORTED
+
+        if key in trusted_map:
+            # 4-state lattice merge across duplicate trusted observations
+            existing = trusted_map[key]
+            merged_truth = merge_fact_truth(existing.truth, f_clone.truth)
+            existing.truth = merged_truth
+            if merged_truth == FactTruth.VERIFIED_TRUE:
+                existing.projected_truth = ProjectedTruth.SUPPORTED_TRUE
+            elif merged_truth == FactTruth.VERIFIED_FALSE:
+                existing.projected_truth = ProjectedTruth.SUPPORTED_FALSE
+            elif merged_truth == FactTruth.CONFLICT:
+                existing.projected_truth = ProjectedTruth.CONFLICT
+                existing.provenance = Provenance(
+                    source_type=SourceType.OBSERVED_WORLD_STATE,
+                    confidence=0.0,
+                    rationale=f"Contradictory duplicate observations in trusted snapshot for '{key}'",
+                )
+            else:
+                existing.projected_truth = ProjectedTruth.UNSUPPORTED
+        else:
+            trusted_map[key] = f_clone
+
+    return trusted_map
+
+
 def _matches_verifier(
     cond: PredicateCondition,
     cap_entry: Optional[CapabilityEntry],
@@ -141,44 +207,36 @@ class EpistemicCausalValidator:
     ) -> PlanValidationResult:
         now = current_time if current_time is not None else time.time()
 
-        # Build trusted observations map if provided
-        trusted_map: Dict[str, WorldFact] = {}
-        if observed_world_state is not None:
-            if isinstance(observed_world_state, dict):
-                trusted_map = copy.deepcopy(observed_world_state)
-            elif isinstance(observed_world_state, list):
-                for f in observed_world_state:
-                    trusted_map[f.fact_key] = f.model_copy(deep=True)
+        # 1. Normalize trusted snapshot with lattice duplicate merging and canonical fact_key indexing
+        trusted_map: Dict[str, WorldFact] = normalize_trusted_snapshot(
+            observed_world_state,
+            default_ttl_decay_to_unknown=self.default_ttl_decay_to_unknown,
+            now=now,
+        )
 
-        current_state: Dict[str, WorldFact] = {}
+        current_state: Dict[str, WorldFact] = copy.deepcopy(trusted_map)
         blocker_reasons: List[str] = []
         unknown_facts: List[str] = []
         invariants_violated: List[str] = []
         first_unknown_step: Optional[str] = None
 
-        # 1a. Load trusted snapshot facts if provided
-        for key, f in trusted_map.items():
-            f_clone = f.model_copy(deep=True)
-            if self.default_ttl_decay_to_unknown and not f_clone.is_fresh(now):
-                f_clone.truth = FactTruth.UNKNOWN
-                f_clone.projected_truth = ProjectedTruth.UNSUPPORTED
-                f_clone.provenance = Provenance(
-                    source_type=SourceType.OBSERVED_WORLD_STATE,
-                    confidence=0.0,
-                    rationale="Fact TTL expired; decayed to UNKNOWN",
-                )
-            else:
-                if f_clone.truth == FactTruth.VERIFIED_TRUE:
-                    f_clone.projected_truth = ProjectedTruth.SUPPORTED_TRUE
-                elif f_clone.truth == FactTruth.VERIFIED_FALSE:
-                    f_clone.projected_truth = ProjectedTruth.SUPPORTED_FALSE
-                elif f_clone.truth == FactTruth.CONFLICT:
-                    f_clone.projected_truth = ProjectedTruth.CONFLICT
-                else:
-                    f_clone.projected_truth = ProjectedTruth.UNSUPPORTED
-            current_state[key] = f_clone
+        # Check if trusted snapshot itself contained conflicting facts
+        for key, f in current_state.items():
+            if f.truth == FactTruth.CONFLICT or f.projected_truth == ProjectedTruth.CONFLICT:
+                reason = f"Trusted world state conflict / contradiction for fact '{key}'"
+                if reason not in blocker_reasons:
+                    blocker_reasons.append(reason)
 
-        # 1b. Process initial facts from plan_ir against trusted boundary
+        if blocker_reasons:
+            return PlanValidationResult(
+                status=ValidationStatus.FAIL,
+                failed_step_id="INITIAL_STATE",
+                failed_predicate=blocker_reasons[0].split("'")[1] if "'" in blocker_reasons[0] else None,
+                blocker_reasons=blocker_reasons,
+                intermediate_states=[copy.deepcopy(current_state)],
+            )
+
+        # 2. Process initial facts from plan_ir against trusted boundary
         for fact in plan_ir.initial_state:
             f_clone = fact.model_copy(deep=True)
             key = f_clone.fact_key
@@ -188,23 +246,17 @@ class EpistemicCausalValidator:
                     trusted_f = trusted_map[key]
                     merged_truth = merge_fact_truth(trusted_f.truth, f_clone.truth)
                     if merged_truth == FactTruth.CONFLICT:
-                        f_clone.truth = FactTruth.CONFLICT
-                        f_clone.projected_truth = ProjectedTruth.CONFLICT
-                        f_clone.provenance = Provenance(
+                        current_state[key].truth = FactTruth.CONFLICT
+                        current_state[key].projected_truth = ProjectedTruth.CONFLICT
+                        current_state[key].provenance = Provenance(
                             source_type=SourceType.OBSERVED_WORLD_STATE,
                             confidence=0.0,
                             rationale=f"Contradictory fact definitions for '{key}' against trusted world state",
                         )
                     else:
-                        f_clone.truth = trusted_f.truth
-                        f_clone.provenance = trusted_f.provenance
-                        f_clone.projected_truth = (
-                            ProjectedTruth.SUPPORTED_TRUE
-                            if trusted_f.truth == FactTruth.VERIFIED_TRUE
-                            else ProjectedTruth.SUPPORTED_FALSE
-                            if trusted_f.truth == FactTruth.VERIFIED_FALSE
-                            else ProjectedTruth.UNSUPPORTED
-                        )
+                        current_state[key].truth = trusted_f.truth
+                        current_state[key].provenance = trusted_f.provenance
+                        current_state[key].projected_truth = trusted_f.projected_truth
                 else:
                     # Omitted from trusted snapshot -> untrusted assumption
                     f_clone.truth = FactTruth.UNKNOWN
@@ -214,6 +266,7 @@ class EpistemicCausalValidator:
                         confidence=0.0,
                         rationale="Planner assumption ungrounded by trusted observation snapshot",
                     )
+                    current_state[key] = f_clone
             else:
                 # No trusted snapshot provided: all initial claims are untrusted
                 f_clone.truth = FactTruth.UNKNOWN
@@ -223,40 +276,23 @@ class EpistemicCausalValidator:
                     confidence=0.0,
                     rationale="Initial state fact ungrounded by trusted observed world state snapshot",
                 )
-
-            if self.default_ttl_decay_to_unknown and not f_clone.is_fresh(now):
-                f_clone.truth = FactTruth.UNKNOWN
-                f_clone.projected_truth = ProjectedTruth.UNSUPPORTED
-                f_clone.provenance = Provenance(
-                    source_type=SourceType.OBSERVED_WORLD_STATE,
-                    confidence=0.0,
-                    rationale="Fact TTL expired; decayed to UNKNOWN",
-                )
-
-            if key in current_state:
-                merged_truth = merge_fact_truth(current_state[key].truth, f_clone.truth)
-                current_state[key].truth = merged_truth
-                if merged_truth == FactTruth.CONFLICT:
-                    current_state[key].projected_truth = ProjectedTruth.CONFLICT
-                    current_state[key].provenance = Provenance(
-                        source_type=SourceType.OBSERVED_WORLD_STATE,
-                        confidence=0.0,
-                        rationale=f"Contradictory duplicate fact definitions for '{key}'",
-                    )
-            else:
                 current_state[key] = f_clone
 
-        # If any initial fact is in CONFLICT, fail immediately
+        # If any initial fact in current_state is in CONFLICT, fail immediately
         for key, f in current_state.items():
             if f.truth == FactTruth.CONFLICT or f.projected_truth == ProjectedTruth.CONFLICT:
-                blocker_reasons.append(f"Initial state conflict / contradiction for fact '{key}'")
-                return PlanValidationResult(
-                    status=ValidationStatus.FAIL,
-                    failed_step_id="INITIAL_STATE",
-                    failed_predicate=key,
-                    blocker_reasons=blocker_reasons,
-                    intermediate_states=[copy.deepcopy(current_state)],
-                )
+                reason = f"Initial state conflict / contradiction for fact '{key}'"
+                if reason not in blocker_reasons:
+                    blocker_reasons.append(reason)
+
+        if blocker_reasons:
+            return PlanValidationResult(
+                status=ValidationStatus.FAIL,
+                failed_step_id="INITIAL_STATE",
+                failed_predicate=blocker_reasons[0].split("'")[1] if "'" in blocker_reasons[0] else None,
+                blocker_reasons=blocker_reasons,
+                intermediate_states=[copy.deepcopy(current_state)],
+            )
 
         intermediate_states: List[Dict[str, WorldFact]] = [copy.deepcopy(current_state)]
 
@@ -282,7 +318,7 @@ class EpistemicCausalValidator:
 
         current_sim_time = now
 
-        # 2. Iterate through each action step
+        # 3. Iterate through each action step
         for idx, action in enumerate(plan_ir.actions):
             step_id = action.action_id
             cap_entry = None
@@ -406,7 +442,7 @@ class EpistemicCausalValidator:
                         if first_unknown_step is None:
                             first_unknown_step = step_id
 
-            # 3. Transition: W_{t+1}
+            # 4. Transition: W_{t+1}
             next_state = copy.deepcopy(current_state)
 
             if not step_unknown:
@@ -556,7 +592,7 @@ class EpistemicCausalValidator:
                     intermediate_states=intermediate_states,
                 )
 
-        # 4. Check Success Criteria on final state W_T
+        # 5. Check Success Criteria on final state W_T
         criteria_satisfied: List[str] = []
         criteria_unmet: List[str] = []
 
@@ -587,7 +623,7 @@ class EpistemicCausalValidator:
                             f"Mandatory success criterion '{crit.criterion_id}' unmet: expected {key} == {crit.condition.expected_truth.value}, got {emp_truth.value}/{proj_truth.value}"
                         )
 
-        # 5. Determine overall verdict
+        # 6. Determine overall verdict
         if blocker_reasons or invariants_violated:
             return PlanValidationResult(
                 status=ValidationStatus.FAIL,

@@ -1143,3 +1143,109 @@ def test_untrusted_evidence_ref_does_not_change_validation_semantics():
     assert r_without.intermediate_states[0]["cache_warmed(redis)"].truth == FactTruth.UNKNOWN
     assert r_with.intermediate_states[0]["cache_warmed(redis)"].truth == FactTruth.UNKNOWN
     assert r_without.status == r_with.status == ValidationStatus.PASS  # (PASS because no actions/criteria, but fact is UNKNOWN)
+
+
+# ---------------------------------------------------------------------------
+# Test 32: Conflicting duplicate trusted observations yield CONFLICT (FAIL)
+# ---------------------------------------------------------------------------
+def test_conflicting_duplicate_trusted_observations_yield_conflict():
+    """Conflicting duplicate facts in observed_world_state (TRUE + FALSE) must merge to CONFLICT and FAIL validation."""
+    validator = EpistemicCausalValidator()
+    f_true = _fact("service_running", ["prod"], FactTruth.VERIFIED_TRUE)
+    f_false = _fact("service_running", ["prod"], FactTruth.VERIFIED_FALSE)
+    plan = PlanIR(
+        plan_id="p32_trusted_conflict",
+        goal_description="Test trusted conflict",
+        initial_state=[f_true],
+        actions=[],
+    )
+    result = validator.validate_plan(plan, observed_world_state=[f_true, f_false])
+    assert result.status == ValidationStatus.FAIL
+    fact = result.intermediate_states[0].get("service_running(prod)")
+    assert fact is not None
+    assert fact.truth == FactTruth.CONFLICT
+    from plan_mode.ir import ProjectedTruth
+    assert fact.projected_truth == ProjectedTruth.CONFLICT
+    assert any("conflict" in b.lower() or "contradict" in b.lower() for b in result.blocker_reasons)
+
+
+# ---------------------------------------------------------------------------
+# Test 33: Duplicate trusted observations with same truth preserve truth
+# ---------------------------------------------------------------------------
+def test_duplicate_trusted_observations_same_truth_preserve_truth():
+    """Duplicate observations with same truth (TRUE + TRUE) must preserve VERIFIED_TRUE."""
+    validator = EpistemicCausalValidator()
+    f1 = _fact("service_running", ["prod"], FactTruth.VERIFIED_TRUE)
+    f2 = _fact("service_running", ["prod"], FactTruth.VERIFIED_TRUE)
+    plan = PlanIR(
+        plan_id="p33_trusted_same_truth",
+        goal_description="Test trusted same truth duplicate",
+        initial_state=[f1],
+        actions=[],
+    )
+    result = validator.validate_plan(plan, observed_world_state=[f1, f2])
+    fact = result.intermediate_states[0].get("service_running(prod)")
+    assert fact is not None
+    assert fact.truth == FactTruth.VERIFIED_TRUE
+    from plan_mode.ir import ProjectedTruth
+    assert fact.projected_truth == ProjectedTruth.SUPPORTED_TRUE
+
+
+# ---------------------------------------------------------------------------
+# Test 34: UNKNOWN and VERIFIED trusted observations merge by lattice
+# ---------------------------------------------------------------------------
+def test_unknown_and_verified_trusted_observations_merge_by_lattice():
+    """UNKNOWN + VERIFIED_TRUE -> VERIFIED_TRUE and VERIFIED_TRUE + UNKNOWN -> VERIFIED_TRUE."""
+    validator = EpistemicCausalValidator()
+    f_unk = _fact("service_running", ["prod"], FactTruth.UNKNOWN)
+    f_true = _fact("service_running", ["prod"], FactTruth.VERIFIED_TRUE)
+    plan = PlanIR(
+        plan_id="p34_lattice_merge",
+        goal_description="Test lattice upgrade",
+        initial_state=[f_true],
+        actions=[],
+    )
+    # UNKNOWN then TRUE
+    r1 = validator.validate_plan(plan, observed_world_state=[f_unk, f_true])
+    assert r1.intermediate_states[0]["service_running(prod)"].truth == FactTruth.VERIFIED_TRUE
+
+    # TRUE then UNKNOWN
+    r2 = validator.validate_plan(plan, observed_world_state=[f_true, f_unk])
+    assert r2.intermediate_states[0]["service_running(prod)"].truth == FactTruth.VERIFIED_TRUE
+
+
+# ---------------------------------------------------------------------------
+# Test 35: Trusted observation merge is order independent
+# ---------------------------------------------------------------------------
+def test_trusted_observation_merge_is_order_independent():
+    """For conflicting observations, reversing the list produces the exact same merged CONFLICT result."""
+    validator = EpistemicCausalValidator()
+    f_true = _fact("flag", ["x"], FactTruth.VERIFIED_TRUE)
+    f_false = _fact("flag", ["x"], FactTruth.VERIFIED_FALSE)
+    plan = PlanIR(plan_id="p35_order_indep", goal_description="Order indep", initial_state=[f_true], actions=[])
+
+    r_forward = validator.validate_plan(plan, observed_world_state=[f_true, f_false])
+    r_reverse = validator.validate_plan(plan, observed_world_state=[f_false, f_true])
+
+    assert r_forward.status == r_reverse.status == ValidationStatus.FAIL
+    assert r_forward.intermediate_states[0]["flag(x)"].truth == r_reverse.intermediate_states[0]["flag(x)"].truth == FactTruth.CONFLICT
+
+
+# ---------------------------------------------------------------------------
+# Test 36: Trusted snapshot dictionary key mismatch is canonicalized
+# ---------------------------------------------------------------------------
+def test_trusted_snapshot_dict_key_mismatch_is_rejected_or_canonicalized():
+    """Dictionary key mismatch against WorldFact.fact_key must normalize by WorldFact.fact_key without aliasing."""
+    validator = EpistemicCausalValidator()
+    f = _fact("system_ready", ["prod"], FactTruth.VERIFIED_TRUE)
+    dict_input = {"wrong_alias_key": f}
+    plan = PlanIR(
+        plan_id="p36_dict_key_mismatch",
+        goal_description="Test dict key normalization",
+        initial_state=[f],
+        actions=[],
+    )
+    result = validator.validate_plan(plan, observed_world_state=dict_input)
+    assert "wrong_alias_key" not in result.intermediate_states[0]
+    assert "system_ready(prod)" in result.intermediate_states[0]
+    assert result.intermediate_states[0]["system_ready(prod)"].truth == FactTruth.VERIFIED_TRUE
