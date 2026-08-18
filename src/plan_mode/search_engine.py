@@ -296,6 +296,7 @@ async def search(session: dict[str, Any] | str, *,
                  root_plan: str | None = None,
                  cwd: str | Path | None = None,
                  checkpoint_before: bool = False,
+                 execution_feedback: list[dict[str, Any]] | None = None,
                  plans_dir: str | Path | None = None) -> dict[str, Any]:
     """Run a search over plan space and return the best plan found.
 
@@ -374,7 +375,7 @@ async def search(session: dict[str, Any] | str, *,
     t0 = time.time()
 
     if mode in ("ast", "evolutionary"):
-        from .ast_search import ASTSearchEngine, PlanParser
+        from .ast_search import ASTSearchEngine, PlanParser, apply_execution_feedback
         from . import ground_check
         gc = ground_check(root_plan, cwd=cwd or Path.cwd())
         initial_state = set(gc.get("verified", []))
@@ -382,6 +383,10 @@ async def search(session: dict[str, Any] | str, *,
         root_ast = PlanParser.parse_plan(root_plan, objective=s.get("objective", ""))
         root_member = engine.evaluate_ast(root_ast, lambda pt: _rollout(pt, rubric)["score"], source_plan_text=root_plan)
         engine.population = [root_member]
+        if execution_feedback:
+            repaired_ast = apply_execution_feedback(root_ast, execution_feedback)
+            repaired_member = engine.evaluate_ast(repaired_ast, lambda pt: _rollout(pt, rubric)["score"], source_plan_text=root_plan)
+            engine.population.append(repaired_member)
 
         for iter_idx in range(iterations):
             evolved = engine.evolve_step(population_size=max(2, width), rubric_score_fn=lambda pt: _rollout(pt, rubric)["score"])

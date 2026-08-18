@@ -585,8 +585,11 @@ angle$ asserting that step $a_i$ achieves condition $p$ consumed by step $a_j$.
 - **Aligned Session Checkpoints**: `checkpoint()` stores a deep session snapshot; `rewind()` restores rounds, search tree, execution log, and world state with a rewind-log entry (AgentRewind 2608.14380).
 - **Search Checkpoints**: `search(..., checkpoint_before=True)` records a recoverable checkpoint before expansion begins.
 
-### 6. Execution Contracts & Anti-Stub Verification
+### 6. Execution Contracts, Traces & Anti-Stub Verification
 - **`## Execution Contract` JSON**: every implementation plan can declare `probe`, `verification_commands`, `expected_artifacts`, `workspace_invariants`, `parity_checks`, and `symbols`.
 - **Minimal Probe**: `probe_contract()` runs the spike before full implementation; `assess(..., run_probe=True)` emits `mech:probe:*` critiques on failure.
 - **Symbol Registry**: `symbol_audit()` compares declared functions/variables against real source files and flags missing declarations plus undeclared helpers — the classic stub loophole.
 - **Gate Integration**: `release(..., require_execution_contract=True)` refuses to release plans without a valid execution contract.
+- **Execution Trace Alignment**: `verify_execution_trace(plan_text, evidence)` matches every declared output and symbol to a real trace and rejects executor/verifier provenance collisions.
+- **Expected-Output Exit Criteria**: `run_exit_criteria(contract, cwd=...)` checks `exit_code`, `must_contain`, `expected_stdout`, and `expected_count`.
+- **Negative Constraints**: `verify_negative_constraints(plan_text, evidence)` checks plan-declared falsifiers against execution evidence.

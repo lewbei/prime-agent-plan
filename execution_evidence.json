@@ -1,0 +1,282 @@
+{
+  "agent_id": "implementation-worker",
+  "verifier_agent_id": "independent-verifier",
+  "tasks": [
+    {
+      "task_id": 1,
+      "status": "done",
+      "files_created": [
+        "src/plan_mode/execution_trace.py"
+      ],
+      "files_modified": [],
+      "symbols": {
+        "src/plan_mode/execution_trace.py": {
+          "functions": [
+            "_as_command_result",
+            "_as_str_list",
+            "_command_matches",
+            "align_task_evidence",
+            "extract_declared_obligations",
+            "parse_execution_evidence",
+            "verify_execution_trace",
+            "verify_negative_constraints"
+          ],
+          "classes": [
+            "CommandResult",
+            "ExecutionEvidence",
+            "TaskExecution"
+          ],
+          "variables": []
+        }
+      },
+      "commands": [],
+      "note": "task 1 complete"
+    },
+    {
+      "task_id": 2,
+      "status": "done",
+      "files_created": [
+        "src/plan_mode/execution_contract.py"
+      ],
+      "files_modified": [],
+      "symbols": {
+        "src/plan_mode/execution_contract.py": {
+          "functions": [
+            "_symbols_from_source",
+            "parity_audit",
+            "parse_execution_contract",
+            "parse_exit_criteria",
+            "probe_contract",
+            "run_command",
+            "run_exit_criteria",
+            "run_verification_commands",
+            "scan_symbols",
+            "symbol_audit",
+            "validate_execution_contract",
+            "validate_exit_criteria"
+          ],
+          "classes": [
+            "ExecutionContract"
+          ],
+          "variables": []
+        }
+      },
+      "commands": [],
+      "note": "task 2 complete"
+    },
+    {
+      "task_id": 3,
+      "status": "done",
+      "files_created": [
+        "src/plan_mode/ast_search.py"
+      ],
+      "files_modified": [],
+      "symbols": {
+        "src/plan_mode/ast_search.py": {
+          "functions": [
+            "apply_execution_feedback",
+            "ast_distance",
+            "crossover_ast",
+            "mutate_exploratory",
+            "mutate_flaw_directed"
+          ],
+          "classes": [
+            "ASTSearchEngine",
+            "PopulationMember"
+          ],
+          "variables": []
+        }
+      },
+      "commands": [],
+      "note": "task 3 complete"
+    },
+    {
+      "task_id": 4,
+      "status": "done",
+      "files_created": [
+        "src/plan_mode/search_engine.py"
+      ],
+      "files_modified": [],
+      "symbols": {},
+      "commands": [],
+      "note": "task 4 complete"
+    },
+    {
+      "task_id": 5,
+      "status": "done",
+      "files_created": [
+        "src/plan_mode/__init__.py"
+      ],
+      "files_modified": [],
+      "symbols": {
+        "src/plan_mode/__init__.py": {
+          "functions": [
+            "_all_check_ids",
+            "_auth_key",
+            "_journal",
+            "_load_rubric",
+            "_load_session",
+            "_mechanical_checks",
+            "_now",
+            "_save_session",
+            "_score",
+            "_search_state",
+            "_session_path",
+            "_slugify",
+            "_task_blocks",
+            "_version_tuple",
+            "assess",
+            "assess_candidates",
+            "best",
+            "checkpoint",
+            "committed",
+            "constraint_check",
+            "create_subagent_context",
+            "deps_check",
+            "edit_file",
+            "execute_plan",
+            "execute_plan_sync",
+            "finish",
+            "fold_history",
+            "ground_check",
+            "history",
+            "judge",
+            "judge_ensemble",
+            "list_sessions",
+            "log_progress",
+            "plan_dag",
+            "plan_quality",
+            "provide_tool",
+            "record_judge",
+            "release",
+            "rewind",
+            "rollback",
+            "rubric",
+            "run",
+            "search",
+            "search_backtrack",
+            "search_expand",
+            "search_report",
+            "search_select",
+            "selfcheck",
+            "session_lock",
+            "simulate",
+            "speculative_rollout",
+            "speculative_rollout_async",
+            "start",
+            "status",
+            "suggest",
+            "template",
+            "verify",
+            "verify_negative_constraints"
+          ],
+          "classes": [],
+          "variables": [
+            "DEFAULT_MAX_ROUNDS",
+            "DEFAULT_PLANS_DIR",
+            "DEFAULT_RUBRIC",
+            "JOURNAL_PATH",
+            "MAX_PLATEAU_ROUNDS",
+            "MIN_DELTA_TO_CONTINUE",
+            "REPO_ROOT",
+            "RUBRIC_PATH",
+            "_CHECKPOINT_FIELDS",
+            "_REENTRANT_LOCKS",
+            "_REENTRANT_MUTEX",
+            "_SESSION_LOCK",
+            "__all__",
+            "__version__"
+          ]
+        }
+      },
+      "commands": [],
+      "note": "task 5 complete"
+    },
+    {
+      "task_id": 6,
+      "status": "done",
+      "files_created": [
+        "tests/test_execution_trace.py"
+      ],
+      "files_modified": [],
+      "symbols": {},
+      "commands": [],
+      "note": "task 6 complete"
+    },
+    {
+      "task_id": 7,
+      "status": "done",
+      "files_created": [
+        "SKILL.md"
+      ],
+      "files_modified": [],
+      "symbols": {},
+      "commands": [],
+      "note": "task 7 complete"
+    },
+    {
+      "task_id": 8,
+      "status": "done",
+      "files_created": [
+        "README.md"
+      ],
+      "files_modified": [],
+      "symbols": {},
+      "commands": [],
+      "note": "task 8 complete"
+    },
+    {
+      "task_id": 9,
+      "status": "done",
+      "files_created": [
+        "execution_evidence.json"
+      ],
+      "files_modified": [],
+      "symbols": {},
+      "commands": [
+        {
+          "command": [
+            "python",
+            "-m",
+            "pytest",
+            "-q"
+          ],
+          "exit_code": 0,
+          "stdout": "136 passed in 1.68s",
+          "stderr": ""
+        },
+        {
+          "command": [
+            "python",
+            "-m",
+            "pytest",
+            "-q"
+          ],
+          "exit_code": 0,
+          "stdout": "133 passed, 3 skipped in 1.41s",
+          "stderr": "",
+          "env": {
+            "PLANNING_CORPUS": "/nonexistent"
+          }
+        },
+        {
+          "command": [
+            "python",
+            "-c",
+            "import plan_mode; assert plan_mode.selfcheck(run_pytest=False)['ok']"
+          ],
+          "exit_code": 0,
+          "stdout": "selfcheck ok",
+          "stderr": ""
+        }
+      ],
+      "note": "task 9 complete"
+    }
+  ],
+  "reports": [
+    {
+      "claim": "green",
+      "author": "independent-verifier"
+    }
+  ]
+}

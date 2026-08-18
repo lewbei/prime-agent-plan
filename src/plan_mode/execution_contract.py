@@ -44,6 +44,7 @@ class ExecutionContract:
     workspace_invariants: list[str] = field(default_factory=list)
     parity_checks: list[dict[str, str]] = field(default_factory=list)
     symbols: dict[str, dict[str, list[str]]] = field(default_factory=dict)
+    exit_criteria: list[dict[str, Any]] = field(default_factory=list)
     raw: dict[str, Any] = field(default_factory=dict)
 
 
@@ -101,6 +102,9 @@ def parse_execution_contract(plan_text: str) -> tuple[Optional[ExecutionContract
     raw_symbols = data.get("symbols")
     symbols = {str(k): (v if isinstance(v, dict) else {}) for k, v in raw_symbols.items()} if isinstance(raw_symbols, dict) else {}
 
+    raw_exit = data.get("exit_criteria")
+    exit_criteria = [c for c in raw_exit if isinstance(c, dict)] if isinstance(raw_exit, list) else []
+
     contract = ExecutionContract(
         probe=probe,
         verification_commands=verification_commands,
@@ -108,6 +112,7 @@ def parse_execution_contract(plan_text: str) -> tuple[Optional[ExecutionContract
         workspace_invariants=workspace_invariants,
         parity_checks=parity_checks,
         symbols=symbols,
+        exit_criteria=exit_criteria,
         raw=data,
     )
     return contract, errors
@@ -282,6 +287,64 @@ def symbol_audit(plan_text: str, *, cwd: str | Path | None = None) -> dict[str, 
         if undeclared_vars:
             errors.append(f"{path}: undeclared variables not listed in contract: {undeclared_vars}")
     return {"ok": not errors, "errors": errors, "files": files, "contract": contract}
+
+
+def parse_exit_criteria(plan_text: str) -> tuple[list[dict[str, Any]], list[str]]:
+    contract, errors = parse_execution_contract(plan_text)
+    if contract is None:
+        return [], errors or ["execution contract missing"]
+    return contract.exit_criteria, []
+
+
+def validate_exit_criteria(plan_text: str) -> dict[str, Any]:
+    criteria, errors = parse_exit_criteria(plan_text)
+    if errors:
+        return {"ok": False, "errors": errors, "criteria": []}
+    problems: list[str] = []
+    for c in criteria:
+        cmd = c.get("command")
+        if not isinstance(cmd, list) or not cmd or not isinstance(cmd[0], str):
+            problems.append(f"invalid exit criterion command: {cmd!r}")
+        if c.get("must_contain") is not None and not isinstance(c.get("must_contain"), list):
+            problems.append("must_contain must be a list of strings")
+        if c.get("expected_count") is not None and not isinstance(c.get("expected_count"), int):
+            problems.append("expected_count must be an integer")
+    return {"ok": not problems, "errors": problems, "criteria": criteria}
+
+
+def run_exit_criteria(contract: ExecutionContract, *, cwd: str | Path | None = None,
+                      timeout: float = 60.0) -> dict[str, Any]:
+    """Run structured exit criteria and check stdout, not only exit code."""
+    results: list[dict[str, Any]] = []
+    errors: list[str] = []
+    for criterion in contract.exit_criteria:
+        cmd = criterion.get("command")
+        if not isinstance(cmd, list) or not cmd:
+            errors.append(f"invalid criterion: {criterion!r}")
+            results.append({"criterion": criterion, "ok": False})
+            continue
+        run = run_command(cmd, cwd=cwd, timeout=timeout)
+        criterion_errors: list[str] = []
+        if run.get("ok") is False:
+            criterion_errors.append(f"exit_code={run.get('exit_code')}, stderr={run.get('stderr')[:160]}")
+        stdout = run.get("stdout") or ""
+        for needle in (criterion.get("must_contain") or []):
+            if str(needle) not in stdout:
+                criterion_errors.append(f"stdout missing {needle!r}")
+        if criterion.get("expected_stdout") is not None and stdout.strip() != str(criterion["expected_stdout"]).strip():
+            criterion_errors.append(f"stdout mismatch: {stdout[:80]!r}")
+        expected_count = criterion.get("expected_count")
+        if isinstance(expected_count, int):
+            import re as _re
+            if len(_re.findall(r"\d+(?:\.\d+)?", stdout)) < expected_count:
+                criterion_errors.append(f"fewer than {expected_count} numeric outputs")
+        ok = not criterion_errors
+        if not ok:
+            errors.append(f"criterion {cmd!r} failed: {'; '.join(criterion_errors)}")
+        results.append({"criterion": criterion, "run": run, "ok": ok,
+                        "errors": criterion_errors})
+    return {"ok": not errors, "errors": errors, "results": results,
+            "total": len(results), "passed": sum(bool(r["ok"]) for r in results)}
 
 
 def run_verification_commands(contract: ExecutionContract, *, cwd: str | Path | None = None,

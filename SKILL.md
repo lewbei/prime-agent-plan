@@ -87,6 +87,20 @@ Every implementation plan must also contain an `## Execution Contract`. The plan
 ```
 ```
 
+### 2b. Execution Evidence & Negative Constraints
+After implementation, the executor writes an `## Execution Evidence` JSON trace with real command outputs. The verifier must be a different agent and independently check:
+- `plan.verify_execution_trace(plan_text, evidence)`
+- `plan.verify_negative_constraints(plan_text, evidence)`
+- `plan.run_exit_criteria(contract, cwd=repo)`
+- `plan.symbol_audit(plan_text, cwd=repo)`
+
+A plan may also declare falsifiers:
+```markdown
+## Negative Constraints
+- NF-1: declared output exists but symbol audit fails.
+- NF-2: command exits 0 but stdout lacks `must_contain`.
+```
+
 ### 3. Assess Draft and Probe Feasibility
 ```python
 res = plan.assess(s, draft_plan_text, note="Initial draft",
@@ -163,6 +177,9 @@ results = await plan.execute_plan(best_plan_text, task_handlers={1: run_task1})
 | `plan.validate_execution_contract(plan_text, cwd=None)` | Parse and statically validate the `## Execution Contract` JSON block. |
 | `plan.probe_contract(plan_text, cwd=None)` | Run the minimal feasibility spike; failed probes force plan revision. |
 | `plan.symbol_audit(plan_text, cwd=None)` | Compare declared functions/variables against actual source files to catch stubs and undeclared helpers. |
+| `plan.run_exit_criteria(contract, cwd=None)` | Run structured exit criteria; checks stdout/must_contain/expected_count, not only exit code. |
+| `plan.verify_execution_trace(plan_text, evidence)` | Align plan obligations with real execution evidence; rejects stubs and missing symbols. |
+| `plan.verify_negative_constraints(plan_text, evidence)` | Check declared falsifiers against execution evidence. |
 | `plan.checkpoint(session, note=None)` / `plan.rewind(session, checkpoint_id=None)` | AgentRewind-style aligned session checkpoints and rollback. |
 | `plan.release(session, min_score=90.0, require_judge=True)` | Confidence-gated checkpoint release validation; successful release commits `best` -> `committed`. |
 | `plan.finish(session, require_release=True, min_score=90.0)` | Complete session after verifying release gate. |

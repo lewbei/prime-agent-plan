@@ -52,11 +52,23 @@ from .execution_contract import (
     ExecutionContract,
     parity_audit,
     parse_execution_contract,
+    parse_exit_criteria,
     probe_contract,
+    run_exit_criteria,
     run_verification_commands,
     scan_symbols,
     symbol_audit,
     validate_execution_contract,
+    validate_exit_criteria,
+)
+from .execution_trace import (
+    CommandResult,
+    ExecutionEvidence,
+    TaskExecution,
+    align_task_evidence,
+    extract_declared_obligations,
+    parse_execution_evidence,
+    verify_execution_trace,
 )
 
 import asyncio
@@ -318,6 +330,17 @@ def _save_session(plans_dir: Path, session: dict[str, Any]) -> None:
         os.replace(tmp_path, p)
 
 
+def verify_negative_constraints(plan_text: str,
+                                evidence: str | dict[str, Any] | None = None) -> dict[str, Any]:
+    """Check plan-declared falsifiers against execution evidence.
+
+    Kept as a thin public wrapper so the symbol registry sees a top-level
+    function in plan_mode rather than an import alias.
+    """
+    from .execution_trace import verify_negative_constraints as _verify_nc
+    return _verify_nc(plan_text, evidence)
+
+
 async def judge_ensemble(session: dict[str, Any] | str, plan_text: str, objective: str,
                         n: int = 3, *, plans_dir: str | Path | None = None) -> dict[str, Any]:
     """Ensemble judgment (2510.03469, 2601.17942): collect up to n verdicts
@@ -577,7 +600,9 @@ def start(objective: str, *, plans_dir: str | Path | None = None, max_rounds: in
 def assess(session: dict[str, Any] | str, plan_text: str, *, note: str | None = None,
            addressed: list[str] | None = None, plans_dir: str | Path | None = None,
            require_execution_contract: bool = False,
-           run_probe: bool = False, probe_cwd: str | Path | None = None) -> dict[str, Any]:
+           run_probe: bool = False, probe_cwd: str | Path | None = None,
+           execution_evidence: str | dict[str, Any] | None = None,
+           require_execution_evidence: bool = False) -> dict[str, Any]:
     """Score a plan version, record it, and return critiques + loop status.
 
     session may be the session dict (from start) or a session_id string.
@@ -652,6 +677,14 @@ def assess(session: dict[str, Any] | str, plan_text: str, *, note: str | None = 
                 for err in probe.get("errors", []) or [probe.get("message") or "probe failed"]:
                     result["critiques"].append({"id": f"mech:probe:{err[:40]}",
                                                 "section": "mechanical", "hint": f"[feasibility probe] {err}"})
+        if execution_evidence is not None or require_execution_evidence:
+            trace = verify_execution_trace(plan_text, execution_evidence, cwd=probe_cwd or Path.cwd())
+            result["execution_trace"] = trace
+            if not trace.get("ok"):
+                for err in trace.get("errors", []):
+                    result["critiques"].append({"id": f"mech:trace:{err[:40]}",
+                                                "section": "mechanical",
+                                                "hint": f"[execution trace] {err}"})
         # RoT memory (2404.05449): distill negative rules from causal flaws and
         # enforce them on subsequent candidate plans for this session.
         rot_path = Path(plans_dir) / f"{session['session_id']}.rot.json"
@@ -776,7 +809,8 @@ def assess(session: dict[str, Any] | str, plan_text: str, *, note: str | None = 
                     "critiques": result["critiques"], "status": "converged",
                     "continue": False, "verify": result.get("verify"),
                     "simulation": result.get("simulation"), "rot_rules": result.get("rot_rules"),
-                "execution_contract": result.get("execution_contract"), "probe": result.get("probe")}
+                "execution_contract": result.get("execution_contract"), "probe": result.get("probe"),
+                "execution_trace": result.get("execution_trace")}
         # convergence rule: score must keep improving; allow MAX_PLATEAU_ROUNDS
         # non-improving rounds in a row before declaring convergence.
         recent = [r["score"] for r in session["rounds"]]
@@ -793,7 +827,8 @@ def assess(session: dict[str, Any] | str, plan_text: str, *, note: str | None = 
                     "critiques": result["critiques"], "status": "improving",
                     "continue": True, "verify": result.get("verify"),
                     "simulation": result.get("simulation"), "rot_rules": result.get("rot_rules"),
-                "execution_contract": result.get("execution_contract"), "probe": result.get("probe")}
+                "execution_contract": result.get("execution_contract"), "probe": result.get("probe"),
+                "execution_trace": result.get("execution_trace")}
         if plateau >= MAX_PLATEAU_ROUNDS and version >= 2:
             if len(_task_blocks(plan_text)) <= 3:
                 result["critiques"].append({"id": "hint:over-refinement",
@@ -807,13 +842,15 @@ def assess(session: dict[str, Any] | str, plan_text: str, *, note: str | None = 
                     "critiques": result["critiques"], "status": "converged",
                     "continue": False, "verify": result.get("verify"),
                     "simulation": result.get("simulation"), "rot_rules": result.get("rot_rules"),
-                "execution_contract": result.get("execution_contract"), "probe": result.get("probe")}
+                "execution_contract": result.get("execution_contract"), "probe": result.get("probe"),
+                "execution_trace": result.get("execution_trace")}
         _save_session(plans_dir, session)
         return {"version": version, "score": result["score"], "delta": delta,
                 "critiques": result["critiques"], "status": session["status"],
                 "continue": True, "verify": result.get("verify"),
                 "simulation": result.get("simulation"), "rot_rules": result.get("rot_rules"),
-                "execution_contract": result.get("execution_contract"), "probe": result.get("probe")}
+                "execution_contract": result.get("execution_contract"), "probe": result.get("probe"),
+                "execution_trace": result.get("execution_trace")}
 
 
 def run(objective: str, draft_plan: str, *, plans_dir: str | Path | None = None,
@@ -964,6 +1001,8 @@ def release(session: dict[str, Any] | str, *, min_score: float = 90.0,
             require_external_judge: bool = False,
             require_execution_contract: bool = False,
             execution_cwd: str | Path | None = None,
+            execution_evidence: str | dict[str, Any] | None = None,
+            require_execution_evidence: bool = False,
             plans_dir: str | Path | None = None) -> dict[str, Any]:
     """Release gate (2602.08948 confidence-gated checkpoints, 2608.10729
     acceptance thresholds): a plan may only be released to execution after
@@ -1048,6 +1087,15 @@ def release(session: dict[str, Any] | str, *, min_score: float = 90.0,
         if not contract_ok:
             problems.extend(ec.get("errors", []))
 
+        trace = verify_execution_trace(best_text, execution_evidence, cwd=execution_cwd or Path.cwd()) \
+            if (execution_evidence is not None or require_execution_evidence) and best_text \
+            else {"ok": True, "errors": [], "warnings": [], "evidence": None, "alignment": None, "exit_criteria": None}
+        trace_ok = bool(trace["ok"]) if require_execution_evidence else not bool(trace.get("errors"))
+        checks.append({"name": "execution_trace", "ok": trace_ok,
+                       "detail": str(trace.get("errors", []))[:120]})
+        if not trace_ok:
+            problems.extend(trace.get("errors", []))
+
         judge_ok = False
         judge_detail = "no judge verdict recorded"
         judges = s.get("judge_log", [])
@@ -1090,7 +1138,9 @@ def finish(session: dict[str, Any] | str, *, verdict: str = "converged",
            min_score: float = 90.0, require_judge: bool = True,
            require_external_judge: bool = False,
            require_execution_contract: bool = False,
-           execution_cwd: str | Path | None = None) -> dict[str, Any]:
+           execution_cwd: str | Path | None = None,
+           execution_evidence: str | dict[str, Any] | None = None,
+           require_execution_evidence: bool = False) -> dict[str, Any]:
     """Mark the session complete with full session locking across release validation."""
     plans_dir = Path(plans_dir) if plans_dir else (Path(session.get("plans_dir")) if isinstance(session, dict) and session.get("plans_dir") else DEFAULT_PLANS_DIR)
     sid = session if isinstance(session, str) else session.get("session_id", "default")
@@ -1105,7 +1155,10 @@ def finish(session: dict[str, Any] | str, *, verdict: str = "converged",
             gate = release(s, min_score=min_score, require_judge=require_judge,
                            require_external_judge=require_external_judge,
                            require_execution_contract=require_execution_contract,
-                           execution_cwd=execution_cwd, plans_dir=plans_dir)
+                           execution_cwd=execution_cwd,
+                           execution_evidence=execution_evidence,
+                           require_execution_evidence=require_execution_evidence,
+                           plans_dir=plans_dir)
             if not gate["ok"]:
                 raise RuntimeError("release gate failed: " + "; ".join(gate["problems"]))
         s["status"] = "finished"
@@ -2090,8 +2143,12 @@ __all__ = [
     "create_subagent_context", "provide_tool", "execute_plan", "execute_plan_sync",
     "speculative_rollout", "speculative_rollout_async", "session_lock",
     "ExecutionContract", "parse_execution_contract", "validate_execution_contract",
+    "parse_exit_criteria", "validate_exit_criteria", "run_exit_criteria",
     "probe_contract", "symbol_audit", "scan_symbols", "parity_audit",
     "run_verification_commands",
+    "ExecutionEvidence", "TaskExecution", "CommandResult",
+    "parse_execution_evidence", "extract_declared_obligations",
+    "align_task_evidence", "verify_execution_trace", "verify_negative_constraints",
     "RoTRuleBase", "RoTRule", "ReplanningLadder", "ContextBudgeter",
     "mutate_flaw_directed", "mutate_exploratory", "crossover_ast", "ast_distance",
     "PopulationMember", "ASTSearchEngine", "Proposition", "PlanParser", "PlanAST",

@@ -142,6 +142,38 @@ def mutate_flaw_directed(ast: PlanAST, validation_result: dict[str, Any]) -> Pla
     return mutated
 
 
+def apply_execution_feedback(ast: PlanAST, feedback: list[dict[str, Any]]) -> PlanAST:
+    """Apply execution feedback to the failing task subgraph only.
+
+    Feedback entries have `task_id` and at least one of:
+    - missing_outputs: files the task was supposed to produce
+    - missing_symbols: symbols the implementation did not provide
+    - detail: human-readable command/stdout mismatch
+
+    The mutation is deliberately local: only the failing action is touched.
+    """
+    mutated = copy.deepcopy(ast)
+    for item in feedback or []:
+        task_id = int(item.get("task_id") or item.get("task") or 0)
+        action = mutated.get_action(task_id)
+        if action is None:
+            continue
+        action.parameters["execution_feedback"] = item
+        for out in (item.get("missing_outputs") or []):
+            if out not in action.outputs:
+                action.outputs.append(str(out))
+        missing_symbols = item.get("missing_symbols") or {}
+        if isinstance(missing_symbols, dict):
+            for path, names in missing_symbols.items():
+                action.parameters.setdefault("repair_symbols", {})[str(path)] = list(names)
+        detail = str(item.get("detail") or "execution feedback").strip()
+        action.name = f"{action.name} [repair: {detail[:60]}]"
+    for i, action in enumerate(mutated.actions, 1):
+        action.id = i
+        action.depends_on = [d for d in action.depends_on if d < i]
+    return mutated
+
+
 def mutate_exploratory(ast: PlanAST) -> PlanAST:
     """Exploratory mutation: adds checkpointing, dependency tightening, or sub-action refinement."""
     mutated = copy.deepcopy(ast)
