@@ -74,6 +74,7 @@ class CapabilityEntry(BaseModel):
     positive_effects: List[PredicateCondition] = Field(default_factory=list)
     negative_effects: List[PredicateCondition] = Field(default_factory=list)
     verifiers: List[ObservationVerifier] = Field(default_factory=list)
+    executor_command_template: List[str] = Field(default_factory=list)
     default_compensation: Optional[CompensationAction] = None
 
     def compute_capability_hash(self) -> str:
@@ -106,6 +107,7 @@ class CapabilityEntry(BaseModel):
                 }
                 for v in self.verifiers
             ],
+            "executor_command_template": self.executor_command_template,
         }
         serialized = json.dumps(data, sort_keys=True)
         return hashlib.sha256(serialized.encode("utf-8")).hexdigest()

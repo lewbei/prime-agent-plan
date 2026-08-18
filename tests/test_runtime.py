@@ -101,6 +101,7 @@ def test_execution_plan_manager_success():
                     expected_output_pattern=r"hello_run",
                 )
             ],
+            executor_command_template=["echo", "{text}"],
         )
     )
 

@@ -3,7 +3,13 @@
 from plan_mode.runtime.ledger import EvidenceLedger, LedgerEventType, LedgerRecord, LedgerTamperError
 from plan_mode.runtime.secret_scrubber import SecretScrubber
 from plan_mode.runtime.sandbox import ExecutionSandbox, SandboxExecutionResult
-from plan_mode.runtime.executor import ExecutionPlanManager, WitnessStatus, ExecutionSummary
+from plan_mode.runtime.executor import (
+    ExecutionPlanManager,
+    WitnessStatus,
+    ExecutionSummary,
+    PreconditionFailedError,
+    ExecutionContractMissingError,
+)
 
 __all__ = [
     "EvidenceLedger",
@@ -16,4 +22,6 @@ __all__ = [
     "ExecutionPlanManager",
     "WitnessStatus",
     "ExecutionSummary",
+    "PreconditionFailedError",
+    "ExecutionContractMissingError",
 ]
