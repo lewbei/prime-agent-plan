@@ -52,13 +52,63 @@ def test_checkpoint_and_rewind_restore_rounds(tmp_path):
 
 @pytest.mark.asyncio
 async def test_search_can_take_pre_expansion_checkpoint(tmp_path):
-    s = plan_mode.start("search checkpoint", plans_dir=tmp_path)
-    plan_mode.assess(s, _valid_plan(), plans_dir=tmp_path)
-    before = len(s["rounds"])
-    await plan_mode.search(s, iterations=1, width=1, mode="beam", expansion="rules",
-                           checkpoint_before=True, plans_dir=tmp_path)
-    assert len(s.get("checkpoints", [])) == 1
-    assert len(s["rounds"]) >= before  # rounds preserved and search completes cleanly
+    """Verify that search takes and records a structured checkpoint before expansion."""
+    session = plan_mode.start("search checkpoint", plans_dir=tmp_path)
+    plan_mode.assess(session, _valid_plan(), plans_dir=tmp_path)
+    before_rounds = len(session["rounds"])
+
+    result = await plan_mode.search(
+        session,
+        iterations=1,
+        width=1,
+        mode="beam",
+        expansion="rules",
+        checkpoint_before=True,
+        plans_dir=tmp_path,
+    )
+
+    assert len(session.get("checkpoints", [])) == 1
+    assert session["checkpoints"][0]["note"].startswith("search:")
+    assert len(session["rounds"]) >= before_rounds
+    assert result is not None
+    assert "best_plan" in result
+
+
+@pytest.mark.asyncio
+async def test_search_commits_a_deterministically_improved_candidate(tmp_path):
+    """Verify that when search finds an improved candidate, it automatically commits a new round."""
+    def _incomplete_seed_plan():
+        return (
+            "# Objective: Deploy service\n"
+            "We will deploy service. Out of scope: non-goals.\n\n"
+            "## Tasks\n"
+            "1. Step A\n"
+            "   Output: a.txt\n"
+            "2. Step B\n"
+            "   Depends on 1\n"
+            "   Inputs: a.txt\n"
+            "   Output: b.txt\n"
+        )
+
+    session = plan_mode.start("deterministic improvement", plans_dir=tmp_path)
+    plan_mode.assess(session, _incomplete_seed_plan(), plans_dir=tmp_path)
+    before_rounds = len(session["rounds"])
+    before_best_score = session["best_score"]
+
+    result = await plan_mode.search(
+        session,
+        iterations=2,
+        width=4,
+        mode="beam",
+        expansion="rules",
+        checkpoint_before=False,
+        plans_dir=tmp_path,
+    )
+
+    assert result is not None
+    assert len(session["rounds"]) == before_rounds + 1
+    assert session["best_score"] > before_best_score
+    assert session["rounds"][-1]["plan_text"] == result["best_plan"]
 
 
 def test_rot_experience_tree_perspective_and_outcomes(tmp_path):
