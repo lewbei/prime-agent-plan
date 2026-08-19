@@ -146,12 +146,15 @@ class ExecutionPlanManager:
         ledger: EvidenceLedger,
         sandbox: Optional[ExecutionSandbox] = None,
         observed_world_state: Optional[List[WorldFact] | Dict[str, WorldFact]] = None,
+        policy_hash: Optional[str] = None,
     ):
         self.session = session
         self.registry = registry
         self.ledger = ledger
         self.sandbox = sandbox or ExecutionSandbox()
-        self.live_world_state: Dict[str, WorldFact] = normalize_trusted_snapshot(observed_world_state)
+        self.policy_hash = policy_hash or (session.authorized_policy_hash if hasattr(session, "authorized_policy_hash") else None)
+        self._has_trusted_snapshot = (observed_world_state is not None)
+        self.live_world_state: Dict[str, WorldFact] = normalize_trusted_snapshot(observed_world_state) if self._has_trusted_snapshot else {}
 
     def execute_authorized_plan(
         self,
@@ -203,14 +206,20 @@ class ExecutionPlanManager:
             )
 
         # F. Policy Hash Preflight Check
-        if hasattr(self.session, "authorized_policy_hash") and self.session.authorized_policy_hash:
-            if certificate.policy_hash != self.session.authorized_policy_hash:
-                raise StateDriftError(
-                    f"Policy drift detected: certificate policy hash '{certificate.policy_hash}' != session policy hash '{self.session.authorized_policy_hash}'."
-                )
+        current_policy = self.policy_hash or self.session.authorized_policy_hash or certificate.policy_hash
+        if certificate.policy_hash != current_policy or (self.session.authorized_policy_hash and self.session.authorized_policy_hash != current_policy):
+            raise StateDriftError(
+                f"Policy drift detected: certificate policy hash '{certificate.policy_hash}' != runtime policy '{current_policy}'."
+            )
 
-        # G. Live World State Hash Check
-        if certificate.world_state_hash and self.live_world_state:
+        # G. Live World State Hash Check (Distinguish None from empty list)
+        if not self._has_trusted_snapshot:
+            empty_hash = compute_world_state_hash([])
+            if certificate.world_state_hash != empty_hash:
+                raise StateDriftError(
+                    f"Live world state drift detected: certificate requires authorized world hash '{certificate.world_state_hash}', but no trusted snapshot was supplied to runtime."
+                )
+        else:
             current_live_ws_hash = compute_world_state_hash(list(self.live_world_state.values()))
             if current_live_ws_hash != certificate.world_state_hash:
                 raise StateDriftError(
@@ -333,10 +342,13 @@ class ExecutionPlanManager:
                 )
 
             # 4. Execute Capability Action
+            cmd = _resolve_template_tokens(cap.executor_command_template, action.parameters)
             if custom_action_handler is not None:
-                exec_res = custom_action_handler(action, action.parameters)
+                try:
+                    exec_res = custom_action_handler(cmd, action, action.parameters)
+                except TypeError:
+                    exec_res = custom_action_handler(action, action.parameters)
             else:
-                cmd = _resolve_template_tokens(cap.executor_command_template, action.parameters)
                 exec_res = self.sandbox.execute_argv_pipeline([cmd], timeout_seconds=action.timeout_seconds)
 
             self.ledger.append_record(

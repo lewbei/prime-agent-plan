@@ -92,6 +92,8 @@ class PlanVersion(BaseModel, frozen=True):
     plan_ir: PlanIR
     validation_result: Optional[PlanValidationResult] = None
     plan_hash: str
+    validation_world_state: Optional[List[WorldFact]] = None
+    validation_world_state_hash: Optional[str] = None
     created_at: float = Field(default_factory=time.time)
 
 
@@ -168,6 +170,7 @@ class PlanningSession(BaseModel):
     committed_version: Optional[int] = None
     
     authorization_certificate: Optional[AuthorizationCertificate] = None
+    authorized_policy_hash: Optional[str] = None
     secret_key: bytes = Field(default_factory=lambda: secrets.token_bytes(32))
 
     def transition_to(self, target_state: SessionState) -> None:
@@ -203,10 +206,10 @@ class PlanningSession(BaseModel):
         version_number: int,
         registry: CapabilityRegistry,
         validator: Optional[CausalValidator] = None,
-        current_time: Optional[float] = None,
         observed_world_state: Optional[List[WorldFact] | Dict[str, WorldFact]] = None,
+        current_time: Optional[float] = None,
     ) -> PlanValidationResult:
-        """Validate candidate plan version with CausalValidator."""
+        """Validate candidate plan version with CausalValidator and store trusted validation snapshot."""
         if version_number not in self.versions:
             raise VersionNotFoundError(f"Version {version_number} not found.")
 
@@ -222,11 +225,20 @@ class PlanningSession(BaseModel):
             current_time=current_time,
         )
 
+        trusted_list = (
+            list(observed_world_state.values())
+            if isinstance(observed_world_state, dict)
+            else (observed_world_state if observed_world_state is not None else None)
+        )
+        ws_hash = compute_world_state_hash(trusted_list) if trusted_list is not None else compute_world_state_hash([])
+
         updated_version = PlanVersion(
             version_number=v_obj.version_number,
             plan_ir=v_obj.plan_ir,
             validation_result=result,
             plan_hash=v_obj.plan_hash,
+            validation_world_state=trusted_list,
+            validation_world_state_hash=ws_hash,
             created_at=v_obj.created_at,
         )
         self.versions[version_number] = updated_version
@@ -260,7 +272,7 @@ class PlanningSession(BaseModel):
         policy_hash: str,
         ttl_seconds: float = 60.0,
     ) -> AuthorizationCertificate:
-        """Issue cryptographic HMAC authorization certificate for selected plan."""
+        """Issue cryptographic HMAC authorization certificate bound strictly to trusted validation world state."""
         if self.current_state != SessionState.SELECTED:
             raise InvalidStateTransitionError(
                 f"Cannot authorize when in state '{self.current_state.value}' (expected SELECTED)."
@@ -269,9 +281,11 @@ class PlanningSession(BaseModel):
         assert self.best_candidate_version is not None
         v_obj = self.versions[self.best_candidate_version]
 
+        trusted_facts = v_obj.validation_world_state if v_obj.validation_world_state is not None else []
+
         cert = AuthorizationCertificate.create(
             plan_ir=v_obj.plan_ir,
-            world_facts=v_obj.plan_ir.initial_state,
+            world_facts=trusted_facts,
             registry=registry,
             policy_hash=policy_hash,
             secret_key=self.secret_key,
@@ -279,6 +293,7 @@ class PlanningSession(BaseModel):
         )
         self.authorization_certificate = cert
         self.authorized_version = self.best_candidate_version
+        self.authorized_policy_hash = policy_hash
         self.transition_to(SessionState.AUTHORIZED)
         return cert
 
@@ -307,10 +322,16 @@ class PlanningSession(BaseModel):
         if cert.is_expired(current_time):
             raise CertificateExpiredError(f"Certificate {cert.certificate_id} expired at {cert.expires_at}.")
 
-        # 3. State drift check
+        # 3. Policy check
+        if policy_hash != cert.policy_hash or (self.authorized_policy_hash and policy_hash != self.authorized_policy_hash):
+            raise StateDriftError(
+                f"Policy drift detected: policy hash '{policy_hash}' does not match authorized policy '{cert.policy_hash}'."
+            )
+
+        # 4. State drift check
         assert self.authorized_version is not None
         v_obj = self.versions[self.authorized_version]
-        live_facts = current_world_facts if current_world_facts is not None else v_obj.plan_ir.initial_state
+        live_facts = current_world_facts if current_world_facts is not None else (v_obj.validation_world_state if v_obj.validation_world_state is not None else [])
         live_ws_hash = compute_world_state_hash(live_facts)
 
         if live_ws_hash != cert.world_state_hash:
@@ -318,7 +339,7 @@ class PlanningSession(BaseModel):
                 f"World state drift detected! Authorized hash {cert.world_state_hash} != live hash {live_ws_hash}"
             )
 
-        # 4. Registry drift check
+        # 5. Registry drift check
         live_reg_hash = registry.compute_registry_hash()
         if live_reg_hash != cert.registry_hash:
             raise StateDriftError("Capability registry changed since certificate issuance.")

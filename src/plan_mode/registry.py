@@ -103,11 +103,11 @@ class CapabilityEntry(BaseModel):
                 {
                     "id": v.verifier_id,
                     "predicate": v.predicate,
-                    "target_args_mapping": [str(a) for a in v.target_args_mapping],
+                    "target_args_mapping": v.target_args_mapping,
                     "cmd": v.command_template,
                     "expected_output_pattern": v.expected_output_pattern,
                     "json_path": v.json_path,
-                    "expected_value": str(v.expected_value) if v.expected_value is not None else None,
+                    "expected_value": v.expected_value,
                     "timeout_seconds": v.timeout_seconds,
                 }
                 for v in self.verifiers
