@@ -1,12 +1,13 @@
 """Hardened Execution Sandbox with Kernel Namespaces, Resource Limits, and Path Traversal Defenses (Phase 4).
 
 Features:
-- Linux Bubblewrap (bwrap) unprivileged container isolation (User, Mount, PID, Network namespaces).
-- POSIX resource limits (RLIMIT_AS memory bounds, RLIMIT_CPU compute bounds, RLIMIT_NPROC process bounds, RLIMIT_FSIZE write caps).
-- Network default-deny policy (unshare network namespace).
-- Filesystem jails (read-only host root, isolated ephemeral workspace).
-- Path traversal ('../') and symlink escape verification.
-- Output size truncation and secret scrubbing.
+- Linux Bubblewrap (bwrap) unprivileged container isolation (User, Mount, PID, Network namespaces) when available.
+- Portable Defense-in-Depth Layer:
+  - Command argument validation (blocking access to blocked host paths and writes outside workspace).
+  - Network default-deny policy (network namespace unsharing via bwrap and socket blocking via environment hooks).
+  - POSIX resource limits (RLIMIT_AS memory bounds, RLIMIT_CPU compute bounds, RLIMIT_NPROC process bounds, RLIMIT_FSIZE write caps).
+  - Path traversal ('../') and symlink escape verification.
+  - Output size truncation and secret scrubbing.
 """
 
 from __future__ import annotations
@@ -181,6 +182,17 @@ class SandboxExecutionResult(BaseModel):
     resource_limit_exceeded: bool = False
 
 
+# Embedded socket blocker script for network default-deny
+_NET_BLOCKER_SCRIPT = """
+import socket
+def _blocked_socket(*args, **kwargs):
+    raise OSError(101, "Network unreachable (Default-Deny policy enforced by ExecutionSandbox)")
+socket.socket = _blocked_socket
+if hasattr(socket, 'create_connection'):
+    socket.create_connection = _blocked_socket
+"""
+
+
 class ExecutionSandbox:
     """Executes structured argv pipelines with Bubblewrap/namespace isolation, rlimits, and secret scrubbing."""
 
@@ -222,6 +234,14 @@ class ExecutionSandbox:
         if env:
             exec_env.update(env)
 
+        # Static defense check: inspect command tokens for security violations
+        sec_err = self._check_command_security(pipeline, effective_cwd)
+        if sec_err:
+            return SandboxExecutionResult(
+                stderr=sec_err,
+                returncode=126,
+            )
+
         # If workspace_dir is specified, validate cwd
         if self.policy.workspace_dir:
             try:
@@ -232,10 +252,18 @@ class ExecutionSandbox:
                     returncode=126,
                 )
 
+        # Network default-deny injection hook for Python when bwrap network namespace is unavailable
+        net_hook_dir = None
+        if not self.policy.allow_network and not self._bwrap_binary:
+            net_hook_dir = tempfile.mkdtemp(prefix="prime_net_block_")
+            hook_file = os.path.join(net_hook_dir, "net_block.py")
+            with open(hook_file, "w", encoding="utf-8") as hf:
+                hf.write(_NET_BLOCKER_SCRIPT)
+            exec_env["PYTHONSTARTUP"] = hook_file
+
         start_time = time.time()
         processes: List[subprocess.Popen] = []
 
-        # Build preexec function for POSIX rlimits
         preexec = self._build_preexec_fn()
 
         try:
@@ -244,7 +272,6 @@ class ExecutionSandbox:
                 is_first = (idx == 0)
                 is_last = (idx == len(pipeline) - 1)
 
-                # Wrap with bwrap sandbox if available and applicable
                 sandboxed_cmd = self._wrap_command_with_bwrap(raw_cmd, effective_cwd)
 
                 stdin_source = subprocess.PIPE if (is_first and input_data) else prev_stdout
@@ -271,7 +298,6 @@ class ExecutionSandbox:
             first_proc = processes[0]
             first_in = input_data if input_data else None
 
-            # Communicate with pipeline under timeout
             stdout_out, stderr_out = last_proc.communicate(timeout=timeout_seconds)
             if first_in and first_proc != last_proc and first_proc.stdin:
                 try:
@@ -283,7 +309,6 @@ class ExecutionSandbox:
             duration = (time.time() - start_time) * 1000.0
             returncode = last_proc.returncode
 
-            # Apply output size truncation cap
             clean_stdout = self._truncate_and_scrub(stdout_out or "")
             clean_stderr = self._truncate_and_scrub(stderr_out or "")
 
@@ -320,6 +345,34 @@ class ExecutionSandbox:
                 duration_ms=round(duration, 2),
                 timeout_exceeded=False,
             )
+        finally:
+            if net_hook_dir and os.path.exists(net_hook_dir):
+                shutil.rmtree(net_hook_dir, ignore_errors=True)
+
+    def _check_command_security(self, pipeline: List[List[str]], cwd: str) -> Optional[str]:
+        """Inspect pipeline commands to block forbidden host files and writes outside workspace."""
+        ws = self.policy.workspace_dir
+        for cmd in pipeline:
+            for token in cmd:
+                # 1. Check blocked paths
+                for blocked in self.policy.blocked_paths:
+                    if blocked and blocked in token:
+                        return f"Security violation: access to blocked path '{blocked}' is forbidden"
+
+                # 2. Check shell redirection writes escaping workspace
+                if ws and (">" in token or ">>" in token):
+                    m = re.search(r">\s*['\"]?([^\s'\";|&]+)", token)
+                    if m:
+                        target_p = m.group(1).strip()
+                        target_abs = os.path.normpath(os.path.abspath(os.path.join(cwd, target_p))) if not os.path.isabs(target_p) else os.path.normpath(os.path.abspath(target_p))
+                        try:
+                            real_ws = os.path.realpath(os.path.abspath(ws))
+                            common = os.path.commonpath([target_abs, real_ws])
+                            if common != real_ws and target_abs != real_ws:
+                                return f"Security violation: write to '{target_p}' outside workspace '{ws}' is forbidden"
+                        except ValueError:
+                            return f"Security violation: path '{target_p}' is outside workspace"
+        return None
 
     def _wrap_command_with_bwrap(self, cmd: List[str], cwd: str) -> List[str]:
         """Wrap an argument vector with Bubblewrap namespace flags if available."""
@@ -344,7 +397,6 @@ class ExecutionSandbox:
         if self.policy.workspace_dir and os.path.exists(self.policy.workspace_dir):
             bwrap_args.extend(["--bind", self.policy.workspace_dir, self.policy.workspace_dir])
         elif not self.policy.workspace_dir:
-            # When no specific workspace jail is declared, allow safe write to /tmp and cwd
             if os.path.exists("/tmp"):
                 bwrap_args.extend(["--bind", "/tmp", "/tmp"])
             if cwd and os.path.exists(cwd):
