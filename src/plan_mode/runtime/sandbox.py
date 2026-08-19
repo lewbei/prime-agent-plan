@@ -254,12 +254,13 @@ class ExecutionSandbox:
 
         # Network default-deny injection hook for Python when bwrap network namespace is unavailable
         net_hook_dir = None
-        if not self.policy.allow_network and not self._bwrap_binary:
+        if not self.policy.allow_network:
             net_hook_dir = tempfile.mkdtemp(prefix="prime_net_block_")
-            hook_file = os.path.join(net_hook_dir, "net_block.py")
+            hook_file = os.path.join(net_hook_dir, "sitecustomize.py")
             with open(hook_file, "w", encoding="utf-8") as hf:
                 hf.write(_NET_BLOCKER_SCRIPT)
-            exec_env["PYTHONSTARTUP"] = hook_file
+            orig_pypath = exec_env.get("PYTHONPATH", "")
+            exec_env["PYTHONPATH"] = f"{net_hook_dir}:{orig_pypath}" if orig_pypath else net_hook_dir
 
         start_time = time.time()
         processes: List[subprocess.Popen] = []
