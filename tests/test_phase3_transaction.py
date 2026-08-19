@@ -24,6 +24,7 @@ from plan_mode.runtime import (
     TransactionOutcome,
     TransactionalExecutionManager,
 )
+from plan_mode.runtime.sandbox import ExecutionSandbox, IsolationPolicy
 from plan_mode.session import CommitGateError, PlanningSession, SessionState
 
 
@@ -47,6 +48,18 @@ def _action(
         parameters=params or {},
         positive_effects=positive or [],
         provenance=_prov(),
+    )
+
+
+def _test_sandbox() -> ExecutionSandbox:
+    """Explicit test-only process runner for Phase 3 semantic tests."""
+    return ExecutionSandbox(
+        IsolationPolicy(
+            use_bwrap=False,
+            require_bwrap=False,
+            allow_unisolated_fallback=True,
+            read_only_root=False,
+        )
     )
 
 
@@ -139,6 +152,8 @@ def _prepare(plan: PlanIR, registry: CapabilityRegistry):
         ledger=ledger,
         observed_world_state=[],
         policy_hash=policy_hash,
+        sandbox=_test_sandbox(),
+        allow_insecure_test_sandbox=True,
     )
     return session, ledger, manager, cert
 
@@ -205,7 +220,6 @@ def test_failed_witness_prevents_commit_and_rolls_back(tmp_path):
     target = tmp_path / "never-created.txt"
     registry = CapabilityRegistry()
     _register_file_caps(registry)
-    # Replace the executor contract with a successful process that does not create the claimed file.
     cap = registry.get("fs.touch")
     registry.register(cap.model_copy(update={"executor_command_template": ["true"]}))
     plan = PlanIR(
