@@ -13,7 +13,6 @@ from pydantic import BaseModel, Field
 
 from plan_mode.epistemic_validator import (
     CausalValidator,
-    EpistemicCausalValidator,
     PlanValidationResult,
     ValidationStatus,
 )
@@ -22,7 +21,6 @@ from plan_mode.registry import CapabilityRegistry
 
 
 class SessionState(str, Enum):
-    """Transactional session states for planning, verification, and execution."""
     DRAFT = "DRAFT"
     IR_VALID = "IR_VALID"
     FEASIBILITY = "FEASIBILITY"
@@ -54,55 +52,46 @@ VALID_TRANSITIONS: Dict[SessionState, Set[SessionState]] = {
 
 
 class InvalidStateTransitionError(Exception):
-    """Raised when an illegal state machine transition is attempted."""
     pass
 
 
 class CertificateExpiredError(Exception):
-    """Raised when an authorization certificate has passed its TTL."""
     pass
 
 
 class StateDriftError(Exception):
-    """Raised when the world state has drifted from the authorized certificate state."""
     pass
 
 
 class SignatureVerificationError(Exception):
-    """Raised when an HMAC cryptographic signature check fails."""
     pass
 
 
 class VersionNotFoundError(Exception):
-    """Raised when a requested plan version is not in session history."""
     pass
 
 
 class CommitGateError(Exception):
-    """Raised when runtime evidence is insufficient to commit a plan."""
-
     def __init__(self, blockers: List[str]):
         self.blockers = blockers
         super().__init__("; ".join(blockers))
 
 
 def compute_world_state_hash(facts: List[WorldFact]) -> str:
-    """Deterministic SHA-256 hash of a collection of world facts preserving raw argument types."""
+    """Deterministic SHA-256 hash preserving raw fact argument types."""
     entries = []
-    for f in facts:
+    for fact in facts:
         entries.append({
-            "predicate": f.predicate,
-            "args": f.args,
-            "truth": f.truth.value,
-            "witnessability": f.witnessability.value,
+            "predicate": fact.predicate,
+            "args": fact.args,
+            "truth": fact.truth.value,
+            "witnessability": fact.witnessability.value,
         })
-    serialized_entries = sorted([json.dumps(e, sort_keys=True) for e in entries])
-    combined = "\n".join(serialized_entries)
-    return hashlib.sha256(combined.encode("utf-8")).hexdigest()
+    serialized_entries = sorted(json.dumps(entry, sort_keys=True) for entry in entries)
+    return hashlib.sha256("\n".join(serialized_entries).encode("utf-8")).hexdigest()
 
 
 class PlanVersion(BaseModel, frozen=True):
-    """Immutable snapshot of a plan version and its validation outcome."""
     version_number: int
     plan_ir: PlanIR
     validation_result: Optional[PlanValidationResult] = None
@@ -113,7 +102,8 @@ class PlanVersion(BaseModel, frozen=True):
 
 
 class AuthorizationCertificate(BaseModel, frozen=True):
-    """Cryptographic authorization token granting execution rights."""
+    """HMAC authorization token binding plan, world, registry, and security policy."""
+
     certificate_id: str
     plan_id: str
     plan_version: int
@@ -121,6 +111,7 @@ class AuthorizationCertificate(BaseModel, frozen=True):
     world_state_hash: str
     registry_hash: str
     policy_hash: str
+    isolation_policy_hash: str
     issued_at: float
     expires_at: float
     signature_hmac: str
@@ -132,6 +123,7 @@ class AuthorizationCertificate(BaseModel, frozen=True):
         world_facts: List[WorldFact],
         registry: CapabilityRegistry,
         policy_hash: str,
+        isolation_policy_hash: str,
         secret_key: bytes,
         ttl_seconds: float = 60.0,
     ) -> "AuthorizationCertificate":
@@ -141,8 +133,11 @@ class AuthorizationCertificate(BaseModel, frozen=True):
         plan_hash = plan_ir.compute_hash()
         ws_hash = compute_world_state_hash(world_facts)
         reg_hash = registry.compute_registry_hash()
-        payload = f"{plan_hash}:{ws_hash}:{reg_hash}:{policy_hash}:{expires_at:.6f}".encode("utf-8")
-        sig = hmac.new(secret_key, payload, hashlib.sha256).hexdigest()
+        payload = (
+            f"{plan_hash}:{ws_hash}:{reg_hash}:{policy_hash}:"
+            f"{isolation_policy_hash}:{expires_at:.6f}"
+        ).encode("utf-8")
+        signature = hmac.new(secret_key, payload, hashlib.sha256).hexdigest()
         return cls(
             certificate_id=cert_id,
             plan_id=plan_ir.plan_id,
@@ -151,23 +146,25 @@ class AuthorizationCertificate(BaseModel, frozen=True):
             world_state_hash=ws_hash,
             registry_hash=reg_hash,
             policy_hash=policy_hash,
+            isolation_policy_hash=isolation_policy_hash,
             issued_at=now,
             expires_at=expires_at,
-            signature_hmac=sig,
+            signature_hmac=signature,
         )
 
     def verify_signature(self, secret_key: bytes) -> bool:
-        payload = f"{self.plan_hash}:{self.world_state_hash}:{self.registry_hash}:{self.policy_hash}:{self.expires_at:.6f}".encode("utf-8")
-        expected_sig = hmac.new(secret_key, payload, hashlib.sha256).hexdigest()
-        return hmac.compare_digest(self.signature_hmac, expected_sig)
+        payload = (
+            f"{self.plan_hash}:{self.world_state_hash}:{self.registry_hash}:{self.policy_hash}:"
+            f"{self.isolation_policy_hash}:{self.expires_at:.6f}"
+        ).encode("utf-8")
+        expected = hmac.new(secret_key, payload, hashlib.sha256).hexdigest()
+        return hmac.compare_digest(self.signature_hmac, expected)
 
     def is_expired(self, current_time: Optional[float] = None) -> bool:
-        now = current_time if current_time is not None else time.time()
-        return now > self.expires_at
+        return (current_time if current_time is not None else time.time()) > self.expires_at
 
 
 class PlanningSession(BaseModel):
-    """Stateful runtime session managing plan versions and state machine."""
     session_id: str
     current_state: SessionState = SessionState.DRAFT
     versions: Dict[int, PlanVersion] = Field(default_factory=dict)
@@ -180,6 +177,7 @@ class PlanningSession(BaseModel):
 
     authorization_certificate: Optional[AuthorizationCertificate] = None
     authorized_policy_hash: Optional[str] = None
+    authorized_isolation_policy_hash: Optional[str] = None
     last_execution_success: bool = False
     last_execution_world_state_hash: Optional[str] = None
     last_execution_version: Optional[int] = None
@@ -193,19 +191,23 @@ class PlanningSession(BaseModel):
         self.current_state = target_state
 
     def submit_draft(self, plan_ir: PlanIR) -> PlanVersion:
-        if self.current_state not in (SessionState.DRAFT, SessionState.COMMITTED, SessionState.ROLLED_BACK, SessionState.FAILED):
+        if self.current_state not in (
+            SessionState.DRAFT,
+            SessionState.COMMITTED,
+            SessionState.ROLLED_BACK,
+            SessionState.FAILED,
+        ):
             self.transition_to(SessionState.DRAFT)
-        next_ver = len(self.versions) + 1
-        plan_ir_versioned = plan_ir.model_copy(update={"version": next_ver})
-        plan_hash = plan_ir_versioned.compute_hash()
+        next_version = len(self.versions) + 1
+        versioned = plan_ir.model_copy(update={"version": next_version})
         version_obj = PlanVersion(
-            version_number=next_ver,
-            plan_ir=plan_ir_versioned,
+            version_number=next_version,
+            plan_ir=versioned,
             validation_result=None,
-            plan_hash=plan_hash,
+            plan_hash=versioned.compute_hash(),
         )
-        self.versions[next_ver] = version_obj
-        self.best_candidate_version = next_ver
+        self.versions[next_version] = version_obj
+        self.best_candidate_version = next_version
         self.transition_to(SessionState.IR_VALID)
         return version_obj
 
@@ -221,12 +223,13 @@ class PlanningSession(BaseModel):
             raise VersionNotFoundError(f"Version {version_number} not found.")
         if self.current_state != SessionState.IR_VALID:
             self.transition_to(SessionState.IR_VALID)
-        v_obj = self.versions[version_number]
-        val = validator or CausalValidator()
+        version_obj = self.versions[version_number]
+        active_validator = validator or CausalValidator()
         effective_now = current_time if current_time is not None else time.time()
-        ttl_decay_policy = getattr(val, "default_ttl_decay_to_unknown", True)
+        ttl_decay_policy = getattr(active_validator, "default_ttl_decay_to_unknown", True)
 
         from plan_mode.epistemic_validator import normalize_trusted_snapshot
+
         normalized_map = (
             normalize_trusted_snapshot(
                 observed_world_state,
@@ -237,23 +240,26 @@ class PlanningSession(BaseModel):
             else None
         )
         canonical_list = list(normalized_map.values()) if normalized_map is not None else None
-        ws_hash = compute_world_state_hash(canonical_list) if canonical_list is not None else compute_world_state_hash([])
-        result = val.validate_plan(
-            v_obj.plan_ir,
+        world_hash = (
+            compute_world_state_hash(canonical_list)
+            if canonical_list is not None
+            else compute_world_state_hash([])
+        )
+        result = active_validator.validate_plan(
+            version_obj.plan_ir,
             registry=registry,
             observed_world_state=normalized_map,
             current_time=effective_now,
         )
-        updated_version = PlanVersion(
-            version_number=v_obj.version_number,
-            plan_ir=v_obj.plan_ir,
+        self.versions[version_number] = PlanVersion(
+            version_number=version_obj.version_number,
+            plan_ir=version_obj.plan_ir,
             validation_result=result,
-            plan_hash=v_obj.plan_hash,
+            plan_hash=version_obj.plan_hash,
             validation_world_state=canonical_list,
-            validation_world_state_hash=ws_hash,
-            created_at=v_obj.created_at,
+            validation_world_state_hash=world_hash,
+            created_at=version_obj.created_at,
         )
-        self.versions[version_number] = updated_version
         if result.status == ValidationStatus.PASS:
             self.best_verified_version = version_number
         elif result.status == ValidationStatus.UNKNOWN:
@@ -264,8 +270,8 @@ class PlanningSession(BaseModel):
     def select_version(self, version_number: int) -> None:
         if version_number not in self.versions:
             raise VersionNotFoundError(f"Version {version_number} not found.")
-        v_obj = self.versions[version_number]
-        if v_obj.validation_result is None or v_obj.validation_result.status != ValidationStatus.PASS:
+        version_obj = self.versions[version_number]
+        if version_obj.validation_result is None or version_obj.validation_result.status != ValidationStatus.PASS:
             raise ValueError(f"Version {version_number} is not validated as PASS.")
         if self.current_state != SessionState.FEASIBILITY:
             self.transition_to(SessionState.FEASIBILITY)
@@ -277,27 +283,45 @@ class PlanningSession(BaseModel):
         registry: CapabilityRegistry,
         policy_hash: str,
         ttl_seconds: float = 60.0,
+        isolation_policy_hash: Optional[str] = None,
     ) -> AuthorizationCertificate:
+        """Authorize a selected plan and bind its allowed isolation privileges.
+
+        If no explicit isolation identity is supplied, authorization defaults to
+        the production STRICT profile.  A network-enabled or otherwise relaxed
+        sandbox therefore requires a different, explicitly authorized hash.
+        """
         if self.current_state != SessionState.SELECTED:
             raise InvalidStateTransitionError(
                 f"Cannot authorize when in state '{self.current_state.value}' (expected SELECTED)."
             )
         assert self.best_candidate_version is not None
-        v_obj = self.versions[self.best_candidate_version]
-        trusted_facts = v_obj.validation_world_state if v_obj.validation_world_state is not None else []
-        cert = AuthorizationCertificate.create(
-            plan_ir=v_obj.plan_ir,
+        version_obj = self.versions[self.best_candidate_version]
+        trusted_facts = version_obj.validation_world_state or []
+
+        if isolation_policy_hash is None:
+            from plan_mode.runtime.isolation_identity import compute_isolation_policy_hash
+            from plan_mode.runtime.sandbox import SecurityProfile
+
+            isolation_policy_hash = compute_isolation_policy_hash(
+                SecurityProfile.get_profile(SecurityProfile.STRICT)
+            )
+
+        certificate = AuthorizationCertificate.create(
+            plan_ir=version_obj.plan_ir,
             world_facts=trusted_facts,
             registry=registry,
             policy_hash=policy_hash,
+            isolation_policy_hash=isolation_policy_hash,
             secret_key=self.secret_key,
             ttl_seconds=ttl_seconds,
         )
-        self.authorization_certificate = cert
+        self.authorization_certificate = certificate
         self.authorized_version = self.best_candidate_version
         self.authorized_policy_hash = policy_hash
+        self.authorized_isolation_policy_hash = isolation_policy_hash
         self.transition_to(SessionState.AUTHORIZED)
-        return cert
+        return certificate
 
     def start_execution(
         self,
@@ -310,35 +334,48 @@ class PlanningSession(BaseModel):
             raise InvalidStateTransitionError(
                 f"Cannot start execution from state '{self.current_state.value}' (expected AUTHORIZED)."
             )
-        cert = self.authorization_certificate
-        if cert is None:
+        certificate = self.authorization_certificate
+        if certificate is None:
             raise SignatureVerificationError("Missing authorization certificate.")
-        if not cert.verify_signature(self.secret_key):
+        if not certificate.verify_signature(self.secret_key):
             raise SignatureVerificationError("Authorization certificate signature invalid or tampered.")
-        if cert.is_expired(current_time):
-            raise CertificateExpiredError(f"Certificate {cert.certificate_id} expired at {cert.expires_at}.")
-        if policy_hash != cert.policy_hash or (self.authorized_policy_hash and policy_hash != self.authorized_policy_hash):
-            raise StateDriftError(
-                f"Policy drift detected: policy hash '{policy_hash}' does not match authorized policy '{cert.policy_hash}'."
+        if certificate.is_expired(current_time):
+            raise CertificateExpiredError(
+                f"Certificate {certificate.certificate_id} expired at {certificate.expires_at}."
             )
+        if policy_hash != certificate.policy_hash or (
+            self.authorized_policy_hash and policy_hash != self.authorized_policy_hash
+        ):
+            raise StateDriftError(
+                f"Policy drift detected: policy hash '{policy_hash}' does not match "
+                f"authorized policy '{certificate.policy_hash}'."
+            )
+        if (
+            self.authorized_isolation_policy_hash
+            and certificate.isolation_policy_hash != self.authorized_isolation_policy_hash
+        ):
+            raise StateDriftError("Isolation policy identity changed after authorization.")
+
         assert self.authorized_version is not None
-        v_obj = self.versions[self.authorized_version]
-        live_facts = current_world_facts if current_world_facts is not None else (v_obj.validation_world_state if v_obj.validation_world_state is not None else [])
-        live_ws_hash = compute_world_state_hash(live_facts)
-        if live_ws_hash != cert.world_state_hash:
+        version_obj = self.versions[self.authorized_version]
+        live_facts = (
+            current_world_facts
+            if current_world_facts is not None
+            else (version_obj.validation_world_state or [])
+        )
+        if compute_world_state_hash(live_facts) != certificate.world_state_hash:
             raise StateDriftError(
-                f"World state drift detected! Authorized hash {cert.world_state_hash} != live hash {live_ws_hash}"
+                "World state drift detected between authorization and execution."
             )
-        live_reg_hash = registry.compute_registry_hash()
-        if live_reg_hash != cert.registry_hash:
+        if registry.compute_registry_hash() != certificate.registry_hash:
             raise StateDriftError("Capability registry changed since certificate issuance.")
+
         self.last_execution_success = False
         self.last_execution_world_state_hash = None
         self.last_execution_version = None
         self.transition_to(SessionState.EXECUTING)
 
     def record_execution_result(self, success: bool, world_facts: List[WorldFact]) -> None:
-        """Bind the latest runtime result to the currently authorized version."""
         if self.current_state != SessionState.EXECUTING:
             raise InvalidStateTransitionError(
                 f"Cannot record execution result from state '{self.current_state.value}'."
@@ -351,7 +388,6 @@ class PlanningSession(BaseModel):
         self,
         live_world_state: Optional[Dict[str, WorldFact] | List[WorldFact]] = None,
     ) -> None:
-        """Commit only an attested successful execution whose mandatory criteria are empirically verified."""
         if self.current_state != SessionState.EXECUTING:
             raise InvalidStateTransitionError(
                 f"Cannot commit from state '{self.current_state.value}' (expected EXECUTING)."
@@ -362,6 +398,7 @@ class PlanningSession(BaseModel):
             blockers.append("latest execution was not independently attested as successful")
         if self.last_execution_version != self.authorized_version:
             blockers.append("execution attestation is not bound to the authorized plan version")
+
         if live_world_state is None:
             blockers.append("live runtime world state is required for commit")
             facts: List[WorldFact] = []
@@ -390,7 +427,8 @@ class PlanningSession(BaseModel):
                     continue
                 if fact.truth != expected.expected_truth:
                     blockers.append(
-                        f"mandatory criterion '{criterion.criterion_id}' expected {expected.expected_truth.value} but observed {fact.truth.value}"
+                        f"mandatory criterion '{criterion.criterion_id}' expected "
+                        f"{expected.expected_truth.value} but observed {fact.truth.value}"
                     )
                     continue
                 if fact.provenance.source_type != SourceType.OBSERVED_WORLD_STATE:
