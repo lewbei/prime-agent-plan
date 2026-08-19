@@ -25,6 +25,7 @@ from plan_mode.runtime.executor import (
     ExecutionSummary,
     WitnessStatus,
 )
+from plan_mode.runtime.isolation_identity import compute_isolation_policy_hash
 from plan_mode.runtime.ledger import EvidenceLedger, LedgerEventType
 from plan_mode.runtime.sandbox import (
     EphemeralWorkspace,
@@ -118,10 +119,13 @@ class TransactionalExecutionManager:
     Production construction is fail-closed: when no sandbox is supplied the
     manager owns a fresh ephemeral workspace and a STRICT Bubblewrap policy.
     A caller-supplied sandbox must itself be fail-closed and workspace-bound.
+    The policy privileges are fingerprinted and must match the HMAC-signed
+    authorization certificate, preventing post-authorization upgrades such as
+    silently enabling network access.
 
     ``allow_insecure_test_sandbox`` exists solely for deterministic unit tests
     of Phase 3 transaction semantics; it must never be enabled by production
-    callers.  It also gates custom execution backends because arbitrary
+    callers. It also gates custom execution backends because arbitrary
     callables are not an isolation boundary.
     """
 
@@ -177,8 +181,11 @@ class TransactionalExecutionManager:
     def workspace_dir(self) -> Optional[str]:
         return self.sandbox.policy.workspace_dir
 
+    @property
+    def isolation_policy_hash(self) -> str:
+        return compute_isolation_policy_hash(self.sandbox.policy)
+
     def close(self) -> None:
-        """Destroy any workspace owned by this transaction manager."""
         if self._closed:
             return
         self._closed = True
@@ -186,13 +193,18 @@ class TransactionalExecutionManager:
             self._owned_workspace.__exit__(None, None, None)
             self._owned_workspace = None
 
-    def _secure_runtime_preflight(self) -> Optional[str]:
+    def _secure_runtime_preflight(self, certificate: AuthorizationCertificate) -> Optional[str]:
         if self._allow_insecure_test_sandbox:
             return None
         if not self.sandbox.is_fail_closed:
             return "transaction sandbox is not configured fail-closed"
         if not self.sandbox.policy.workspace_dir:
             return "transaction sandbox has no isolated workspace"
+        if self.isolation_policy_hash != certificate.isolation_policy_hash:
+            return (
+                "isolation policy drift detected: runtime privileges do not match "
+                "the HMAC-bound authorization certificate"
+            )
         if not self.sandbox.kernel_isolation_ready:
             return "kernel isolation backend (bwrap) unavailable; transaction refused before dispatch"
         return None
@@ -221,7 +233,7 @@ class TransactionalExecutionManager:
                 "all commands must pass through the configured isolation sandbox."
             )
 
-        isolation_error = self._secure_runtime_preflight()
+        isolation_error = self._secure_runtime_preflight(certificate)
         if isolation_error:
             execution = ExecutionSummary(
                 plan_id=plan.plan_id,
@@ -392,6 +404,17 @@ class TransactionalExecutionManager:
         if self.policy_hash != certificate.policy_hash:
             return self._containment_failed(
                 execution, [], blockers, effectful_dispatched[-1], "runtime policy drifted before compensation"
+            )
+        if (
+            not self._allow_insecure_test_sandbox
+            and self.isolation_policy_hash != certificate.isolation_policy_hash
+        ):
+            return self._containment_failed(
+                execution,
+                [],
+                blockers,
+                effectful_dispatched[-1],
+                "isolation policy drifted before compensation",
             )
 
         results: List[CompensationResult] = []
