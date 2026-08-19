@@ -148,7 +148,11 @@ def _matches_verifier_runtime(
 
 
 class ExecutionPlanManager:
-    """Coordinates safe plan execution, ledger recording, and empirical verification."""
+    """Coordinates safe plan execution, ledger recording, and empirical verification.
+
+    Execution deliberately stops at an attested ExecutionSummary. Transactional
+    commit/rollback decisions belong to the Phase 3 finalization layer.
+    """
 
     def __init__(
         self,
@@ -176,22 +180,16 @@ class ExecutionPlanManager:
         backend = execution_backend or custom_action_handler
         start_time = time.time()
 
-        # -------------------------------------------------------------------
-        # Central Runtime Preflight Verification (Fail-Closed)
-        # -------------------------------------------------------------------
-        # A. Session State Preflight
         if self.session.current_state != SessionState.EXECUTING:
             raise InvalidStateTransitionError(
                 f"Cannot execute plan in state '{self.session.current_state.value}'. Expected EXECUTING (session.start_execution() must be called first)."
             )
 
-        # B. Certificate Signature & Expiration
         if not certificate.verify_signature(self.session.secret_key):
             raise SignatureVerificationError("Authorization certificate signature invalid or tampered.")
         if certificate.is_expired():
             raise ValueError("Authorization certificate has expired.")
 
-        # C. Certificate must match session's active authorized certificate
         if (
             self.session.authorization_certificate is None
             or certificate.certificate_id != self.session.authorization_certificate.certificate_id
@@ -199,7 +197,6 @@ class ExecutionPlanManager:
         ):
             raise SignatureVerificationError("Authorization certificate does not match active session authorized certificate.")
 
-        # D. Plan Version Existence and Hash Identity
         if certificate.plan_version not in self.session.versions:
             raise ValueError(f"Plan version {certificate.plan_version} not found in session.")
 
@@ -211,14 +208,12 @@ class ExecutionPlanManager:
                 f"Plan identity drift detected: certificate hash '{certificate.plan_hash}' != PlanIR canonical hash '{plan_ir.compute_hash()}'."
             )
 
-        # E. Registry Hash Preflight Check
         current_reg_hash = self.registry.compute_registry_hash()
         if certificate.registry_hash and certificate.registry_hash != current_reg_hash:
             raise StateDriftError(
                 f"Registry drift detected: certificate registry hash '{certificate.registry_hash}' != current registry hash '{current_reg_hash}'."
             )
 
-        # F. Policy Hash Preflight Check
         if self.policy_hash is None:
             raise StateDriftError("Runtime requires explicit current policy_hash identity before executing.")
 
@@ -232,7 +227,6 @@ class ExecutionPlanManager:
                 f"Policy drift detected: session policy hash '{self.session.authorized_policy_hash}' != runtime policy '{self.policy_hash}'."
             )
 
-        # G. Live World State Hash Check (Distinguish None from empty list)
         if not self._has_trusted_snapshot:
             raise StateDriftError(
                 "No trusted live world state snapshot was supplied to runtime (observed_world_state is None)."
@@ -246,14 +240,10 @@ class ExecutionPlanManager:
 
         step_results: List[StepExecutionResult] = []
 
-        # -------------------------------------------------------------------
-        # Step-by-Step Execution Loop
-        # -------------------------------------------------------------------
         for action in plan_ir.actions:
             step_start = time.time()
             step_id = action.action_id
 
-            # 1. Re-validate action against current registry
             try:
                 self.registry.validate_action(action)
                 cap = self.registry.get(action.capability_name)
@@ -284,7 +274,6 @@ class ExecutionPlanManager:
                     live_world_state=copy.deepcopy(self.live_world_state),
                 )
 
-            # 2. Strict Live Empirical Precondition Check
             pre_passed = True
             pre_failure_reason = ""
             for pre in action.preconditions:
@@ -331,7 +320,6 @@ class ExecutionPlanManager:
                     live_world_state=copy.deepcopy(self.live_world_state),
                 )
 
-            # 3. Check Executor Contract
             if not cap.executor_command_template:
                 err_msg = f"Action '{step_id}' cannot execute: capability '{cap.name}' has no concrete executor contract."
                 duration = (time.time() - step_start) * 1000.0
@@ -359,7 +347,6 @@ class ExecutionPlanManager:
                     live_world_state=copy.deepcopy(self.live_world_state),
                 )
 
-            # 4. Execute Capability Action
             cmd = _resolve_template_tokens(cap.executor_command_template, action.parameters)
             if backend is not None:
                 exec_res = backend(cmd, timeout_seconds=action.timeout_seconds)
@@ -403,7 +390,6 @@ class ExecutionPlanManager:
                     live_world_state=copy.deepcopy(self.live_world_state),
                 )
 
-            # 5. Independent Per-Effect Postcondition Witnessing
             has_effects = bool(action.positive_effects or action.negative_effects)
             step_duration = (time.time() - step_start) * 1000.0
             now_ts = time.time()
@@ -420,7 +406,6 @@ class ExecutionPlanManager:
                 )
                 continue
 
-            # Verify and witness each positive effect individually
             all_effects_witnessed = True
             witness_failure_reason = ""
             any_verifier_ran = False
@@ -437,7 +422,6 @@ class ExecutionPlanManager:
                     witness_failure_reason = f"No matching observation verifier bound for positive effect '{pos_key}'"
                     break
 
-                # Run each matching verifier
                 pos_effect_verified = False
                 for v in matching_verifiers:
                     any_verifier_ran = True
@@ -469,7 +453,6 @@ class ExecutionPlanManager:
                     break
 
             if all_effects_witnessed:
-                # Verify and witness each negative effect individually
                 for neg in action.negative_effects:
                     neg_key = neg.fact_key
                     matching_verifiers = [
@@ -564,14 +547,6 @@ class ExecutionPlanManager:
                 )
             )
 
-        # 6. Commit Execution
-        self.ledger.append_record(
-            LedgerEventType.PLAN_COMMITTED,
-            {"plan_id": plan_ir.plan_id, "version": plan_ir.version},
-        )
-        if self.session.current_state == SessionState.EXECUTING:
-            self.session.commit_execution()
-
         total_duration = (time.time() - start_time) * 1000.0
         return ExecutionSummary(
             plan_id=plan_ir.plan_id,
@@ -616,6 +591,7 @@ class ExecutionPlanManager:
                 return False, f"JSON parsing failed for verifier '{v.verifier_id}': {str(e)}"
 
         return True, ""
+
     def _witness_postconditions(self, action: ActionIR, cap: CapabilityEntry) -> WitnessStatus:
         """Evaluate postcondition verifiers and return WitnessStatus."""
         has_effects = bool(action.positive_effects or action.negative_effects)
