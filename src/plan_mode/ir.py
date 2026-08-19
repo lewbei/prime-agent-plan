@@ -9,6 +9,8 @@ from enum import Enum
 from typing import Any, Dict, List, Optional
 from pydantic import BaseModel, Field, field_validator
 
+from plan_mode.fact_identity import canonical_fact_identity
+
 
 class FactTruth(str, Enum):
     """4-state epistemic truth lattice."""
@@ -77,9 +79,8 @@ class WorldFact(BaseModel):
 
     @property
     def fact_key(self) -> str:
-        """Deterministic canonical string key for the predicate and arguments."""
-        args_str = ",".join(str(a) for a in self.args)
-        return f"{self.predicate}({args_str})"
+        """Deterministic typed semantic key for the predicate and arguments."""
+        return canonical_fact_identity(self.predicate, self.args)
 
     def is_fresh(self, current_time: Optional[float] = None) -> bool:
         """Evaluate if the fact remains fresh according to its TTL."""
@@ -99,9 +100,8 @@ class PredicateCondition(BaseModel):
 
     @property
     def fact_key(self) -> str:
-        """Deterministic canonical string key matching WorldFact."""
-        args_str = ",".join(str(a) for a in self.args)
-        return f"{self.predicate}({args_str})"
+        """Deterministic typed semantic key matching WorldFact."""
+        return canonical_fact_identity(self.predicate, self.args)
 
 
 class HardConstraint(BaseModel):
