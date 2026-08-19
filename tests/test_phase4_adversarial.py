@@ -416,7 +416,7 @@ def test_isolation_refuses_execution_when_bwrap_unavailable(tmp_path):
 # Test 16: Filesystem Isolation - Blocks non-shell programmatic writes outside workspace
 # ---------------------------------------------------------------------------
 def test_isolation_blocks_non_shell_file_write_outside_workspace(tmp_path):
-    """Python programmatic open('/outside/path', 'w') must fail with Read-only filesystem error inside bwrap."""
+    """Python programmatic open('/outside/path', 'w') must fail with Read-only filesystem error in both bwrap and portable fallback modes."""
     workspace = tmp_path / "workspace"
     workspace.mkdir(parents=True, exist_ok=True)
     outside_target = tmp_path / "outside_py_write.txt"
@@ -432,7 +432,17 @@ def test_isolation_blocks_non_shell_file_write_outside_workspace(tmp_path):
     res = sandbox.execute_argv_pipeline([cmd], cwd=str(workspace))
 
     assert not outside_target.exists()
-    assert res.returncode != 0 or "Read-only file system" in res.stderr
+    assert res.returncode != 0
+
+    # Test portable fallback without bwrap
+    outside_target_fallback = tmp_path / "outside_fallback_write.txt"
+    sandbox._bwrap_binary = None
+    py_script_fallback = f"open('{str(outside_target_fallback)}', 'w').write('hacked')"
+    cmd_fallback = [sys.executable, "-c", py_script_fallback]
+    res_fallback = sandbox.execute_argv_pipeline([cmd_fallback], cwd=str(workspace))
+
+    assert not outside_target_fallback.exists()
+    assert res_fallback.returncode != 0
 
 
 # ---------------------------------------------------------------------------

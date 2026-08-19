@@ -185,14 +185,41 @@ class SandboxExecutionResult(BaseModel):
     resource_limit_exceeded: bool = False
 
 
-# Embedded socket blocker script for network default-deny
+# Embedded sandbox security hook for environment isolation & fallback containment
 _NET_BLOCKER_SCRIPT = """
-import socket
-def _blocked_socket(*args, **kwargs):
-    raise OSError(101, "Network unreachable (Default-Deny policy enforced by ExecutionSandbox)")
-socket.socket = _blocked_socket
-if hasattr(socket, 'create_connection'):
-    socket.create_connection = _blocked_socket
+import socket, builtins, os, io
+
+# 1. Network Default-Deny Hook
+if os.environ.get("PRIME_NETWORK_DENY") == "1":
+    def _blocked_socket(*args, **kwargs):
+        raise OSError(101, "Network unreachable (Default-Deny policy enforced by ExecutionSandbox)")
+    socket.socket = _blocked_socket
+    if hasattr(socket, 'create_connection'):
+        socket.create_connection = _blocked_socket
+
+# 2. Filesystem Read-Only Root & Workspace Confinement Hook
+_ws_dir = os.environ.get("PRIME_WORKSPACE_DIR")
+_ro_root = os.environ.get("PRIME_READ_ONLY_ROOT") == "1"
+
+if _ro_root and _ws_dir:
+    _orig_builtin_open = builtins.open
+    _real_ws = os.path.realpath(os.path.abspath(_ws_dir))
+
+    def _sandboxed_open(file, mode="r", *args, **kwargs):
+        # Block write/append/truncate modes outside workspace
+        if any(m in mode for m in ("w", "a", "+", "x")):
+            file_str = str(file)
+            abs_p = os.path.normpath(os.path.abspath(file_str)) if os.path.isabs(file_str) else os.path.normpath(os.path.abspath(os.path.join(os.getcwd(), file_str)))
+            try:
+                common = os.path.commonpath([abs_p, _real_ws])
+                if common != _real_ws:
+                    raise OSError(30, f"Read-only file system: write to '{file_str}' outside workspace '{_ws_dir}' is forbidden")
+            except ValueError:
+                raise OSError(30, f"Read-only file system: '{file_str}' outside workspace")
+        return _orig_builtin_open(file, mode, *args, **kwargs)
+
+    builtins.open = _sandboxed_open
+    io.open = _sandboxed_open
 """
 
 
@@ -262,15 +289,20 @@ class ExecutionSandbox:
                     returncode=126,
                 )
 
-        # Network default-deny injection hook for Python when bwrap network namespace is unavailable
-        net_hook_dir = None
+        # Security containment environment hooks
         if not self.policy.allow_network:
-            net_hook_dir = tempfile.mkdtemp(prefix="prime_net_block_")
-            hook_file = os.path.join(net_hook_dir, "sitecustomize.py")
-            with open(hook_file, "w", encoding="utf-8") as hf:
-                hf.write(_NET_BLOCKER_SCRIPT)
-            orig_pypath = exec_env.get("PYTHONPATH", "")
-            exec_env["PYTHONPATH"] = f"{net_hook_dir}:{orig_pypath}" if orig_pypath else net_hook_dir
+            exec_env["PRIME_NETWORK_DENY"] = "1"
+        if self.policy.read_only_root:
+            exec_env["PRIME_READ_ONLY_ROOT"] = "1"
+        if self.policy.workspace_dir:
+            exec_env["PRIME_WORKSPACE_DIR"] = self.policy.workspace_dir
+
+        net_hook_dir = tempfile.mkdtemp(prefix="prime_sec_hook_")
+        hook_file = os.path.join(net_hook_dir, "sitecustomize.py")
+        with open(hook_file, "w", encoding="utf-8") as hf:
+            hf.write(_NET_BLOCKER_SCRIPT)
+        orig_pypath = exec_env.get("PYTHONPATH", "")
+        exec_env["PYTHONPATH"] = f"{net_hook_dir}:{orig_pypath}" if orig_pypath else net_hook_dir
 
         start_time = time.time()
         processes: List[subprocess.Popen] = []
