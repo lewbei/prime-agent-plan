@@ -66,34 +66,36 @@ def test_setup():
 
 def test_insert_disambiguation_action(test_setup):
     reg, plan = test_setup
-    
-    # Insert ping action before ssh_exec to ground host_alive
+
+    # Effect-creating search operations are closed-world and require registry grounding.
     disambiguated = insert_disambiguation_action(
         plan_ir=plan,
         target_action_index=0,
         probe_capability_name="system.ping",
         parameters={"host": "srv1.internal"},
         positive_effects=[PredicateCondition(predicate="host_alive", args=["srv1.internal"])],
+        registry=reg,
     )
 
     assert len(disambiguated.actions) == 2
     assert disambiguated.actions[0].capability_name == "system.ping"
     assert disambiguated.actions[1].capability_name == "system.ssh_exec"
     assert disambiguated.actions[0].provenance.source_type == SourceType.PLANNER_INFERENCE
+    # The effect comes from the registered contract, not from caller invention.
+    assert disambiguated.actions[0].positive_effects[0].predicate == "host_alive"
 
 
 def test_mutate_action_parameters(test_setup):
     reg, plan = test_setup
     mutated = mutate_action_parameters(plan, action_index=0, parameter_updates={"host": "srv2.internal"})
     assert mutated.actions[0].parameters["host"] == "srv2.internal"
-    # Ensure immutability / original plan unaffected
     assert plan.actions[0].parameters["host"] == "srv1.internal"
 
 
 def test_causal_crossover(test_setup):
     reg, plan_a = test_setup
     prov = Provenance(source_type=SourceType.PLANNER_INFERENCE)
-    
+
     plan_b = PlanIR(
         plan_id="plan_b",
         goal_description="Alternative plan",
@@ -109,7 +111,7 @@ def test_causal_crossover(test_setup):
         ],
     )
 
-    child = causal_crossover(parent_a=plan_b, parent_b=plan_a, split_index_a=1)
+    child = causal_crossover(parent_a=plan_b, parent_b=plan_a, split_index_a=1, registry=reg)
     assert len(child.actions) == 2
     assert child.actions[0].capability_name == "system.ping"
     assert child.actions[1].capability_name == "system.ssh_exec"
@@ -118,12 +120,11 @@ def test_causal_crossover(test_setup):
 def test_epistemic_plan_search_optimizer(test_setup):
     reg, plan = test_setup
     searcher = EpistemicPlanSearch(registry=reg)
-    
-    # Ground truth initial state has host_alive = VERIFIED_TRUE
+
     initial_grounded = [
         WorldFact(predicate="host_ready", args=["srv1.internal"], truth=FactTruth.VERIFIED_TRUE, provenance=Provenance(source_type=SourceType.OBSERVED_WORLD_STATE))
     ]
-    
+
     optimized = searcher.search_best_plan(
         seed_plan=plan,
         max_iterations=10,
