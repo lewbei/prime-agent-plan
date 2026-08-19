@@ -48,19 +48,21 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
 
-      - name: Set up Python 3.12
-        uses: actions/setup-python@v5
-        with:
-          python-version: "3.12"
-
-      - name: Install Bubblewrap and test dependencies
+      - name: Verify Docker integration harness
         run: |
-          sudo apt-get update
-          sudo apt-get install -y bubblewrap
-          bwrap --version
-          python -m pip install --upgrade pip
-          python -m pip install -e ".[test]"
+          docker version
 
-      - name: Exercise real kernel isolation
+      - name: Exercise real Bubblewrap namespaces in privileged Linux container
         run: |
-          python -m pytest -q tests/test_phase4_kernel_integration.py
+          docker run --rm --privileged --security-opt seccomp=unconfined \
+            -v "$GITHUB_WORKSPACE:/repo" \
+            -w /repo \
+            python:3.12-bookworm \
+            bash -lc '
+              apt-get update &&
+              apt-get install -y bubblewrap &&
+              bwrap --version &&
+              python -m pip install --upgrade pip &&
+              python -m pip install -e ".[test]" &&
+              python -m pytest -q tests/test_phase4_kernel_integration.py
+            '
