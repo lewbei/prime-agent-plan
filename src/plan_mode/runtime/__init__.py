@@ -1,4 +1,4 @@
-"""Runtime Subsystem Prototype Scaffolding: in-memory event chain, structured process runner, and secret scrubber."""
+"""Runtime Subsystem Prototype Scaffolding: event chain, structured execution, attestation, and transaction control."""
 
 from plan_mode.runtime.ledger import EvidenceLedger, LedgerEventType, LedgerRecord, LedgerTamperError
 from plan_mode.runtime.secret_scrubber import SecretScrubber
@@ -10,6 +10,12 @@ from plan_mode.runtime.executor import (
     ExecutionBackend,
     PreconditionFailedError,
     ExecutionContractMissingError,
+)
+from plan_mode.runtime.transaction import (
+    TransactionalExecutionManager,
+    TransactionOutcome,
+    TransactionSummary,
+    CompensationResult,
 )
 
 __all__ = [
@@ -26,4 +32,8 @@ __all__ = [
     "ExecutionBackend",
     "PreconditionFailedError",
     "ExecutionContractMissingError",
+    "TransactionalExecutionManager",
+    "TransactionOutcome",
+    "TransactionSummary",
+    "CompensationResult",
 ]
