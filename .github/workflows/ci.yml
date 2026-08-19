@@ -39,3 +39,28 @@ jobs:
       - name: Verify clean installation and selfcheck
         run: |
           python -c "import plan; import plan_mode; res = plan_mode.selfcheck(run_pytest=False); print(res); assert res['ok']"
+
+  phase4-kernel-isolation:
+    name: phase4 kernel isolation (bwrap)
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install Bubblewrap and test dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y bubblewrap
+          bwrap --version
+          python -m pip install --upgrade pip
+          python -m pip install -e ".[test]"
+
+      - name: Exercise real kernel isolation
+        run: |
+          python -m pytest -q tests/test_phase4_kernel_integration.py
