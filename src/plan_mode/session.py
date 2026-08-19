@@ -17,7 +17,7 @@ from plan_mode.epistemic_validator import (
     PlanValidationResult,
     ValidationStatus,
 )
-from plan_mode.ir import PlanIR, WorldFact
+from plan_mode.ir import PlanIR, SourceType, WorldFact
 from plan_mode.registry import CapabilityRegistry
 
 
@@ -33,10 +33,10 @@ class SessionState(str, Enum):
     DIAGNOSING = "DIAGNOSING"
     COMPENSATING = "COMPENSATING"
     ROLLED_BACK = "ROLLED_BACK"
+    CONTAINMENT_FAILED = "CONTAINMENT_FAILED"
     FAILED = "FAILED"
 
 
-# Allowed state transitions
 VALID_TRANSITIONS: Dict[SessionState, Set[SessionState]] = {
     SessionState.DRAFT: {SessionState.IR_VALID, SessionState.FAILED},
     SessionState.IR_VALID: {SessionState.FEASIBILITY, SessionState.DRAFT, SessionState.FAILED},
@@ -45,8 +45,9 @@ VALID_TRANSITIONS: Dict[SessionState, Set[SessionState]] = {
     SessionState.AUTHORIZED: {SessionState.EXECUTING, SessionState.SELECTED, SessionState.DRAFT, SessionState.FAILED},
     SessionState.EXECUTING: {SessionState.COMMITTED, SessionState.DIAGNOSING, SessionState.COMPENSATING, SessionState.FAILED},
     SessionState.DIAGNOSING: {SessionState.COMPENSATING, SessionState.DRAFT, SessionState.FAILED},
-    SessionState.COMPENSATING: {SessionState.ROLLED_BACK, SessionState.FAILED},
+    SessionState.COMPENSATING: {SessionState.ROLLED_BACK, SessionState.CONTAINMENT_FAILED, SessionState.FAILED},
     SessionState.ROLLED_BACK: {SessionState.DRAFT, SessionState.FAILED},
+    SessionState.CONTAINMENT_FAILED: {SessionState.FAILED},
     SessionState.COMMITTED: {SessionState.DRAFT},
     SessionState.FAILED: {SessionState.DRAFT},
 }
@@ -75,6 +76,14 @@ class SignatureVerificationError(Exception):
 class VersionNotFoundError(Exception):
     """Raised when a requested plan version is not in session history."""
     pass
+
+
+class CommitGateError(Exception):
+    """Raised when runtime evidence is insufficient to commit a plan."""
+
+    def __init__(self, blockers: List[str]):
+        self.blockers = blockers
+        super().__init__("; ".join(blockers))
 
 
 def compute_world_state_hash(facts: List[WorldFact]) -> str:
@@ -125,18 +134,15 @@ class AuthorizationCertificate(BaseModel, frozen=True):
         policy_hash: str,
         secret_key: bytes,
         ttl_seconds: float = 60.0,
-    ) -> AuthorizationCertificate:
+    ) -> "AuthorizationCertificate":
         now = time.time()
         expires_at = now + ttl_seconds
         cert_id = f"cert_{secrets.token_hex(8)}"
         plan_hash = plan_ir.compute_hash()
         ws_hash = compute_world_state_hash(world_facts)
         reg_hash = registry.compute_registry_hash()
-
-        # Binding: HMAC(PlanHash || WSHash || RegHash || PolicyHash || ExpiresAt)
         payload = f"{plan_hash}:{ws_hash}:{reg_hash}:{policy_hash}:{expires_at:.6f}".encode("utf-8")
         sig = hmac.new(secret_key, payload, hashlib.sha256).hexdigest()
-
         return cls(
             certificate_id=cert_id,
             plan_id=plan_ir.plan_id,
@@ -151,13 +157,11 @@ class AuthorizationCertificate(BaseModel, frozen=True):
         )
 
     def verify_signature(self, secret_key: bytes) -> bool:
-        """Verify the HMAC signature of this certificate."""
         payload = f"{self.plan_hash}:{self.world_state_hash}:{self.registry_hash}:{self.policy_hash}:{self.expires_at:.6f}".encode("utf-8")
         expected_sig = hmac.new(secret_key, payload, hashlib.sha256).hexdigest()
         return hmac.compare_digest(self.signature_hmac, expected_sig)
 
     def is_expired(self, current_time: Optional[float] = None) -> bool:
-        """Check if certificate has exceeded its validity window."""
         now = current_time if current_time is not None else time.time()
         return now > self.expires_at
 
@@ -167,20 +171,21 @@ class PlanningSession(BaseModel):
     session_id: str
     current_state: SessionState = SessionState.DRAFT
     versions: Dict[int, PlanVersion] = Field(default_factory=dict)
-    
-    # Version pointers
+
     best_candidate_version: Optional[int] = None
     best_verified_version: Optional[int] = None
     best_unknown_version: Optional[int] = None
     authorized_version: Optional[int] = None
     committed_version: Optional[int] = None
-    
+
     authorization_certificate: Optional[AuthorizationCertificate] = None
     authorized_policy_hash: Optional[str] = None
+    last_execution_success: bool = False
+    last_execution_world_state_hash: Optional[str] = None
+    last_execution_version: Optional[int] = None
     secret_key: bytes = Field(default_factory=lambda: secrets.token_bytes(32))
 
     def transition_to(self, target_state: SessionState) -> None:
-        """Enforce state machine transition graph."""
         if target_state not in VALID_TRANSITIONS.get(self.current_state, set()):
             raise InvalidStateTransitionError(
                 f"Illegal state transition from '{self.current_state.value}' to '{target_state.value}'."
@@ -188,14 +193,11 @@ class PlanningSession(BaseModel):
         self.current_state = target_state
 
     def submit_draft(self, plan_ir: PlanIR) -> PlanVersion:
-        """Submit a new plan draft, generating an immutable PlanVersion."""
         if self.current_state not in (SessionState.DRAFT, SessionState.COMMITTED, SessionState.ROLLED_BACK, SessionState.FAILED):
             self.transition_to(SessionState.DRAFT)
-
         next_ver = len(self.versions) + 1
         plan_ir_versioned = plan_ir.model_copy(update={"version": next_ver})
         plan_hash = plan_ir_versioned.compute_hash()
-
         version_obj = PlanVersion(
             version_number=next_ver,
             plan_ir=plan_ir_versioned,
@@ -215,13 +217,10 @@ class PlanningSession(BaseModel):
         observed_world_state: Optional[List[WorldFact] | Dict[str, WorldFact]] = None,
         current_time: Optional[float] = None,
     ) -> PlanValidationResult:
-        """Validate candidate plan version with CausalValidator and store trusted validation snapshot."""
         if version_number not in self.versions:
             raise VersionNotFoundError(f"Version {version_number} not found.")
-
         if self.current_state != SessionState.IR_VALID:
             self.transition_to(SessionState.IR_VALID)
-
         v_obj = self.versions[version_number]
         val = validator or CausalValidator()
         effective_now = current_time if current_time is not None else time.time()
@@ -239,14 +238,12 @@ class PlanningSession(BaseModel):
         )
         canonical_list = list(normalized_map.values()) if normalized_map is not None else None
         ws_hash = compute_world_state_hash(canonical_list) if canonical_list is not None else compute_world_state_hash([])
-
         result = val.validate_plan(
             v_obj.plan_ir,
             registry=registry,
             observed_world_state=normalized_map,
             current_time=effective_now,
         )
-
         updated_version = PlanVersion(
             version_number=v_obj.version_number,
             plan_ir=v_obj.plan_ir,
@@ -257,27 +254,21 @@ class PlanningSession(BaseModel):
             created_at=v_obj.created_at,
         )
         self.versions[version_number] = updated_version
-
         if result.status == ValidationStatus.PASS:
             self.best_verified_version = version_number
         elif result.status == ValidationStatus.UNKNOWN:
             self.best_unknown_version = version_number
-
         self.transition_to(SessionState.FEASIBILITY)
         return result
 
     def select_version(self, version_number: int) -> None:
-        """Select a validated plan version for execution."""
         if version_number not in self.versions:
             raise VersionNotFoundError(f"Version {version_number} not found.")
-
         v_obj = self.versions[version_number]
         if v_obj.validation_result is None or v_obj.validation_result.status != ValidationStatus.PASS:
             raise ValueError(f"Version {version_number} is not validated as PASS.")
-
         if self.current_state != SessionState.FEASIBILITY:
             self.transition_to(SessionState.FEASIBILITY)
-
         self.best_candidate_version = version_number
         self.transition_to(SessionState.SELECTED)
 
@@ -287,17 +278,13 @@ class PlanningSession(BaseModel):
         policy_hash: str,
         ttl_seconds: float = 60.0,
     ) -> AuthorizationCertificate:
-        """Issue cryptographic HMAC authorization certificate bound strictly to trusted validation world state."""
         if self.current_state != SessionState.SELECTED:
             raise InvalidStateTransitionError(
                 f"Cannot authorize when in state '{self.current_state.value}' (expected SELECTED)."
             )
-
         assert self.best_candidate_version is not None
         v_obj = self.versions[self.best_candidate_version]
-
         trusted_facts = v_obj.validation_world_state if v_obj.validation_world_state is not None else []
-
         cert = AuthorizationCertificate.create(
             plan_ir=v_obj.plan_ir,
             world_facts=trusted_facts,
@@ -319,53 +306,100 @@ class PlanningSession(BaseModel):
         current_world_facts: Optional[List[WorldFact]] = None,
         current_time: Optional[float] = None,
     ) -> None:
-        """Verify certificate validity and state drift before transitioning to EXECUTING."""
         if self.current_state != SessionState.AUTHORIZED:
             raise InvalidStateTransitionError(
                 f"Cannot start execution from state '{self.current_state.value}' (expected AUTHORIZED)."
             )
-
         cert = self.authorization_certificate
         if cert is None:
             raise SignatureVerificationError("Missing authorization certificate.")
-
-        # 1. Signature check
         if not cert.verify_signature(self.secret_key):
             raise SignatureVerificationError("Authorization certificate signature invalid or tampered.")
-
-        # 2. Expiration check
         if cert.is_expired(current_time):
             raise CertificateExpiredError(f"Certificate {cert.certificate_id} expired at {cert.expires_at}.")
-
-        # 3. Policy check
         if policy_hash != cert.policy_hash or (self.authorized_policy_hash and policy_hash != self.authorized_policy_hash):
             raise StateDriftError(
                 f"Policy drift detected: policy hash '{policy_hash}' does not match authorized policy '{cert.policy_hash}'."
             )
-
-        # 4. State drift check
         assert self.authorized_version is not None
         v_obj = self.versions[self.authorized_version]
         live_facts = current_world_facts if current_world_facts is not None else (v_obj.validation_world_state if v_obj.validation_world_state is not None else [])
         live_ws_hash = compute_world_state_hash(live_facts)
-
         if live_ws_hash != cert.world_state_hash:
             raise StateDriftError(
                 f"World state drift detected! Authorized hash {cert.world_state_hash} != live hash {live_ws_hash}"
             )
-
-        # 5. Registry drift check
         live_reg_hash = registry.compute_registry_hash()
         if live_reg_hash != cert.registry_hash:
             raise StateDriftError("Capability registry changed since certificate issuance.")
-
+        self.last_execution_success = False
+        self.last_execution_world_state_hash = None
+        self.last_execution_version = None
         self.transition_to(SessionState.EXECUTING)
 
-    def commit_execution(self) -> None:
-        """Mark plan execution as successfully committed."""
+    def record_execution_result(self, success: bool, world_facts: List[WorldFact]) -> None:
+        """Bind the latest runtime result to the currently authorized version."""
+        if self.current_state != SessionState.EXECUTING:
+            raise InvalidStateTransitionError(
+                f"Cannot record execution result from state '{self.current_state.value}'."
+            )
+        self.last_execution_success = bool(success)
+        self.last_execution_world_state_hash = compute_world_state_hash(world_facts)
+        self.last_execution_version = self.authorized_version
+
+    def commit_execution(
+        self,
+        live_world_state: Optional[Dict[str, WorldFact] | List[WorldFact]] = None,
+    ) -> None:
+        """Commit only an attested successful execution whose mandatory criteria are empirically verified."""
         if self.current_state != SessionState.EXECUTING:
             raise InvalidStateTransitionError(
                 f"Cannot commit from state '{self.current_state.value}' (expected EXECUTING)."
             )
+
+        blockers: List[str] = []
+        if not self.last_execution_success:
+            blockers.append("latest execution was not independently attested as successful")
+        if self.last_execution_version != self.authorized_version:
+            blockers.append("execution attestation is not bound to the authorized plan version")
+        if live_world_state is None:
+            blockers.append("live runtime world state is required for commit")
+            facts: List[WorldFact] = []
+        elif isinstance(live_world_state, dict):
+            facts = list(live_world_state.values())
+        else:
+            facts = list(live_world_state)
+
+        if live_world_state is not None:
+            current_hash = compute_world_state_hash(facts)
+            if self.last_execution_world_state_hash != current_hash:
+                blockers.append("commit world state does not match the attested execution world state")
+
+        if self.authorized_version is None:
+            blockers.append("no authorized plan version is bound to this execution")
+        else:
+            plan = self.versions[self.authorized_version].plan_ir
+            fact_map = {fact.fact_key: fact for fact in facts}
+            for criterion in plan.success_criteria:
+                if not criterion.is_mandatory:
+                    continue
+                expected = criterion.condition
+                fact = fact_map.get(expected.fact_key)
+                if fact is None:
+                    blockers.append(f"mandatory criterion '{criterion.criterion_id}' is not observed")
+                    continue
+                if fact.truth != expected.expected_truth:
+                    blockers.append(
+                        f"mandatory criterion '{criterion.criterion_id}' expected {expected.expected_truth.value} but observed {fact.truth.value}"
+                    )
+                    continue
+                if fact.provenance.source_type != SourceType.OBSERVED_WORLD_STATE:
+                    blockers.append(
+                        f"mandatory criterion '{criterion.criterion_id}' is not grounded in observed runtime evidence"
+                    )
+
+        if blockers:
+            raise CommitGateError(blockers)
+
         self.committed_version = self.authorized_version
         self.transition_to(SessionState.COMMITTED)
