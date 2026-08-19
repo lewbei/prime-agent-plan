@@ -1,4 +1,4 @@
-"""Phase 3 transactional execution: verified commit gating and saga compensation."""
+"""Transactional execution with verified commit gating and fail-closed isolation."""
 from __future__ import annotations
 
 import copy
@@ -26,7 +26,12 @@ from plan_mode.runtime.executor import (
     WitnessStatus,
 )
 from plan_mode.runtime.ledger import EvidenceLedger, LedgerEventType
-from plan_mode.runtime.sandbox import ExecutionSandbox
+from plan_mode.runtime.sandbox import (
+    EphemeralWorkspace,
+    ExecutionSandbox,
+    SandboxSecurityViolationError,
+    SecurityProfile,
+)
 from plan_mode.session import (
     AuthorizationCertificate,
     CommitGateError,
@@ -108,7 +113,17 @@ def _instantiate_condition(cond: PredicateCondition, params: Dict[str, Any]) -> 
 
 
 class TransactionalExecutionManager:
-    """Executes an authorized plan and either commits it or verifies compensation."""
+    """Execute an authorized plan and either commit it or verify compensation.
+
+    Production construction is fail-closed: when no sandbox is supplied the
+    manager owns a fresh ephemeral workspace and a STRICT Bubblewrap policy.
+    A caller-supplied sandbox must itself be fail-closed and workspace-bound.
+
+    ``allow_insecure_test_sandbox`` exists solely for deterministic unit tests
+    of Phase 3 transaction semantics; it must never be enabled by production
+    callers.  It also gates custom execution backends because arbitrary
+    callables are not an isolation boundary.
+    """
 
     def __init__(
         self,
@@ -118,12 +133,37 @@ class TransactionalExecutionManager:
         observed_world_state: List[WorldFact] | Dict[str, WorldFact],
         policy_hash: str,
         sandbox: Optional[ExecutionSandbox] = None,
+        *,
+        allow_insecure_test_sandbox: bool = False,
     ):
         self.session = session
         self.registry = registry
         self.ledger = ledger
         self.policy_hash = policy_hash
-        self.sandbox = sandbox or ExecutionSandbox()
+        self._allow_insecure_test_sandbox = allow_insecure_test_sandbox
+        self._owned_workspace: Optional[EphemeralWorkspace] = None
+        self._closed = False
+
+        if sandbox is None:
+            workspace = EphemeralWorkspace()
+            workspace.__enter__()
+            self._owned_workspace = workspace
+            strict_policy = SecurityProfile.get_profile(SecurityProfile.STRICT).model_copy(
+                update={"workspace_dir": workspace.path}
+            )
+            self.sandbox = ExecutionSandbox(policy=strict_policy)
+        else:
+            if not allow_insecure_test_sandbox:
+                if not sandbox.is_fail_closed:
+                    raise SandboxSecurityViolationError(
+                        "Transactional execution requires a fail-closed isolation policy."
+                    )
+                if not sandbox.policy.workspace_dir:
+                    raise SandboxSecurityViolationError(
+                        "Transactional execution requires an explicit isolated workspace."
+                    )
+            self.sandbox = sandbox
+
         self.executor = ExecutionPlanManager(
             session=session,
             registry=registry,
@@ -133,13 +173,74 @@ class TransactionalExecutionManager:
             policy_hash=policy_hash,
         )
 
+    @property
+    def workspace_dir(self) -> Optional[str]:
+        return self.sandbox.policy.workspace_dir
+
+    def close(self) -> None:
+        """Destroy any workspace owned by this transaction manager."""
+        if self._closed:
+            return
+        self._closed = True
+        if self._owned_workspace is not None:
+            self._owned_workspace.__exit__(None, None, None)
+            self._owned_workspace = None
+
+    def _secure_runtime_preflight(self) -> Optional[str]:
+        if self._allow_insecure_test_sandbox:
+            return None
+        if not self.sandbox.is_fail_closed:
+            return "transaction sandbox is not configured fail-closed"
+        if not self.sandbox.policy.workspace_dir:
+            return "transaction sandbox has no isolated workspace"
+        if not self.sandbox.kernel_isolation_ready:
+            return "kernel isolation backend (bwrap) unavailable; transaction refused before dispatch"
+        return None
+
     def execute_and_finalize(
         self,
         certificate: AuthorizationCertificate,
         execution_backend: Optional[ExecutionBackend] = None,
     ) -> TransactionSummary:
+        try:
+            return self._execute_and_finalize(certificate, execution_backend)
+        finally:
+            self.close()
+
+    def _execute_and_finalize(
+        self,
+        certificate: AuthorizationCertificate,
+        execution_backend: Optional[ExecutionBackend],
+    ) -> TransactionSummary:
         plan = self._plan_for_certificate(certificate)
         self._assert_unique_action_ids(plan.actions)
+
+        if execution_backend is not None and not self._allow_insecure_test_sandbox:
+            raise SandboxSecurityViolationError(
+                "Custom execution backends are not permitted on the production transactional path; "
+                "all commands must pass through the configured isolation sandbox."
+            )
+
+        isolation_error = self._secure_runtime_preflight()
+        if isolation_error:
+            execution = ExecutionSummary(
+                plan_id=plan.plan_id,
+                plan_version=plan.version,
+                success=False,
+                live_world_state=copy.deepcopy(self.executor.live_world_state),
+            )
+            if self.session.current_state == SessionState.EXECUTING:
+                self.session.record_execution_result(
+                    False,
+                    list(self.executor.live_world_state.values()),
+                )
+            return self._compensate_or_contain(
+                certificate,
+                execution,
+                execution_backend,
+                [isolation_error],
+            )
+
         dispatch_index = 0
 
         def tracking_backend(argv: List[str], *, timeout_seconds: float):
@@ -157,7 +258,11 @@ class TransactionalExecutionManager:
             )
             if execution_backend is not None:
                 return execution_backend(argv, timeout_seconds=timeout_seconds)
-            return self.sandbox.execute_argv_pipeline([argv], timeout_seconds=timeout_seconds)
+            return self.sandbox.execute_argv_pipeline(
+                [argv],
+                cwd=self.sandbox.policy.workspace_dir,
+                timeout_seconds=timeout_seconds,
+            )
 
         try:
             execution = self.executor.execute_authorized_plan(
@@ -427,7 +532,11 @@ class TransactionalExecutionManager:
             if execution_backend is not None:
                 exec_result = execution_backend(argv, timeout_seconds=spec.timeout_seconds)
             else:
-                exec_result = self.sandbox.execute_argv_pipeline([argv], timeout_seconds=spec.timeout_seconds)
+                exec_result = self.sandbox.execute_argv_pipeline(
+                    [argv],
+                    cwd=self.sandbox.policy.workspace_dir,
+                    timeout_seconds=spec.timeout_seconds,
+                )
         except Exception as exc:
             return CompensationResult(
                 original_step_id=original_action.action_id,
