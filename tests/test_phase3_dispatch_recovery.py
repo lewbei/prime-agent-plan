@@ -18,6 +18,7 @@ from plan_mode.runtime import (
     TransactionOutcome,
     TransactionalExecutionManager,
 )
+from plan_mode.runtime.sandbox import IsolationPolicy
 from plan_mode.session import PlanningSession, SessionState
 
 
@@ -32,6 +33,17 @@ def _action(action_id: str, cap: str, params=None, effects=None):
         parameters=params or {},
         positive_effects=effects or [],
         provenance=_prov(),
+    )
+
+
+def _test_sandbox() -> ExecutionSandbox:
+    return ExecutionSandbox(
+        IsolationPolicy(
+            use_bwrap=False,
+            require_bwrap=False,
+            allow_unisolated_fallback=True,
+            read_only_root=False,
+        )
     )
 
 
@@ -99,6 +111,8 @@ def test_duplicate_action_ids_are_rejected_before_any_dispatch():
         ledger=ledger,
         observed_world_state=[],
         policy_hash=policy,
+        sandbox=_test_sandbox(),
+        allow_insecure_test_sandbox=True,
     )
     calls = []
 
@@ -174,6 +188,8 @@ def test_backend_exception_after_real_side_effect_triggers_verified_compensation
         ledger=ledger,
         observed_world_state=[],
         policy_hash=policy,
+        sandbox=_test_sandbox(),
+        allow_insecure_test_sandbox=True,
     )
     sandbox = ExecutionSandbox()
     touch_calls = 0
