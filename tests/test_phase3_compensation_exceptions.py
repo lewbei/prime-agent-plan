@@ -4,6 +4,7 @@ from __future__ import annotations
 from plan_mode.ir import ActionIR, PlanIR, PredicateCondition, Provenance, SourceType
 from plan_mode.registry import CapabilityEntry, CapabilityRegistry, CompensationAction, ObservationVerifier
 from plan_mode.runtime import EvidenceLedger, ExecutionSandbox, TransactionOutcome, TransactionalExecutionManager
+from plan_mode.runtime.sandbox import IsolationPolicy
 from plan_mode.session import PlanningSession, SessionState
 
 
@@ -18,6 +19,17 @@ def _action(action_id, cap, params=None, effects=None):
         parameters=params or {},
         positive_effects=effects or [],
         provenance=_prov(),
+    )
+
+
+def _test_sandbox() -> ExecutionSandbox:
+    return ExecutionSandbox(
+        IsolationPolicy(
+            use_bwrap=False,
+            require_bwrap=False,
+            allow_unisolated_fallback=True,
+            read_only_root=False,
+        )
     )
 
 
@@ -85,6 +97,8 @@ def _setup(path: str, *, verifier_pattern=None):
         ledger=EvidenceLedger(session_id=session.session_id),
         observed_world_state=[],
         policy_hash=policy,
+        sandbox=_test_sandbox(),
+        allow_insecure_test_sandbox=True,
     )
     return session, manager, cert
 
@@ -112,7 +126,6 @@ def test_compensation_backend_exception_enters_containment_failed(tmp_path):
 
 def test_compensation_verifier_exception_enters_containment_failed(tmp_path):
     target = tmp_path / "verifier-exception.txt"
-    # Invalid regex is evaluated only after the real compensation command succeeds.
     session, manager, cert = _setup(str(target), verifier_pattern="[")
     summary = manager.execute_and_finalize(cert)
     assert summary.outcome == TransactionOutcome.CONTAINMENT_FAILED
