@@ -324,7 +324,6 @@ class ExecutionSandbox:
             prev_stdout = None
             for idx, raw_cmd in enumerate(pipeline):
                 is_first = idx == 0
-                is_last = idx == len(pipeline) - 1
                 sandboxed_cmd = self._wrap_command_with_bwrap(raw_cmd, effective_cwd)
                 stdin_source = subprocess.PIPE if (is_first and input_data) else prev_stdout
                 proc = subprocess.Popen(
@@ -411,7 +410,17 @@ class ExecutionSandbox:
         if not self.kernel_isolation_ready:
             return cmd
 
-        bwrap_args = [self._bwrap_binary]
+        # Make the user namespace explicit instead of relying on Bubblewrap's
+        # implicit unprivileged-user behavior.  The process is root only inside
+        # the new user namespace and carries no host-root authority.
+        bwrap_args = [
+            self._bwrap_binary,
+            "--unshare-user",
+            "--uid",
+            "0",
+            "--gid",
+            "0",
+        ]
         if self.policy.read_only_root:
             bwrap_args.extend(["--ro-bind", "/", "/"])
         else:
@@ -444,6 +453,8 @@ class ExecutionSandbox:
             "--unshare-pid",
             "--unshare-ipc",
             "--unshare-uts",
+            "--unshare-cgroup-try",
+            "--new-session",
             "--die-with-parent",
             "--chdir",
             cwd,
