@@ -339,13 +339,23 @@ class EpistemicPlanSearch:
                 # Flaw-directed mutations for UNKNOWN facts
                 if val_res.status == ValidationStatus.UNKNOWN and val_res.unknown_facts:
                     target_unknown = val_res.unknown_facts[0]
+                    unknown_pred = target_unknown
+                    unknown_args: List[str] = []
+                    if "(" in target_unknown and target_unknown.endswith(")"):
+                        unknown_pred = target_unknown[:target_unknown.find("(")]
+                        raw_args = target_unknown[target_unknown.find("(") + 1 : -1]
+                        unknown_args = [a.strip() for a in raw_args.split(",") if a.strip()]
+
                     # Look up capability in registry that produces the missing fact
                     for cap_name, cap in sorted(self.registry.capabilities.items()):
                         for eff in cap.positive_effects:
-                            if eff.predicate in target_unknown:
+                            if eff.predicate == unknown_pred or eff.predicate in target_unknown:
                                 probe_params: Dict[str, Any] = {}
-                                for p_name, p_spec in cap.input_schema.items():
-                                    probe_params[p_name] = "default_val"
+                                for p_idx, (p_name, p_spec) in enumerate(cap.input_schema.items()):
+                                    if p_idx < len(unknown_args):
+                                        probe_params[p_name] = unknown_args[p_idx]
+                                    else:
+                                        probe_params[p_name] = "default_val"
 
                                 mutated = insert_disambiguation_action(
                                     plan_ir=candidate,
@@ -353,7 +363,10 @@ class EpistemicPlanSearch:
                                     probe_capability_name=cap_name,
                                     parameters=probe_params,
                                     positive_effects=[
-                                        PredicateCondition(predicate=eff.predicate, args=[])
+                                        PredicateCondition(
+                                            predicate=eff.predicate,
+                                            args=unknown_args if unknown_args else eff.args,
+                                        )
                                     ],
                                 )
                                 next_beam.append(mutated)
