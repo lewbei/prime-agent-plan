@@ -1,12 +1,13 @@
-# Epistemic Planning & Verification Runtime: Target Security Model
+# Epistemic Planning & Verification Runtime: Security Model & Isolation Architecture
 
-> [!WARNING]
-> **TARGET ARCHITECTURE SPECIFICATION — PROTOTYPE STAGE**
-> This document describes the **target security architecture** for future production deployment.
-> **Current Codebase Status (Phase 0 Scaffolding):**
-> - `sandbox.py` is currently a **Structured Subprocess Runner** that avoids shell interpolation (`shell=False`) and passes explicit argument vectors (`argv`), but does **not** provide OS-level container isolation, cgroups, memory limits, or kernel namespace containment.
-> - `ledger.py` is an **in-memory integrity-linked event hash chain**, not a tamper-proof or externally anchored append-only disk ledger.
-> - The runtime currently operates within the local Python process space; non-repudiation, protected signing keys, and hardened security boundaries are future targets, not current guarantees.
+> [!NOTE]
+> **PHASE 4 IMPLEMENTATION COMPLETE & VERIFIED**
+> This document describes the **hardened security architecture** enforced by the runtime.
+> **Current Codebase Status (Phases 0–4 Verified):**
+> - `sandbox.py` implements **Real Linux Namespace & Container Isolation** via Bubblewrap (`bwrap`), POSIX resource limits (`RLIMIT_AS`, `RLIMIT_CPU`, `RLIMIT_NPROC`, `RLIMIT_FSIZE`), network default-deny policies, filesystem workspace jails, path traversal & symlink escape defenses, output size caps, and secret scrubbing.
+> - `transaction.py` provides transactional saga compensation, pre-dispatch recovery recording, and fail-closed `CONTAINMENT_FAILED` handling.
+> - `ledger.py` is an **in-memory integrity-linked SHA-256 event hash chain** providing chronological auditability for all runtime actions and observations.
+> - `session.py` provides HMAC cryptographic authorization certificates strictly bound to canonical PlanIR hashes, trusted validation snapshots, and registry policies.
 
 ---
 

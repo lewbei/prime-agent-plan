@@ -2,7 +2,19 @@
 
 from plan_mode.runtime.ledger import EvidenceLedger, LedgerEventType, LedgerRecord, LedgerTamperError
 from plan_mode.runtime.secret_scrubber import SecretScrubber
-from plan_mode.runtime.sandbox import ExecutionSandbox, SandboxExecutionResult
+from plan_mode.runtime.sandbox import (
+    ExecutionSandbox,
+    SandboxExecutionResult,
+    IsolationPolicy,
+    EphemeralWorkspace,
+    SecurityProfile,
+    SecurityProfileType,
+    validate_path_within_workspace,
+    PathTraversalEscapeError,
+    SymlinkEscapeError,
+    SandboxResourceLimitExceededError,
+    SandboxSecurityViolationError,
+)
 from plan_mode.runtime.executor import (
     ExecutionPlanManager,
     WitnessStatus,
@@ -26,6 +38,15 @@ __all__ = [
     "SecretScrubber",
     "ExecutionSandbox",
     "SandboxExecutionResult",
+    "IsolationPolicy",
+    "EphemeralWorkspace",
+    "SecurityProfile",
+    "SecurityProfileType",
+    "validate_path_within_workspace",
+    "PathTraversalEscapeError",
+    "SymlinkEscapeError",
+    "SandboxResourceLimitExceededError",
+    "SandboxSecurityViolationError",
     "ExecutionPlanManager",
     "WitnessStatus",
     "ExecutionSummary",

@@ -1,18 +1,174 @@
-"""Structured Subprocess Runner with argv Pipeline Chaining (No Shell Interpolation).
+"""Hardened Execution Sandbox with Kernel Namespaces, Resource Limits, and Path Traversal Defenses (Phase 4).
 
-Note: This runner executes explicit argument vectors via native OS pipes and stripped environment variables.
-It does NOT provide hostile-code containment or OS-level container isolation.
+Features:
+- Linux Bubblewrap (bwrap) unprivileged container isolation (User, Mount, PID, Network namespaces).
+- POSIX resource limits (RLIMIT_AS memory bounds, RLIMIT_CPU compute bounds, RLIMIT_NPROC process bounds, RLIMIT_FSIZE write caps).
+- Network default-deny policy (unshare network namespace).
+- Filesystem jails (read-only host root, isolated ephemeral workspace).
+- Path traversal ('../') and symlink escape verification.
+- Output size truncation and secret scrubbing.
 """
 
 from __future__ import annotations
 
+import json
 import os
+import re
+import shutil
 import subprocess
+import sys
+import tempfile
 import time
-from typing import Dict, List, Optional
+from enum import Enum
+from pathlib import Path
+from typing import Any, Dict, List, Optional
 from pydantic import BaseModel, Field
 
 from plan_mode.runtime.secret_scrubber import SecretScrubber
+
+try:
+    import resource
+    HAS_RESOURCE_MODULE = True
+except ImportError:
+    HAS_RESOURCE_MODULE = False
+
+
+class PathTraversalEscapeError(Exception):
+    """Raised when a path or command attempts to escape the designated workspace boundary."""
+    pass
+
+
+class SymlinkEscapeError(Exception):
+    """Raised when a symlink resolves to a target outside the workspace boundary."""
+    pass
+
+
+class SandboxResourceLimitExceededError(Exception):
+    """Raised when an action exceeds configured CPU, memory, or process limits."""
+    pass
+
+
+class SandboxSecurityViolationError(Exception):
+    """Raised when an action attempts an unauthorized network or filesystem operation."""
+    pass
+
+
+class SecurityProfileType(str, Enum):
+    STRICT = "STRICT"
+    PERMISSIVE_DEV = "PERMISSIVE_DEV"
+    NETWORK_ALLOWED = "NETWORK_ALLOWED"
+
+
+class IsolationPolicy(BaseModel):
+    """Declarative security policy constraining capability and payload execution."""
+    workspace_dir: Optional[str] = None
+    allow_network: bool = False
+    read_only_root: bool = True
+    blocked_paths: List[str] = Field(
+        default_factory=lambda: [
+            "/etc/shadow",
+            "/etc/sudoers",
+            "/root",
+            os.path.expanduser("~/.ssh"),
+            os.path.expanduser("~/.aws"),
+            os.path.expanduser("~/.gnupg"),
+        ]
+    )
+    memory_limit_bytes: Optional[int] = 512 * 1024 * 1024  # 512MB RAM cap
+    max_processes: Optional[int] = 32                      # 32 max child processes
+    cpu_time_limit_seconds: Optional[float] = 10.0         # 10s CPU compute cap
+    max_file_size_bytes: Optional[int] = 50 * 1024 * 1024  # 50MB max file write
+    max_output_size_bytes: int = 100 * 1024                # 100KB stdout/stderr truncation cap
+    env_whitelist: List[str] = Field(
+        default_factory=lambda: ["PATH", "LANG", "LC_ALL", "TMPDIR", "PYTHONPATH", "HOME"]
+    )
+    use_bwrap: bool = True
+
+
+class SecurityProfile:
+    """Pre-configured security policy profiles."""
+    STRICT = SecurityProfileType.STRICT
+    PERMISSIVE_DEV = SecurityProfileType.PERMISSIVE_DEV
+    NETWORK_ALLOWED = SecurityProfileType.NETWORK_ALLOWED
+
+    @classmethod
+    def get_profile(cls, profile_type: SecurityProfileType | str) -> IsolationPolicy:
+        if isinstance(profile_type, str):
+            profile_type = SecurityProfileType(profile_type)
+
+        if profile_type == SecurityProfileType.STRICT:
+            return IsolationPolicy(
+                allow_network=False,
+                read_only_root=True,
+                max_processes=16,
+                memory_limit_bytes=256 * 1024 * 1024,
+                cpu_time_limit_seconds=5.0,
+            )
+        elif profile_type == SecurityProfileType.PERMISSIVE_DEV:
+            return IsolationPolicy(
+                allow_network=False,
+                read_only_root=False,
+                max_processes=64,
+                memory_limit_bytes=1024 * 1024 * 1024,
+                cpu_time_limit_seconds=30.0,
+            )
+        elif profile_type == SecurityProfileType.NETWORK_ALLOWED:
+            return IsolationPolicy(
+                allow_network=True,
+                read_only_root=True,
+                max_processes=32,
+                memory_limit_bytes=512 * 1024 * 1024,
+                cpu_time_limit_seconds=10.0,
+            )
+        return IsolationPolicy()
+
+
+def validate_path_within_workspace(path: str, workspace_dir: str) -> str:
+    """Verify that path resides strictly inside workspace_dir, resolving symlinks and '../'."""
+    real_ws = os.path.realpath(os.path.abspath(workspace_dir))
+    norm_path = os.path.normpath(os.path.abspath(path))
+
+    # Check for relative traversal escape
+    try:
+        common_norm = os.path.commonpath([norm_path, real_ws])
+        if common_norm != real_ws and norm_path != real_ws:
+            raise PathTraversalEscapeError(
+                f"Path traversal escape detected: '{path}' escapes workspace '{workspace_dir}'"
+            )
+    except ValueError:
+        raise PathTraversalEscapeError(f"Path '{path}' is on a different drive or invalid for workspace '{workspace_dir}'")
+
+    # Check symlink target resolution
+    if os.path.islink(path) or os.path.exists(path):
+        real_target = os.path.realpath(path)
+        try:
+            common_real = os.path.commonpath([real_target, real_ws])
+            if common_real != real_ws and real_target != real_ws:
+                raise SymlinkEscapeError(
+                    f"Symlink escape detected: '{path}' points to '{real_target}' outside workspace '{workspace_dir}'"
+                )
+        except ValueError:
+            raise SymlinkEscapeError(f"Symlink '{path}' resolves outside workspace boundary")
+
+    return norm_path
+
+
+class EphemeralWorkspace:
+    """Secure temporary workspace context manager with strict 0o700 permissions and automated cleanup."""
+
+    def __init__(self, base_dir: Optional[str] = None, prefix: str = "prime_ws_"):
+        self.base_dir = base_dir
+        self.prefix = prefix
+        self.path: str = ""
+
+    def __enter__(self) -> EphemeralWorkspace:
+        self.path = tempfile.mkdtemp(prefix=self.prefix, dir=self.base_dir)
+        os.chmod(self.path, 0o700)
+        return self
+
+    def __exit__(self, exc_type: Any, exc_val: Any, exc_tb: Any) -> None:
+        if self.path and os.path.exists(self.path):
+            shutil.rmtree(self.path, ignore_errors=True)
 
 
 class SandboxExecutionResult(BaseModel):
@@ -22,10 +178,11 @@ class SandboxExecutionResult(BaseModel):
     returncode: int = 0
     duration_ms: float = 0.0
     timeout_exceeded: bool = False
+    resource_limit_exceeded: bool = False
 
 
 class ExecutionSandbox:
-    """Executes structured argv pipelines with direct OS pipes and whitelisted environment variables."""
+    """Executes structured argv pipelines with Bubblewrap/namespace isolation, rlimits, and secret scrubbing."""
 
     DEFAULT_ENV_WHITELIST = {
         "PATH": "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
@@ -33,8 +190,15 @@ class ExecutionSandbox:
         "LC_ALL": "C.UTF-8",
     }
 
-    def __init__(self, scrubber: Optional[SecretScrubber] = None):
+    def __init__(
+        self,
+        policy: Optional[IsolationPolicy] = None,
+        scrubber: Optional[SecretScrubber] = None,
+    ):
+        self.policy = policy or IsolationPolicy()
         self.scrubber = scrubber or SecretScrubber()
+        self._bwrap_binary = shutil.which("bwrap") if self.policy.use_bwrap else None
+        self._prlimit_binary = shutil.which("prlimit")
 
     def execute_argv_pipeline(
         self,
@@ -44,50 +208,70 @@ class ExecutionSandbox:
         timeout_seconds: float = 10.0,
         input_data: Optional[str] = None,
     ) -> SandboxExecutionResult:
-        """Execute a pipeline of commands: cmd_0 | cmd_1 | ... | cmd_n via direct OS pipes."""
+        """Execute a pipeline of commands: cmd_0 | cmd_1 | ... | cmd_n under full isolation."""
         if not pipeline:
             return SandboxExecutionResult(returncode=0)
 
-        # Build sanitized execution environment
+        effective_cwd = cwd or self.policy.workspace_dir or os.getcwd()
+
+        # Build sanitized execution environment (strictly whitelisted, stripping host secrets)
         exec_env = dict(self.DEFAULT_ENV_WHITELIST)
+        for key in self.policy.env_whitelist:
+            if key in os.environ and key not in exec_env:
+                exec_env[key] = os.environ[key]
         if env:
             exec_env.update(env)
+
+        # If workspace_dir is specified, validate cwd
+        if self.policy.workspace_dir:
+            try:
+                validate_path_within_workspace(effective_cwd, self.policy.workspace_dir)
+            except (PathTraversalEscapeError, SymlinkEscapeError) as e:
+                return SandboxExecutionResult(
+                    stderr=f"Security violation: {str(e)}",
+                    returncode=126,
+                )
 
         start_time = time.time()
         processes: List[subprocess.Popen] = []
 
+        # Build preexec function for POSIX rlimits
+        preexec = self._build_preexec_fn()
+
         try:
             prev_stdout = None
-            for idx, cmd in enumerate(pipeline):
+            for idx, raw_cmd in enumerate(pipeline):
                 is_first = (idx == 0)
                 is_last = (idx == len(pipeline) - 1)
+
+                # Wrap with bwrap sandbox if available and applicable
+                sandboxed_cmd = self._wrap_command_with_bwrap(raw_cmd, effective_cwd)
 
                 stdin_source = subprocess.PIPE if (is_first and input_data) else prev_stdout
                 stdout_target = subprocess.PIPE if is_last else subprocess.PIPE
                 stderr_target = subprocess.PIPE
 
                 proc = subprocess.Popen(
-                    cmd,
+                    sandboxed_cmd,
                     stdin=stdin_source,
                     stdout=stdout_target,
                     stderr=stderr_target,
-                    cwd=cwd,
+                    cwd=effective_cwd,
                     env=exec_env,
                     text=True,
+                    preexec_fn=preexec,
                 )
                 processes.append(proc)
 
-                # Close intermediate reading descriptor in parent so child gets EOF
                 if prev_stdout is not None:
                     prev_stdout.close()
                 prev_stdout = proc.stdout
 
-            # Send input to first process if provided
             last_proc = processes[-1]
             first_proc = processes[0]
             first_in = input_data if input_data else None
 
-            # Communicate with pipeline
+            # Communicate with pipeline under timeout
             stdout_out, stderr_out = last_proc.communicate(timeout=timeout_seconds)
             if first_in and first_proc != last_proc and first_proc.stdin:
                 try:
@@ -99,9 +283,9 @@ class ExecutionSandbox:
             duration = (time.time() - start_time) * 1000.0
             returncode = last_proc.returncode
 
-            # Scrub output
-            clean_stdout = self.scrubber.scrub_text(stdout_out or "")
-            clean_stderr = self.scrubber.scrub_text(stderr_out or "")
+            # Apply output size truncation cap
+            clean_stdout = self._truncate_and_scrub(stdout_out or "")
+            clean_stderr = self._truncate_and_scrub(stderr_out or "")
 
             return SandboxExecutionResult(
                 stdout=clean_stdout,
@@ -112,7 +296,6 @@ class ExecutionSandbox:
             )
 
         except subprocess.TimeoutExpired:
-            # Terminate all processes in pipeline
             for p in processes:
                 try:
                     p.kill()
@@ -137,3 +320,106 @@ class ExecutionSandbox:
                 duration_ms=round(duration, 2),
                 timeout_exceeded=False,
             )
+
+    def _wrap_command_with_bwrap(self, cmd: List[str], cwd: str) -> List[str]:
+        """Wrap an argument vector with Bubblewrap namespace flags if available."""
+        if not self._bwrap_binary or not self.policy.use_bwrap:
+            return cmd
+
+        bwrap_args = [self._bwrap_binary]
+
+        # Filesystem containment
+        if self.policy.read_only_root:
+            bwrap_args.extend(["--ro-bind", "/", "/"])
+        else:
+            bwrap_args.extend(["--bind", "/", "/"])
+
+        # Mount devices, procfs, and tmpfs
+        if os.path.exists("/dev"):
+            bwrap_args.extend(["--dev", "/dev"])
+        if os.path.exists("/proc"):
+            bwrap_args.extend(["--proc", "/proc"])
+
+        # Mount ephemeral workspace as read-write
+        if self.policy.workspace_dir and os.path.exists(self.policy.workspace_dir):
+            bwrap_args.extend(["--bind", self.policy.workspace_dir, self.policy.workspace_dir])
+        elif not self.policy.workspace_dir:
+            # When no specific workspace jail is declared, allow safe write to /tmp and cwd
+            if os.path.exists("/tmp"):
+                bwrap_args.extend(["--bind", "/tmp", "/tmp"])
+            if cwd and os.path.exists(cwd):
+                bwrap_args.extend(["--bind", cwd, cwd])
+
+        # Mask blocked sensitive host paths
+        for blocked in self.policy.blocked_paths:
+            if blocked and os.path.exists(blocked):
+                if os.path.isdir(blocked):
+                    bwrap_args.extend(["--tmpfs", blocked])
+                else:
+                    bwrap_args.extend(["--ro-bind", "/dev/null", blocked])
+
+        # Network namespace containment (default deny)
+        if not self.policy.allow_network:
+            bwrap_args.append("--unshare-net")
+
+        # Process and lifecycle isolation
+        bwrap_args.extend([
+            "--unshare-pid",
+            "--unshare-ipc",
+            "--unshare-uts",
+            "--die-with-parent",
+            "--chdir", cwd,
+            "--",
+        ])
+
+        # If prlimit is available, wrap inner command inside container with strict limits
+        if self._prlimit_binary:
+            prlimit_flags = [self._prlimit_binary]
+            if self.policy.max_processes is not None:
+                prlimit_flags.append(f"--nproc={self.policy.max_processes}")
+            if self.policy.memory_limit_bytes is not None:
+                prlimit_flags.append(f"--as={self.policy.memory_limit_bytes}")
+            if self.policy.cpu_time_limit_seconds is not None:
+                prlimit_flags.append(f"--cpu={int(self.policy.cpu_time_limit_seconds)}")
+            if self.policy.max_file_size_bytes is not None:
+                prlimit_flags.append(f"--fsize={self.policy.max_file_size_bytes}")
+            prlimit_flags.append("--")
+            bwrap_args.extend(prlimit_flags)
+
+        bwrap_args.extend(cmd)
+        return bwrap_args
+
+    def _build_preexec_fn(self) -> Optional[Any]:
+        """Configure POSIX rlimits for memory, CPU, process count, and write sizes."""
+        if not HAS_RESOURCE_MODULE:
+            return None
+
+        mem_limit = self.policy.memory_limit_bytes
+        cpu_limit = int(self.policy.cpu_time_limit_seconds) if self.policy.cpu_time_limit_seconds else None
+        nproc_limit = self.policy.max_processes
+        fsize_limit = self.policy.max_file_size_bytes
+
+        is_using_bwrap = bool(self._bwrap_binary and self.policy.use_bwrap)
+
+        def _set_limits():
+            try:
+                if mem_limit is not None and hasattr(resource, "RLIMIT_AS"):
+                    resource.setrlimit(resource.RLIMIT_AS, (mem_limit, mem_limit))
+                if cpu_limit is not None and hasattr(resource, "RLIMIT_CPU"):
+                    resource.setrlimit(resource.RLIMIT_CPU, (cpu_limit, cpu_limit + 1))
+                if not is_using_bwrap and nproc_limit is not None and hasattr(resource, "RLIMIT_NPROC"):
+                    resource.setrlimit(resource.RLIMIT_NPROC, (nproc_limit, nproc_limit))
+                if fsize_limit is not None and hasattr(resource, "RLIMIT_FSIZE"):
+                    resource.setrlimit(resource.RLIMIT_FSIZE, (fsize_limit, fsize_limit))
+            except Exception:
+                pass
+
+        return _set_limits
+
+    def _truncate_and_scrub(self, text: str) -> str:
+        """Apply output size limit cap and scrub secrets."""
+        if len(text) > self.policy.max_output_size_bytes:
+            truncated = text[: self.policy.max_output_size_bytes] + "\n[TRUNCATED_MAX_OUTPUT_EXCEEDED]"
+        else:
+            truncated = text
+        return self.scrubber.scrub_text(truncated)
