@@ -71,10 +71,7 @@ def _resolve_tokens(tokens: List[str], params: Dict[str, Any]) -> List[str]:
     return resolved
 
 
-def _resolve_parameter_mapping(
-    mapping: Dict[str, str], original_params: Dict[str, Any]
-) -> Dict[str, Any]:
-    """Resolve compensation params, rejecting missing explicit placeholders."""
+def _resolve_parameter_mapping(mapping: Dict[str, str], original_params: Dict[str, Any]) -> Dict[str, Any]:
     resolved: Dict[str, Any] = {}
     for target, source in mapping.items():
         is_braced = source.startswith("{") and source.endswith("}")
@@ -141,14 +138,8 @@ class TransactionalExecutionManager:
         certificate: AuthorizationCertificate,
         execution_backend: Optional[ExecutionBackend] = None,
     ) -> TransactionSummary:
-        """Run one authorized transaction and finalize it exactly once."""
         plan = self._plan_for_certificate(certificate)
         self._assert_unique_action_ids(plan.actions)
-
-        # Always pass a tracking backend to the Phase 2 executor.  The dispatch
-        # record is written *before* the underlying launcher runs, so a backend
-        # exception after a possible side effect still leaves enough evidence
-        # for conservative compensation.
         dispatch_index = 0
 
         def tracking_backend(argv: List[str], *, timeout_seconds: float):
@@ -162,7 +153,6 @@ class TransactionalExecutionManager:
                 {
                     "step_id": action.action_id,
                     "capability": action.capability_name,
-                    "argv": list(argv),
                 },
             )
             if execution_backend is not None:
@@ -184,10 +174,7 @@ class TransactionalExecutionManager:
                 live_world_state=copy.deepcopy(self.executor.live_world_state),
             )
             if self.session.current_state == SessionState.EXECUTING:
-                self.session.record_execution_result(
-                    False,
-                    list(self.executor.live_world_state.values()),
-                )
+                self.session.record_execution_result(False, list(self.executor.live_world_state.values()))
             return self._compensate_or_contain(
                 certificate,
                 execution,
@@ -210,9 +197,7 @@ class TransactionalExecutionManager:
 
         if execution.success:
             try:
-                self.session.commit_execution(
-                    live_world_state=self.executor.live_world_state,
-                )
+                self.session.commit_execution(live_world_state=self.executor.live_world_state)
                 self.ledger.append_record(
                     LedgerEventType.PLAN_COMMITTED,
                     {
@@ -228,19 +213,9 @@ class TransactionalExecutionManager:
                 )
             except CommitGateError as exc:
                 blockers = list(exc.blockers)
-                return self._compensate_or_contain(
-                    certificate,
-                    execution,
-                    execution_backend,
-                    blockers,
-                )
             except Exception as exc:
-                return self._compensate_or_contain(
-                    certificate,
-                    execution,
-                    execution_backend,
-                    [f"commit finalization error: {type(exc).__name__}: {exc}"],
-                )
+                blockers = [f"commit finalization error: {type(exc).__name__}: {exc}"]
+            return self._compensate_or_contain(certificate, execution, execution_backend, blockers)
 
         return self._compensate_or_contain(
             certificate,
@@ -285,15 +260,11 @@ class TransactionalExecutionManager:
         assert self.session.authorized_version is not None
         plan = self.session.versions[self.session.authorized_version].plan_ir
         action_by_id = {action.action_id: action for action in plan.actions}
-        dispatched_ids = self._dispatched_action_ids()
         effectful_dispatched = [
             step_id
-            for step_id in dispatched_ids
+            for step_id in self._dispatched_action_ids()
             if step_id in action_by_id
-            and (
-                action_by_id[step_id].positive_effects
-                or action_by_id[step_id].negative_effects
-            )
+            and (action_by_id[step_id].positive_effects or action_by_id[step_id].negative_effects)
         ]
 
         if not effectful_dispatched:
@@ -311,19 +282,11 @@ class TransactionalExecutionManager:
 
         if self.registry.compute_registry_hash() != certificate.registry_hash:
             return self._containment_failed(
-                execution,
-                [],
-                blockers,
-                effectful_dispatched[-1],
-                "capability registry drifted before compensation",
+                execution, [], blockers, effectful_dispatched[-1], "capability registry drifted before compensation"
             )
         if self.policy_hash != certificate.policy_hash:
             return self._containment_failed(
-                execution,
-                [],
-                blockers,
-                effectful_dispatched[-1],
-                "runtime policy drifted before compensation",
+                execution, [], blockers, effectful_dispatched[-1], "runtime policy drifted before compensation"
             )
 
         results: List[CompensationResult] = []
@@ -339,12 +302,7 @@ class TransactionalExecutionManager:
                     step_id,
                     "dispatched effectful capability has no registered compensation",
                 )
-
-            result = self._execute_compensation(
-                action,
-                spec,
-                execution_backend,
-            )
+            result = self._execute_compensation(action, spec, execution_backend)
             results.append(result)
             if not result.executed or not result.verified:
                 return self._containment_failed(
@@ -451,8 +409,7 @@ class TransactionalExecutionManager:
                     executed=False,
                     verified=False,
                     error_message=(
-                        f"compensation precondition '{pre.fact_key}' expected "
-                        f"{pre.expected_truth.value}, observed {observed}"
+                        f"compensation precondition '{pre.fact_key}' expected {pre.expected_truth.value}, observed {observed}"
                     ),
                 )
 
@@ -466,12 +423,19 @@ class TransactionalExecutionManager:
         )
 
         argv = _resolve_tokens(comp_cap.executor_command_template, params)
-        if execution_backend is not None:
-            exec_result = execution_backend(argv, timeout_seconds=spec.timeout_seconds)
-        else:
-            exec_result = self.sandbox.execute_argv_pipeline(
-                [argv],
-                timeout_seconds=spec.timeout_seconds,
+        try:
+            if execution_backend is not None:
+                exec_result = execution_backend(argv, timeout_seconds=spec.timeout_seconds)
+            else:
+                exec_result = self.sandbox.execute_argv_pipeline([argv], timeout_seconds=spec.timeout_seconds)
+        except Exception as exc:
+            return CompensationResult(
+                original_step_id=original_action.action_id,
+                compensation_id=spec.compensation_id,
+                capability_name=comp_cap.name,
+                executed=True,
+                verified=False,
+                error_message=f"compensation backend raised: {type(exc).__name__}: {exc}",
             )
 
         self.ledger.append_record(
@@ -495,7 +459,19 @@ class TransactionalExecutionManager:
                 error_message=exec_result.stderr or "compensation executor failed",
             )
 
-        witness = self.executor.witness_postconditions(comp_action, comp_cap)
+        try:
+            witness = self.executor.witness_postconditions(comp_action, comp_cap)
+        except Exception as exc:
+            return CompensationResult(
+                original_step_id=original_action.action_id,
+                compensation_id=spec.compensation_id,
+                capability_name=comp_cap.name,
+                executed=True,
+                verified=False,
+                returncode=exec_result.returncode,
+                error_message=f"compensation verifier raised: {type(exc).__name__}: {exc}",
+            )
+
         verified = witness == WitnessStatus.WITNESSED_TRUE
         self.ledger.append_record(
             LedgerEventType.COMPENSATION_VERIFIED,
@@ -506,7 +482,6 @@ class TransactionalExecutionManager:
                 "witness_status": witness.value,
             },
         )
-
         if verified:
             self._apply_compensation_effects(comp_action, spec.compensation_id)
 
