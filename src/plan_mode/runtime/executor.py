@@ -7,8 +7,19 @@ import json
 import re
 import time
 from enum import Enum
-from typing import Any, Callable, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional, Protocol
 from pydantic import BaseModel, Field
+
+
+class ExecutionBackend(Protocol):
+    """Execution backend interface for launching authorized command vectors."""
+    def __call__(
+        self,
+        authorized_argv: List[str],
+        *,
+        timeout_seconds: float = 10.0,
+    ) -> SandboxExecutionResult:
+        ...
 
 from plan_mode.ir import (
     ActionIR,
@@ -159,8 +170,10 @@ class ExecutionPlanManager:
     def execute_authorized_plan(
         self,
         certificate: AuthorizationCertificate,
-        custom_action_handler: Optional[Callable[[ActionIR, Dict[str, Any]], SandboxExecutionResult]] = None,
+        execution_backend: Optional[ExecutionBackend | Callable[..., SandboxExecutionResult]] = None,
+        custom_action_handler: Optional[ExecutionBackend | Callable[..., SandboxExecutionResult]] = None,
     ) -> ExecutionSummary:
+        backend = execution_backend or custom_action_handler
         start_time = time.time()
 
         # -------------------------------------------------------------------
@@ -348,8 +361,8 @@ class ExecutionPlanManager:
 
             # 4. Execute Capability Action
             cmd = _resolve_template_tokens(cap.executor_command_template, action.parameters)
-            if custom_action_handler is not None:
-                exec_res = custom_action_handler(cmd, timeout_seconds=action.timeout_seconds)
+            if backend is not None:
+                exec_res = backend(cmd, timeout_seconds=action.timeout_seconds)
             else:
                 exec_res = self.sandbox.execute_argv_pipeline([cmd], timeout_seconds=action.timeout_seconds)
 
@@ -594,8 +607,11 @@ class ExecutionPlanManager:
                         return False, f"JSON path '{v.json_path}' key '{key}' not found in output"
 
                 if v.expected_value is not None:
-                    if str(actual_val) != str(v.expected_value) and actual_val != v.expected_value:
-                        return False, f"JSON path '{v.json_path}' value '{actual_val}' != expected '{v.expected_value}'"
+                    if type(actual_val) is not type(v.expected_value) or actual_val != v.expected_value:
+                        return False, (
+                            f"JSON path '{v.json_path}' value {actual_val!r} (type {type(actual_val).__name__}) "
+                            f"!= expected {v.expected_value!r} (type {type(v.expected_value).__name__})"
+                        )
             except Exception as e:
                 return False, f"JSON parsing failed for verifier '{v.verifier_id}': {str(e)}"
 

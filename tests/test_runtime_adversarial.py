@@ -1850,3 +1850,215 @@ def test_world_state_hash_distinguishes_integer_and_string_arguments():
     hash_str = compute_world_state_hash([f_str])
 
     assert hash_int != hash_str
+
+
+# ---------------------------------------------------------------------------
+# Section T: Single Canonical Validation Snapshot Context (Time & Policy Consistency)
+# ---------------------------------------------------------------------------
+
+def test_validation_snapshot_uses_same_effective_time_as_validator():
+    """Validation and stored validation_world_state must use the exact same effective time."""
+    fact_expiring = WorldFact(
+        predicate="edge_token",
+        args=["tok1"],
+        truth=FactTruth.VERIFIED_TRUE,
+        ttl_seconds=10.0,
+        created_at=1000.0,
+        updated_at=1000.0,
+        provenance=Provenance(source_type=SourceType.OBSERVED_WORLD_STATE),
+    )
+    reg = CapabilityRegistry()
+    reg.register(
+        CapabilityEntry(
+            name="tool_ok",
+            description="Tool",
+            input_schema={},
+            positive_effects=[_cond("done", [])],
+            verifiers=[ObservationVerifier(verifier_id="v1", predicate="done", command_template=["true"])],
+            executor_command_template=["true"],
+        )
+    )
+    plan = PlanIR(
+        plan_id="p_time_consistency",
+        goal_description="Test time consistency",
+        initial_state=[],
+        actions=[_action(action_id="act1", capability_name="tool_ok", positive_effects=[_cond("done", [])])],
+    )
+    session = PlanningSession(session_id="s_time_consistency")
+    session.submit_draft(plan)
+
+    # Calling validate_candidate with current_time=1005 (before expiry)
+    session.validate_candidate(1, reg, observed_world_state=[fact_expiring], current_time=1005.0)
+
+    stored_v1 = session.versions[1]
+    assert stored_v1.validation_world_state is not None
+    assert stored_v1.validation_world_state[0].truth == FactTruth.VERIFIED_TRUE
+
+
+def test_validation_snapshot_respects_custom_validator_ttl_policy():
+    """Custom validator with default_ttl_decay_to_unknown=False preserves truth in stored validation_world_state."""
+    t0 = 1000.0
+    now = 1050.0  # Expired by 40s
+    expired_fact = WorldFact(
+        predicate="policy_token",
+        args=["tok2"],
+        truth=FactTruth.VERIFIED_TRUE,
+        ttl_seconds=10.0,
+        created_at=t0,
+        updated_at=t0,
+        provenance=Provenance(source_type=SourceType.OBSERVED_WORLD_STATE),
+    )
+    reg = CapabilityRegistry()
+    reg.register(
+        CapabilityEntry(
+            name="tool_ok",
+            description="Tool",
+            input_schema={},
+            positive_effects=[_cond("done", [])],
+            verifiers=[ObservationVerifier(verifier_id="v1", predicate="done", command_template=["true"])],
+            executor_command_template=["true"],
+        )
+    )
+    plan = PlanIR(
+        plan_id="p_custom_ttl_policy",
+        goal_description="Test custom TTL policy",
+        initial_state=[],
+        actions=[_action(action_id="act1", capability_name="tool_ok", positive_effects=[_cond("done", [])])],
+    )
+    session = PlanningSession(session_id="s_custom_ttl_policy")
+    session.submit_draft(plan)
+
+    from plan_mode.epistemic_validator import EpistemicCausalValidator
+    custom_val = EpistemicCausalValidator(default_ttl_decay_to_unknown=False)
+    session.validate_candidate(1, reg, validator=custom_val, observed_world_state=[expired_fact], current_time=now)
+
+    stored_v1 = session.versions[1]
+    assert stored_v1.validation_world_state is not None
+    assert stored_v1.validation_world_state[0].truth == FactTruth.VERIFIED_TRUE
+
+
+# ---------------------------------------------------------------------------
+# Section U: JSON Verifier Strict Type Equality (No str() Coercion)
+# ---------------------------------------------------------------------------
+
+def test_json_verifier_integer_does_not_match_string_expected_value():
+    """JSON output integer 123 must NOT match string '123'."""
+    reg = CapabilityRegistry()
+    reg.register(
+        CapabilityEntry(
+            name="json_tool_type_str",
+            description="Returns int 123",
+            input_schema={},
+            positive_effects=[_cond("val_ok", [])],
+            verifiers=[
+                ObservationVerifier(
+                    verifier_id="v_type_str",
+                    predicate="val_ok",
+                    command_template=["echo", '{"value": 123}'],
+                    json_path="value",
+                    expected_value="123",  # string "123"!
+                )
+            ],
+            executor_command_template=["true"],
+        )
+    )
+    plan = PlanIR(
+        plan_id="p_type_str_mismatch",
+        goal_description="Test int vs str mismatch",
+        initial_state=[],
+        actions=[_action(action_id="act1", capability_name="json_tool_type_str", positive_effects=[_cond("val_ok", [])])],
+    )
+    session = PlanningSession(session_id="s_type_str_mismatch")
+    session.submit_draft(plan)
+    session.validate_candidate(1, reg, observed_world_state=[])
+    session.select_version(1)
+    policy_hash = reg.compute_registry_hash()
+    cert = session.authorize_selected(reg, policy_hash=policy_hash)
+    session.start_execution(reg, policy_hash=policy_hash, current_world_facts=[])
+
+    manager = ExecutionPlanManager(session=session, registry=reg, ledger=EvidenceLedger(session_id=session.session_id), observed_world_state=[], policy_hash=policy_hash)
+    summary = manager.execute_authorized_plan(cert)
+    assert summary.success is False
+    assert summary.step_results[0].witness_status == WitnessStatus.WITNESSED_FALSE
+
+
+def test_json_verifier_integer_matches_integer_expected_value():
+    """JSON output integer 123 matches integer 123."""
+    reg = CapabilityRegistry()
+    reg.register(
+        CapabilityEntry(
+            name="json_tool_type_int",
+            description="Returns int 123",
+            input_schema={},
+            positive_effects=[_cond("val_ok", [])],
+            verifiers=[
+                ObservationVerifier(
+                    verifier_id="v_type_int",
+                    predicate="val_ok",
+                    command_template=["echo", '{"value": 123}'],
+                    json_path="value",
+                    expected_value=123,  # integer 123!
+                )
+            ],
+            executor_command_template=["true"],
+        )
+    )
+    plan = PlanIR(
+        plan_id="p_type_int_match",
+        goal_description="Test int match",
+        initial_state=[],
+        actions=[_action(action_id="act1", capability_name="json_tool_type_int", positive_effects=[_cond("val_ok", [])])],
+    )
+    session = PlanningSession(session_id="s_type_int_match")
+    session.submit_draft(plan)
+    session.validate_candidate(1, reg, observed_world_state=[])
+    session.select_version(1)
+    policy_hash = reg.compute_registry_hash()
+    cert = session.authorize_selected(reg, policy_hash=policy_hash)
+    session.start_execution(reg, policy_hash=policy_hash, current_world_facts=[])
+
+    manager = ExecutionPlanManager(session=session, registry=reg, ledger=EvidenceLedger(session_id=session.session_id), observed_world_state=[], policy_hash=policy_hash)
+    summary = manager.execute_authorized_plan(cert)
+    assert summary.success is True
+    assert summary.step_results[0].witness_status == WitnessStatus.WITNESSED_TRUE
+
+
+def test_json_verifier_bool_does_not_match_integer_expected_value():
+    """JSON output boolean true must NOT match integer 1."""
+    reg = CapabilityRegistry()
+    reg.register(
+        CapabilityEntry(
+            name="json_tool_type_bool",
+            description="Returns bool true",
+            input_schema={},
+            positive_effects=[_cond("val_ok", [])],
+            verifiers=[
+                ObservationVerifier(
+                    verifier_id="v_type_bool",
+                    predicate="val_ok",
+                    command_template=["echo", '{"value": true}'],
+                    json_path="value",
+                    expected_value=1,  # integer 1!
+                )
+            ],
+            executor_command_template=["true"],
+        )
+    )
+    plan = PlanIR(
+        plan_id="p_type_bool_mismatch",
+        goal_description="Test bool vs int mismatch",
+        initial_state=[],
+        actions=[_action(action_id="act1", capability_name="json_tool_type_bool", positive_effects=[_cond("val_ok", [])])],
+    )
+    session = PlanningSession(session_id="s_type_bool_mismatch")
+    session.submit_draft(plan)
+    session.validate_candidate(1, reg, observed_world_state=[])
+    session.select_version(1)
+    policy_hash = reg.compute_registry_hash()
+    cert = session.authorize_selected(reg, policy_hash=policy_hash)
+    session.start_execution(reg, policy_hash=policy_hash, current_world_facts=[])
+
+    manager = ExecutionPlanManager(session=session, registry=reg, ledger=EvidenceLedger(session_id=session.session_id), observed_world_state=[], policy_hash=policy_hash)
+    summary = manager.execute_authorized_plan(cert)
+    assert summary.success is False
+    assert summary.step_results[0].witness_status == WitnessStatus.WITNESSED_FALSE

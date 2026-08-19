@@ -224,17 +224,28 @@ class PlanningSession(BaseModel):
 
         v_obj = self.versions[version_number]
         val = validator or CausalValidator()
+        effective_now = current_time if current_time is not None else time.time()
+        ttl_decay_policy = getattr(val, "default_ttl_decay_to_unknown", True)
+
+        from plan_mode.epistemic_validator import normalize_trusted_snapshot
+        normalized_map = (
+            normalize_trusted_snapshot(
+                observed_world_state,
+                default_ttl_decay_to_unknown=ttl_decay_policy,
+                now=effective_now,
+            )
+            if observed_world_state is not None
+            else None
+        )
+        canonical_list = list(normalized_map.values()) if normalized_map is not None else None
+        ws_hash = compute_world_state_hash(canonical_list) if canonical_list is not None else compute_world_state_hash([])
+
         result = val.validate_plan(
             v_obj.plan_ir,
             registry=registry,
-            observed_world_state=observed_world_state,
-            current_time=current_time,
+            observed_world_state=normalized_map,
+            current_time=effective_now,
         )
-
-        from plan_mode.epistemic_validator import normalize_trusted_snapshot
-        normalized_map = normalize_trusted_snapshot(observed_world_state, now=current_time) if observed_world_state is not None else None
-        canonical_list = list(normalized_map.values()) if normalized_map is not None else None
-        ws_hash = compute_world_state_hash(canonical_list) if canonical_list is not None else compute_world_state_hash([])
 
         updated_version = PlanVersion(
             version_number=v_obj.version_number,

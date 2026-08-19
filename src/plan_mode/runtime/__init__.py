@@ -7,6 +7,7 @@ from plan_mode.runtime.executor import (
     ExecutionPlanManager,
     WitnessStatus,
     ExecutionSummary,
+    ExecutionBackend,
     PreconditionFailedError,
     ExecutionContractMissingError,
 )
@@ -22,6 +23,7 @@ __all__ = [
     "ExecutionPlanManager",
     "WitnessStatus",
     "ExecutionSummary",
+    "ExecutionBackend",
     "PreconditionFailedError",
     "ExecutionContractMissingError",
 ]
