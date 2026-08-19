@@ -103,7 +103,7 @@ def test_execution_manager_refuses_if_session_preflight_not_completed():
     cert = session.authorize_selected(reg, policy_hash=policy_hash)
 
     # Note: We do NOT call session.start_execution() -> current_state remains AUTHORIZED, not EXECUTING!
-    manager = ExecutionPlanManager(session=session, registry=reg, ledger=EvidenceLedger(session_id=session.session_id))
+    manager = ExecutionPlanManager(session=session, registry=reg, ledger=EvidenceLedger(session_id=session.session_id), observed_world_state=[], policy_hash=policy_hash)
     with pytest.raises((ValueError, InvalidStateTransitionError)):
         manager.execute_authorized_plan(cert)
 
@@ -148,7 +148,7 @@ def test_runtime_rejects_registry_drift_after_authorization():
         )
     )
 
-    manager = ExecutionPlanManager(session=session, registry=mutated_reg, ledger=EvidenceLedger(session_id=session.session_id))
+    manager = ExecutionPlanManager(session=session, registry=mutated_reg, ledger=EvidenceLedger(session_id=session.session_id), observed_world_state=[], policy_hash=policy_hash)
     with pytest.raises((StateDriftError, ValueError)):
         manager.execute_authorized_plan(cert)
 
@@ -191,6 +191,7 @@ def test_runtime_rejects_world_state_drift_before_execution():
         registry=reg,
         ledger=EvidenceLedger(session_id=session.session_id),
         observed_world_state=drifted_world,
+        policy_hash=policy_hash,
     )
     with pytest.raises((StateDriftError, PreconditionFailedError, ValueError)):
         manager.execute_authorized_plan(cert)
@@ -222,9 +223,9 @@ def test_runtime_rejects_policy_hash_mismatch():
     cert = session.authorize_selected(reg, policy_hash="policy_v1")
     session.start_execution(reg, policy_hash="policy_v1")
 
-    # Pass mismatched policy hash to manager
+    # Pass mismatched policy hash in certificate
     tampered_cert = cert.model_copy(update={"policy_hash": "wrong_policy_hash_xyz"})
-    manager = ExecutionPlanManager(session=session, registry=reg, ledger=EvidenceLedger(session_id=session.session_id))
+    manager = ExecutionPlanManager(session=session, registry=reg, ledger=EvidenceLedger(session_id=session.session_id), observed_world_state=[], policy_hash="policy_v1")
     with pytest.raises((StateDriftError, ValueError, SignatureVerificationError)):
         manager.execute_authorized_plan(tampered_cert)
 
@@ -263,7 +264,7 @@ def test_runtime_rejects_wrong_authorization_certificate_for_session():
     cert2 = s2.authorize_selected(reg, policy_hash=policy_hash)
     s2.start_execution(reg, policy_hash=policy_hash)
 
-    manager = ExecutionPlanManager(session=s1, registry=reg, ledger=EvidenceLedger(session_id=s1.session_id))
+    manager = ExecutionPlanManager(session=s1, registry=reg, ledger=EvidenceLedger(session_id=s1.session_id), observed_world_state=[], policy_hash=policy_hash)
     # Passing cert2 (from session s2) to session s1's manager
     with pytest.raises((SignatureVerificationError, ValueError, StateDriftError)):
         manager.execute_authorized_plan(cert2)
@@ -500,7 +501,7 @@ def test_custom_handler_cannot_bypass_missing_executor_contract(tmp_path):
     def custom_handler(action, params):
         return SandboxExecutionResult(stdout="fake", returncode=0)
 
-    manager = ExecutionPlanManager(session=session, registry=reg, ledger=EvidenceLedger(session_id=session.session_id))
+    manager = ExecutionPlanManager(session=session, registry=reg, ledger=EvidenceLedger(session_id=session.session_id), observed_world_state=[], policy_hash=policy_hash)
     summary = manager.execute_authorized_plan(cert, custom_action_handler=custom_handler)
     assert summary.success is False
     assert any("contract" in str(r.error_message).lower() for r in summary.step_results)
@@ -564,7 +565,7 @@ def test_precondition_failure_is_unwitnessed(tmp_path):
     cert = session.authorize_selected(reg, policy_hash=policy_hash)
     session.start_execution(reg, policy_hash=policy_hash, current_world_facts=[])
 
-    manager = ExecutionPlanManager(session=session, registry=reg, ledger=EvidenceLedger(session_id=session.session_id), observed_world_state=[])
+    manager = ExecutionPlanManager(session=session, registry=reg, ledger=EvidenceLedger(session_id=session.session_id), observed_world_state=[], policy_hash=policy_hash)
     summary = manager.execute_authorized_plan(cert)
 
     # Step 1 verifier fails (file not created -> WITNESSED_FALSE); plan aborts; step 2 is UNWITNESSED
@@ -600,7 +601,7 @@ def test_executor_failure_is_unwitnessed(tmp_path):
     cert = session.authorize_selected(reg, policy_hash=policy_hash)
     session.start_execution(reg, policy_hash=policy_hash)
 
-    manager = ExecutionPlanManager(session=session, registry=reg, ledger=EvidenceLedger(session_id=session.session_id))
+    manager = ExecutionPlanManager(session=session, registry=reg, ledger=EvidenceLedger(session_id=session.session_id), observed_world_state=[], policy_hash=policy_hash)
     summary = manager.execute_authorized_plan(cert)
     assert summary.success is False
     assert summary.step_results[0].exit_code != 0
@@ -621,7 +622,8 @@ def test_missing_verifier_is_unwitnessed(tmp_path):
     action_with_effect = _action(action_id="act1", capability_name="no_verif_tool", positive_effects=[_cond("done", [])])
 
     session = PlanningSession(session_id="s_miss_verif")
-    manager = ExecutionPlanManager(session=session, registry=reg, ledger=EvidenceLedger(session_id=session.session_id))
+    policy_hash = reg.compute_registry_hash()
+    manager = ExecutionPlanManager(session=session, registry=reg, ledger=EvidenceLedger(session_id=session.session_id), observed_world_state=[], policy_hash=policy_hash)
     witness_status = manager._witness_postconditions(action_with_effect, cap_no_verif)
     assert witness_status == WitnessStatus.UNWITNESSED
 
@@ -665,7 +667,7 @@ def test_unsupported_verifier_mode_cannot_silently_witness_true(tmp_path):
     cert = session.authorize_selected(reg, policy_hash=policy_hash)
     session.start_execution(reg, policy_hash=policy_hash)
 
-    manager = ExecutionPlanManager(session=session, registry=reg, ledger=EvidenceLedger(session_id=session.session_id))
+    manager = ExecutionPlanManager(session=session, registry=reg, ledger=EvidenceLedger(session_id=session.session_id), observed_world_state=[], policy_hash=policy_hash)
     summary = manager.execute_authorized_plan(cert)
     assert summary.success is True
     assert summary.step_results[0].witness_status == WitnessStatus.WITNESSED_TRUE
@@ -704,7 +706,7 @@ def test_unsupported_verifier_mode_cannot_silently_witness_true(tmp_path):
     cert_bad = s_bad.authorize_selected(reg_bad, policy_hash=pol_bad)
     s_bad.start_execution(reg_bad, policy_hash=pol_bad)
 
-    mgr_bad = ExecutionPlanManager(session=s_bad, registry=reg_bad, ledger=EvidenceLedger(session_id=s_bad.session_id))
+    mgr_bad = ExecutionPlanManager(session=s_bad, registry=reg_bad, ledger=EvidenceLedger(session_id=s_bad.session_id), observed_world_state=[], policy_hash=pol_bad)
     sum_bad = mgr_bad.execute_authorized_plan(cert_bad)
     assert sum_bad.success is False
     assert sum_bad.step_results[0].witness_status == WitnessStatus.WITNESSED_FALSE
@@ -758,7 +760,7 @@ def test_executor_command_creates_real_observable_effect(tmp_path):
     cert = session.authorize_selected(reg, policy_hash=policy_hash)
     session.start_execution(reg, policy_hash=policy_hash)
 
-    manager = ExecutionPlanManager(session=session, registry=reg, ledger=EvidenceLedger(session_id=session.session_id))
+    manager = ExecutionPlanManager(session=session, registry=reg, ledger=EvidenceLedger(session_id=session.session_id), observed_world_state=[], policy_hash=policy_hash)
     summary = manager.execute_authorized_plan(cert)
 
     assert summary.success is True
@@ -808,7 +810,7 @@ def test_witnessed_effect_updates_live_world_state(tmp_path):
     cert = session.authorize_selected(reg, policy_hash=policy_hash)
     session.start_execution(reg, policy_hash=policy_hash)
 
-    manager = ExecutionPlanManager(session=session, registry=reg, ledger=EvidenceLedger(session_id=session.session_id))
+    manager = ExecutionPlanManager(session=session, registry=reg, ledger=EvidenceLedger(session_id=session.session_id), observed_world_state=[], policy_hash=policy_hash)
     summary = manager.execute_authorized_plan(cert)
     assert summary.success is True
 
@@ -889,7 +891,7 @@ def test_two_step_plan_consumes_first_step_witnessed_effect(tmp_path):
     cert = session.authorize_selected(reg, policy_hash=policy_hash)
     session.start_execution(reg, policy_hash=policy_hash)
 
-    manager = ExecutionPlanManager(session=session, registry=reg, ledger=EvidenceLedger(session_id=session.session_id))
+    manager = ExecutionPlanManager(session=session, registry=reg, ledger=EvidenceLedger(session_id=session.session_id), observed_world_state=[], policy_hash=policy_hash)
     summary = manager.execute_authorized_plan(cert)
 
     assert summary.success is True
@@ -960,7 +962,7 @@ def test_failed_verifier_keeps_effect_unverified(tmp_path):
     cert = session.authorize_selected(reg, policy_hash=policy_hash)
     session.start_execution(reg, policy_hash=policy_hash)
 
-    manager = ExecutionPlanManager(session=session, registry=reg, ledger=EvidenceLedger(session_id=session.session_id))
+    manager = ExecutionPlanManager(session=session, registry=reg, ledger=EvidenceLedger(session_id=session.session_id), observed_world_state=[], policy_hash=policy_hash)
     summary = manager.execute_authorized_plan(cert)
 
     assert summary.success is False
@@ -1020,6 +1022,7 @@ def test_runtime_does_not_mutate_plan_ir_to_fake_observation(tmp_path):
         registry=reg,
         ledger=EvidenceLedger(session_id=session.session_id),
         observed_world_state=[init_fact],
+        policy_hash=policy_hash,
     )
     summary = manager.execute_authorized_plan(cert)
     assert summary.success is True
@@ -1319,7 +1322,7 @@ def test_runtime_wrong_target_verifier_ignored_when_correct_verifier_fails(tmp_p
     cert = session.authorize_selected(reg, policy_hash=policy_hash)
     session.start_execution(reg, policy_hash=policy_hash)
 
-    manager = ExecutionPlanManager(session=session, registry=reg, ledger=EvidenceLedger(session_id=session.session_id))
+    manager = ExecutionPlanManager(session=session, registry=reg, ledger=EvidenceLedger(session_id=session.session_id), observed_world_state=[], policy_hash=policy_hash)
     summary = manager.execute_authorized_plan(cert)
 
     # Must fail because v_correct failed and v_wrong_staging was ignored for prod effect
@@ -1380,7 +1383,7 @@ def test_partial_multi_effect_witnessing_promotes_only_successful_effect(tmp_pat
     cert = session.authorize_selected(reg, policy_hash=policy_hash)
     session.start_execution(reg, policy_hash=policy_hash)
 
-    manager = ExecutionPlanManager(session=session, registry=reg, ledger=EvidenceLedger(session_id=session.session_id))
+    manager = ExecutionPlanManager(session=session, registry=reg, ledger=EvidenceLedger(session_id=session.session_id), observed_world_state=[], policy_hash=policy_hash)
     summary = manager.execute_authorized_plan(cert)
 
     assert summary.success is False
@@ -1437,13 +1440,13 @@ def test_custom_backend_receives_authorized_resolved_command(tmp_path):
     cert = session.authorize_selected(reg, policy_hash=policy_hash)
     session.start_execution(reg, policy_hash=policy_hash)
 
-    def spy_backend(resolved_cmd, action, params):
+    def spy_backend(resolved_cmd, timeout_seconds=10.0):
         received_cmds.append(resolved_cmd)
         # Execute the authorized command vector
         sandbox = ExecutionSandbox()
-        return sandbox.execute_argv_pipeline([resolved_cmd])
+        return sandbox.execute_argv_pipeline([resolved_cmd], timeout_seconds=timeout_seconds)
 
-    manager = ExecutionPlanManager(session=session, registry=reg, ledger=EvidenceLedger(session_id=session.session_id))
+    manager = ExecutionPlanManager(session=session, registry=reg, ledger=EvidenceLedger(session_id=session.session_id), observed_world_state=[], policy_hash=policy_hash)
     summary = manager.execute_authorized_plan(cert, custom_action_handler=spy_backend)
 
     assert summary.success is True
@@ -1482,7 +1485,368 @@ def test_custom_backend_cannot_replace_registered_command_contract():
     def fake_backend(resolved_cmd, action, params):
         return SandboxExecutionResult(returncode=0)
 
-    manager = ExecutionPlanManager(session=session, registry=reg, ledger=EvidenceLedger(session_id=session.session_id))
+    manager = ExecutionPlanManager(session=session, registry=reg, ledger=EvidenceLedger(session_id=session.session_id), observed_world_state=[], policy_hash=policy_hash)
     summary = manager.execute_authorized_plan(cert, custom_action_handler=fake_backend)
     assert summary.success is False
     assert any("contract" in str(r.error_message).lower() for r in summary.step_results)
+
+
+# ---------------------------------------------------------------------------
+# Section O: Canonical Validation Snapshot Normalization & Storage
+# ---------------------------------------------------------------------------
+
+def test_validation_snapshot_stored_in_canonical_normalized_form():
+    """Input [X UNKNOWN, X VERIFIED_TRUE] must normalize to stored validation_world_state with 1 fact of truth VERIFIED_TRUE."""
+    f_unk = _fact("service_running", ["prod"], FactTruth.UNKNOWN)
+    f_true = _fact("service_running", ["prod"], FactTruth.VERIFIED_TRUE)
+
+    reg = CapabilityRegistry()
+    reg.register(
+        CapabilityEntry(
+            name="tool_ok",
+            description="Tool",
+            input_schema={},
+            positive_effects=[_cond("done", [])],
+            verifiers=[ObservationVerifier(verifier_id="v1", predicate="done", command_template=["true"])],
+            executor_command_template=["true"],
+        )
+    )
+    plan = PlanIR(
+        plan_id="p_canon_store",
+        goal_description="Test canonical store",
+        initial_state=[f_true],
+        actions=[_action(action_id="act1", capability_name="tool_ok", positive_effects=[_cond("done", [])])],
+    )
+    session = PlanningSession(session_id="s_canon_store")
+    session.submit_draft(plan)
+    session.validate_candidate(1, reg, observed_world_state=[f_unk, f_true])
+
+    stored_v1 = session.versions[1]
+    assert stored_v1.validation_world_state is not None
+    # Stored snapshot must contain exactly 1 canonical fact with truth == VERIFIED_TRUE
+    assert len(stored_v1.validation_world_state) == 1
+    assert stored_v1.validation_world_state[0].fact_key == "service_running(prod)"
+    assert stored_v1.validation_world_state[0].truth == FactTruth.VERIFIED_TRUE
+
+
+def test_duplicate_same_truth_snapshot_authorizes_and_executes_without_hash_mismatch():
+    """Input [X VERIFIED_TRUE, X VERIFIED_TRUE] canonicalizes to 1 fact; authorization and execution match."""
+    f1 = _fact("service_running", ["prod"], FactTruth.VERIFIED_TRUE)
+    f2 = _fact("service_running", ["prod"], FactTruth.VERIFIED_TRUE)
+
+    reg = CapabilityRegistry()
+    reg.register(
+        CapabilityEntry(
+            name="tool_ok",
+            description="Tool",
+            input_schema={},
+            positive_effects=[_cond("done", [])],
+            verifiers=[ObservationVerifier(verifier_id="v1", predicate="done", command_template=["true"])],
+            executor_command_template=["true"],
+        )
+    )
+    plan = PlanIR(
+        plan_id="p_dup_exec",
+        goal_description="Test duplicate execution hash consistency",
+        initial_state=[f1],
+        actions=[_action(action_id="act1", capability_name="tool_ok", positive_effects=[_cond("done", [])])],
+    )
+    session = PlanningSession(session_id="s_dup_exec")
+    session.submit_draft(plan)
+    session.validate_candidate(1, reg, observed_world_state=[f1, f2])
+    session.select_version(1)
+    policy_hash = reg.compute_registry_hash()
+    cert = session.authorize_selected(reg, policy_hash=policy_hash)
+    session.start_execution(reg, policy_hash=policy_hash, current_world_facts=[f1])
+
+    manager = ExecutionPlanManager(
+        session=session,
+        registry=reg,
+        ledger=EvidenceLedger(session_id=session.session_id),
+        observed_world_state=[f1, f2],
+        policy_hash=policy_hash,
+    )
+    summary = manager.execute_authorized_plan(cert)
+    assert summary.success is True
+
+
+def test_validation_ttl_normalization_is_bound_into_authorization_identity():
+    """Expired trusted fact decays during validation; stored validation snapshot and cert hash reflect decayed UNKNOWN truth."""
+    t0 = 1000.0
+    now = 1050.0  # 50s later
+    expired_fact = WorldFact(
+        predicate="auth_token",
+        args=["session_1"],
+        truth=FactTruth.VERIFIED_TRUE,
+        ttl_seconds=10.0,
+        created_at=t0,
+        updated_at=t0,
+        provenance=Provenance(source_type=SourceType.OBSERVED_WORLD_STATE),
+    )
+    reg = CapabilityRegistry()
+    reg.register(
+        CapabilityEntry(
+            name="tool_ok",
+            description="Tool",
+            input_schema={},
+            positive_effects=[_cond("done", [])],
+            verifiers=[ObservationVerifier(verifier_id="v1", predicate="done", command_template=["true"])],
+            executor_command_template=["true"],
+        )
+    )
+    plan = PlanIR(
+        plan_id="p_ttl_bound",
+        goal_description="Test TTL bound into auth identity",
+        initial_state=[],
+        actions=[_action(action_id="act1", capability_name="tool_ok", positive_effects=[_cond("done", [])])],
+    )
+    session = PlanningSession(session_id="s_ttl_bound")
+    session.submit_draft(plan)
+    session.validate_candidate(1, reg, observed_world_state=[expired_fact], current_time=now)
+
+    stored_v1 = session.versions[1]
+    assert stored_v1.validation_world_state is not None
+    assert stored_v1.validation_world_state[0].truth == FactTruth.UNKNOWN
+
+
+# ---------------------------------------------------------------------------
+# Section P: None Must Never Mean Trusted Empty
+# ---------------------------------------------------------------------------
+
+def test_runtime_none_snapshot_rejected_even_when_authorized_world_is_empty():
+    """Authorize explicitly with observed_world_state=[]. Manager with observed_world_state=None must be rejected."""
+    reg = CapabilityRegistry()
+    reg.register(
+        CapabilityEntry(
+            name="tool_ok",
+            description="Tool",
+            input_schema={},
+            positive_effects=[_cond("done", [])],
+            verifiers=[ObservationVerifier(verifier_id="v1", predicate="done", command_template=["true"])],
+            executor_command_template=["true"],
+        )
+    )
+    plan = PlanIR(
+        plan_id="p_none_vs_empty",
+        goal_description="Test none vs empty snapshot",
+        initial_state=[],
+        actions=[_action(action_id="act1", capability_name="tool_ok", positive_effects=[_cond("done", [])])],
+    )
+    session = PlanningSession(session_id="s_none_vs_empty")
+    session.submit_draft(plan)
+    session.validate_candidate(1, reg, observed_world_state=[])
+    session.select_version(1)
+    policy_hash = reg.compute_registry_hash()
+    cert = session.authorize_selected(reg, policy_hash=policy_hash)
+    session.start_execution(reg, policy_hash=policy_hash, current_world_facts=[])
+
+    # Manager with observed_world_state=None must fail closed
+    mgr_none = ExecutionPlanManager(
+        session=session,
+        registry=reg,
+        ledger=EvidenceLedger(session_id=session.session_id),
+        observed_world_state=None,
+        policy_hash=policy_hash,
+    )
+    with pytest.raises(StateDriftError):
+        mgr_none.execute_authorized_plan(cert)
+
+    # Manager with observed_world_state=[] must succeed
+    mgr_empty = ExecutionPlanManager(
+        session=session,
+        registry=reg,
+        ledger=EvidenceLedger(session_id=session.session_id),
+        observed_world_state=[],
+        policy_hash=policy_hash,
+    )
+    summary = mgr_empty.execute_authorized_plan(cert)
+    assert summary.success is True
+
+
+# ---------------------------------------------------------------------------
+# Section Q: Current Policy Identity Must Be Explicit
+# ---------------------------------------------------------------------------
+
+def test_runtime_requires_current_policy_identity():
+    """ExecutionPlanManager without an explicit policy_hash must refuse execution."""
+    reg = CapabilityRegistry()
+    reg.register(
+        CapabilityEntry(
+            name="tool_ok",
+            description="Tool",
+            input_schema={},
+            positive_effects=[_cond("done", [])],
+            verifiers=[ObservationVerifier(verifier_id="v1", predicate="done", command_template=["true"])],
+            executor_command_template=["true"],
+        )
+    )
+    plan = PlanIR(
+        plan_id="p_require_policy",
+        goal_description="Test require policy",
+        initial_state=[],
+        actions=[_action(action_id="act1", capability_name="tool_ok", positive_effects=[_cond("done", [])])],
+    )
+    session = PlanningSession(session_id="s_require_policy")
+    session.submit_draft(plan)
+    session.validate_candidate(1, reg, observed_world_state=[])
+    session.select_version(1)
+    policy_hash = reg.compute_registry_hash()
+    cert = session.authorize_selected(reg, policy_hash=policy_hash)
+    session.start_execution(reg, policy_hash=policy_hash, current_world_facts=[])
+
+    # Manager created with policy_hash=None
+    mgr_no_policy = ExecutionPlanManager(
+        session=session,
+        registry=reg,
+        ledger=EvidenceLedger(session_id=session.session_id),
+        observed_world_state=[],
+        policy_hash=None,
+    )
+    with pytest.raises((StateDriftError, ValueError)):
+        mgr_no_policy.execute_authorized_plan(cert)
+
+
+def test_runtime_policy_v2_rejected_against_untampered_v1_certificate():
+    """Certificate is untouched and has policy_v1; manager has explicit policy_hash='policy_v2'. Must reject."""
+    reg = CapabilityRegistry()
+    reg.register(
+        CapabilityEntry(
+            name="tool_ok",
+            description="Tool",
+            input_schema={},
+            positive_effects=[_cond("done", [])],
+            verifiers=[ObservationVerifier(verifier_id="v1", predicate="done", command_template=["true"])],
+            executor_command_template=["true"],
+        )
+    )
+    plan = PlanIR(
+        plan_id="p_policy_v2_reject",
+        goal_description="Test policy v2 reject",
+        initial_state=[],
+        actions=[_action(action_id="act1", capability_name="tool_ok", positive_effects=[_cond("done", [])])],
+    )
+    session = PlanningSession(session_id="s_policy_v2_reject")
+    session.submit_draft(plan)
+    session.validate_candidate(1, reg, observed_world_state=[])
+    session.select_version(1)
+    cert = session.authorize_selected(reg, policy_hash="policy_v1")
+    session.start_execution(reg, policy_hash="policy_v1", current_world_facts=[])
+
+    mgr_v2 = ExecutionPlanManager(
+        session=session,
+        registry=reg,
+        ledger=EvidenceLedger(session_id=session.session_id),
+        observed_world_state=[],
+        policy_hash="policy_v2",
+    )
+    with pytest.raises(StateDriftError):
+        mgr_v2.execute_authorized_plan(cert)
+
+
+# ---------------------------------------------------------------------------
+# Section R: Strict Custom Execution Backend Contract
+# ---------------------------------------------------------------------------
+
+def test_legacy_two_argument_custom_handler_is_rejected(tmp_path):
+    """Providing a legacy 2-argument custom handler (without argv vector) must be rejected."""
+    reg = CapabilityRegistry()
+    reg.register(
+        CapabilityEntry(
+            name="fs.touch_backend",
+            description="Touch",
+            input_schema={"path": {"type": "str", "required": True}},
+            positive_effects=[_cond("file_exists", ["{path}"])],
+            verifiers=[ObservationVerifier(verifier_id="v1", predicate="file_exists", target_args_mapping=["{path}"], command_template=["test", "-f", "{path}"])],
+            executor_command_template=["touch", "{path}"],
+        )
+    )
+    plan = PlanIR(
+        plan_id="p_legacy_handler",
+        goal_description="Test legacy handler rejection",
+        initial_state=[],
+        actions=[_action(action_id="act1", capability_name="fs.touch_backend", parameters={"path": str(tmp_path / "x.txt")}, positive_effects=[_cond("file_exists", [str(tmp_path / "x.txt")])])],
+    )
+    session = PlanningSession(session_id="s_legacy_handler")
+    session.submit_draft(plan)
+    session.validate_candidate(1, reg, observed_world_state=[])
+    session.select_version(1)
+    policy_hash = reg.compute_registry_hash()
+    cert = session.authorize_selected(reg, policy_hash=policy_hash)
+    session.start_execution(reg, policy_hash=policy_hash, current_world_facts=[])
+
+    def legacy_2arg_handler(action, params):
+        return SandboxExecutionResult(returncode=0)
+
+    manager = ExecutionPlanManager(
+        session=session,
+        registry=reg,
+        ledger=EvidenceLedger(session_id=session.session_id),
+        observed_world_state=[],
+        policy_hash=policy_hash,
+    )
+    with pytest.raises(TypeError):
+        manager.execute_authorized_plan(cert, custom_action_handler=legacy_2arg_handler)
+
+
+def test_backend_internal_typeerror_does_not_trigger_second_execution_path(tmp_path):
+    """If custom backend raises TypeError internally, it must execute exactly once and propagate without fallback."""
+    reg = CapabilityRegistry()
+    reg.register(
+        CapabilityEntry(
+            name="fs.touch_backend",
+            description="Touch",
+            input_schema={"path": {"type": "str", "required": True}},
+            positive_effects=[_cond("file_exists", ["{path}"])],
+            verifiers=[ObservationVerifier(verifier_id="v1", predicate="file_exists", target_args_mapping=["{path}"], command_template=["test", "-f", "{path}"])],
+            executor_command_template=["touch", "{path}"],
+        )
+    )
+    plan = PlanIR(
+        plan_id="p_internal_typeerror",
+        goal_description="Test internal typeerror single invocation",
+        initial_state=[],
+        actions=[_action(action_id="act1", capability_name="fs.touch_backend", parameters={"path": str(tmp_path / "x.txt")}, positive_effects=[_cond("file_exists", [str(tmp_path / "x.txt")])])],
+    )
+    session = PlanningSession(session_id="s_internal_typeerror")
+    session.submit_draft(plan)
+    session.validate_candidate(1, reg, observed_world_state=[])
+    session.select_version(1)
+    policy_hash = reg.compute_registry_hash()
+    cert = session.authorize_selected(reg, policy_hash=policy_hash)
+    session.start_execution(reg, policy_hash=policy_hash, current_world_facts=[])
+
+    invocations = 0
+
+    def bug_backend(authorized_argv, timeout_seconds=10.0):
+        nonlocal invocations
+        invocations += 1
+        raise TypeError("Deliberate internal backend type error")
+
+    manager = ExecutionPlanManager(
+        session=session,
+        registry=reg,
+        ledger=EvidenceLedger(session_id=session.session_id),
+        observed_world_state=[],
+        policy_hash=policy_hash,
+    )
+    with pytest.raises(TypeError) as excinfo:
+        manager.execute_authorized_plan(cert, custom_action_handler=bug_backend)
+
+    assert "Deliberate internal backend type error" in str(excinfo.value)
+    assert invocations == 1
+
+
+# ---------------------------------------------------------------------------
+# Section S: Type-Safe World State Identity Hashing
+# ---------------------------------------------------------------------------
+
+def test_world_state_hash_distinguishes_integer_and_string_arguments():
+    """compute_world_state_hash must distinguish integer 123 from string '123'."""
+    from plan_mode.session import compute_world_state_hash
+    f_int = WorldFact(predicate="resource", args=[123], truth=FactTruth.VERIFIED_TRUE, provenance=Provenance(source_type=SourceType.OBSERVED_WORLD_STATE))
+    f_str = WorldFact(predicate="resource", args=["123"], truth=FactTruth.VERIFIED_TRUE, provenance=Provenance(source_type=SourceType.OBSERVED_WORLD_STATE))
+
+    hash_int = compute_world_state_hash([f_int])
+    hash_str = compute_world_state_hash([f_str])
+
+    assert hash_int != hash_str

@@ -132,7 +132,7 @@ def test_execution_plan_manager_success():
     session.start_execution(reg, policy_hash="policy_v1")
 
     ledger = EvidenceLedger(session_id=session.session_id)
-    manager = ExecutionPlanManager(session=session, registry=reg, ledger=ledger, observed_world_state=plan.initial_state)
+    manager = ExecutionPlanManager(session=session, registry=reg, ledger=ledger, observed_world_state=plan.initial_state, policy_hash="policy_v1")
 
     exec_result = manager.execute_authorized_plan(cert)
     assert exec_result.success is True

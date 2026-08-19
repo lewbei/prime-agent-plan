@@ -78,11 +78,17 @@ class VersionNotFoundError(Exception):
 
 
 def compute_world_state_hash(facts: List[WorldFact]) -> str:
-    """Deterministic SHA-256 hash of a collection of world facts."""
-    entries = sorted(
-        [f"{f.fact_key}:{f.truth.value}:{f.witnessability.value}" for f in facts]
-    )
-    combined = "\n".join(entries)
+    """Deterministic SHA-256 hash of a collection of world facts preserving raw argument types."""
+    entries = []
+    for f in facts:
+        entries.append({
+            "predicate": f.predicate,
+            "args": f.args,
+            "truth": f.truth.value,
+            "witnessability": f.witnessability.value,
+        })
+    serialized_entries = sorted([json.dumps(e, sort_keys=True) for e in entries])
+    combined = "\n".join(serialized_entries)
     return hashlib.sha256(combined.encode("utf-8")).hexdigest()
 
 
@@ -225,19 +231,17 @@ class PlanningSession(BaseModel):
             current_time=current_time,
         )
 
-        trusted_list = (
-            list(observed_world_state.values())
-            if isinstance(observed_world_state, dict)
-            else (observed_world_state if observed_world_state is not None else None)
-        )
-        ws_hash = compute_world_state_hash(trusted_list) if trusted_list is not None else compute_world_state_hash([])
+        from plan_mode.epistemic_validator import normalize_trusted_snapshot
+        normalized_map = normalize_trusted_snapshot(observed_world_state, now=current_time) if observed_world_state is not None else None
+        canonical_list = list(normalized_map.values()) if normalized_map is not None else None
+        ws_hash = compute_world_state_hash(canonical_list) if canonical_list is not None else compute_world_state_hash([])
 
         updated_version = PlanVersion(
             version_number=v_obj.version_number,
             plan_ir=v_obj.plan_ir,
             validation_result=result,
             plan_hash=v_obj.plan_hash,
-            validation_world_state=trusted_list,
+            validation_world_state=canonical_list,
             validation_world_state_hash=ws_hash,
             created_at=v_obj.created_at,
         )
