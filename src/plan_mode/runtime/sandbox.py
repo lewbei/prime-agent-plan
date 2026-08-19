@@ -150,6 +150,7 @@ def validate_path_within_workspace(path: str, workspace_dir: str) -> str:
                 )
         except ValueError:
             raise SymlinkEscapeError(f"Symlink '{path}' resolves outside workspace boundary")
+        return real_target
 
     return norm_path
 
