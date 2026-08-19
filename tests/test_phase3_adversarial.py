@@ -26,6 +26,7 @@ from plan_mode.runtime import (
     TransactionOutcome,
     TransactionalExecutionManager,
 )
+from plan_mode.runtime.sandbox import IsolationPolicy
 from plan_mode.session import CommitGateError, PlanningSession, SessionState
 
 
@@ -44,6 +45,17 @@ def _action(action_id: str, cap: str, params=None, effects=None) -> ActionIR:
         parameters=params or {},
         positive_effects=effects or [],
         provenance=_prov(),
+    )
+
+
+def _test_sandbox() -> ExecutionSandbox:
+    return ExecutionSandbox(
+        IsolationPolicy(
+            use_bwrap=False,
+            require_bwrap=False,
+            allow_unisolated_fallback=True,
+            read_only_root=False,
+        )
     )
 
 
@@ -139,6 +151,8 @@ def _prepare(plan: PlanIR, registry: CapabilityRegistry):
         ledger=ledger,
         observed_world_state=[],
         policy_hash=policy,
+        sandbox=_test_sandbox(),
+        allow_insecure_test_sandbox=True,
     )
     return session, ledger, manager, cert, policy
 
@@ -158,7 +172,6 @@ def test_compensation_without_observable_effects_cannot_claim_rollback(tmp_path)
     summary = manager.execute_and_finalize(cert)
     assert summary.outcome == TransactionOutcome.CONTAINMENT_FAILED
     assert session.current_state == SessionState.CONTAINMENT_FAILED
-    # Fail closed before the unobservable compensation command is launched.
     assert target.exists()
 
 
@@ -194,7 +207,6 @@ def test_successful_compensation_command_with_failed_verifier_is_not_rollback(tm
     summary = manager.execute_and_finalize(cert)
     assert summary.outcome == TransactionOutcome.CONTAINMENT_FAILED
     assert session.current_state == SessionState.CONTAINMENT_FAILED
-    # rm ran, but the recovery observation failed; containment cannot be claimed.
     assert not target.exists()
     assert summary.compensation_results[-1].executed is True
     assert summary.compensation_results[-1].verified is False
@@ -265,7 +277,6 @@ def test_commit_rejects_mandatory_criterion_with_non_observed_provenance():
     )
     session = PlanningSession(session_id="s-forged-criterion")
     session.submit_draft(plan)
-    # Use a tiny test validator seam so this test attacks commit only.
     from plan_mode.epistemic_validator import PlanValidationResult, ValidationStatus
 
     class PassValidator:
