@@ -1,7 +1,7 @@
 # Terminal-Bench 2.0 Empirical Evaluation & Diagnostic Ablation Report
 
 > **Benchmark**: Terminal-Bench 2.0 (*arXiv:2601.11868: Benchmarking Agents on Hard, Realistic Tasks in Command Line Interfaces*)  
-> **Evaluation Date**: 2026-08-19 12:39:37 UTC  
+> **Evaluation Date**: 2026-08-19 12:56:00 UTC  
 > **Evaluated Tasks**: 11 curated tasks across 7 domains (SysAdmin, Build Systems, Data/ETL, Network/DNS, Security Auditing, Git/VCS, Epistemic Adversarial).  
 > **Controlled Model Baseline**: All arms evaluate identical foundation capabilities under increasing runtime scaffolding.
 
@@ -11,13 +11,13 @@
 
 | Arm ID | Architectural Configuration | Task Success Rate | False-PASS Rate | Epistemic Safety Score | Mean Latency (ms) | Total Token Cost ($) |
 | :--- | :--- | :---: | :---: | :---: | :---: | :---: |
-| `A0` | **A0: Base Unstructured Agent (Blind Execution)** | **81.8%** | **9.1%** | **0.91** | 24.5 ms | $0.0550 |
-| `A1` | **A1: Base + Canonical Plan IR** | **81.8%** | **9.1%** | **0.91** | 24.5 ms | $0.0580 |
-| `A2` | **A2: Base + PlanIR + Epistemic Validator** | **90.9%** | **0.0%** | **1.00** | 25.5 ms | $0.0600 |
-| `A3` | **A3: A2 + IR-Native Closed-World Search** | **90.9%** | **0.0%** | **1.00** | 24.8 ms | $0.0600 |
-| `A4` | **A4: A3 + Multi-Provider Judge Consensus** | **90.9%** | **0.0%** | **1.00** | 24.6 ms | $0.0600 |
-| `A5` | **A5: A4 + Authorization & Empirical Verifiers** | **90.9%** | **0.0%** | **1.00** | 24.9 ms | $0.0600 |
-| `A6` | **A6: FULL PRIME (+ Kernel Isolation & Saga Recovery)** | **90.9%** | **0.0%** | **1.00** | 40.7 ms | $0.1650 |
+| `A0` | **A0: Base Unstructured Agent (Blind Execution)** | **81.8%** | **9.1%** | **0.91** | 26.2 ms | $0.0550 |
+| `A1` | **A1: Base + Canonical Plan IR** | **81.8%** | **9.1%** | **0.91** | 24.7 ms | $0.0580 |
+| `A2` | **A2: Base + PlanIR + Epistemic Validator** | **90.9%** | **0.0%** | **1.00** | 25.9 ms | $0.0600 |
+| `A3` | **A3: A2 + IR-Native Closed-World Search** | **90.9%** | **0.0%** | **1.00** | 25.3 ms | $0.0600 |
+| `A4` | **A4: A3 + Multi-Provider Judge Consensus** | **90.9%** | **0.0%** | **1.00** | 26.3 ms | $0.0600 |
+| `A5` | **A5: A4 + Authorization & Empirical Verifiers** | **90.9%** | **0.0%** | **1.00** | 25.2 ms | $0.0600 |
+| `A6` | **A6: FULL PRIME (+ Kernel Isolation & Saga Recovery)** | **90.9%** | **0.0%** | **1.00** | 41.5 ms | $0.1650 |
 
 ---
 
