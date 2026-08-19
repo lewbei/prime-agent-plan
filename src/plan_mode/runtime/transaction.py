@@ -141,14 +141,72 @@ class TransactionalExecutionManager:
         certificate: AuthorizationCertificate,
         execution_backend: Optional[ExecutionBackend] = None,
     ) -> TransactionSummary:
-        execution = self.executor.execute_authorized_plan(
-            certificate,
-            execution_backend=execution_backend,
-        )
-        self.session.record_execution_result(
-            execution.success,
-            list(self.executor.live_world_state.values()),
-        )
+        """Run one authorized transaction and finalize it exactly once."""
+        plan = self._plan_for_certificate(certificate)
+        self._assert_unique_action_ids(plan.actions)
+
+        # Always pass a tracking backend to the Phase 2 executor.  The dispatch
+        # record is written *before* the underlying launcher runs, so a backend
+        # exception after a possible side effect still leaves enough evidence
+        # for conservative compensation.
+        dispatch_index = 0
+
+        def tracking_backend(argv: List[str], *, timeout_seconds: float):
+            nonlocal dispatch_index
+            if dispatch_index >= len(plan.actions):
+                raise RuntimeError("execution backend invoked more times than authorized plan actions")
+            action = plan.actions[dispatch_index]
+            dispatch_index += 1
+            self.ledger.append_record(
+                LedgerEventType.ACTION_DISPATCHED,
+                {
+                    "step_id": action.action_id,
+                    "capability": action.capability_name,
+                    "argv": list(argv),
+                },
+            )
+            if execution_backend is not None:
+                return execution_backend(argv, timeout_seconds=timeout_seconds)
+            return self.sandbox.execute_argv_pipeline([argv], timeout_seconds=timeout_seconds)
+
+        try:
+            execution = self.executor.execute_authorized_plan(
+                certificate,
+                execution_backend=tracking_backend,
+            )
+        except Exception as exc:
+            dispatched = self._dispatched_action_ids()
+            execution = ExecutionSummary(
+                plan_id=plan.plan_id,
+                plan_version=plan.version,
+                success=False,
+                failed_step_id=dispatched[-1] if dispatched else None,
+                live_world_state=copy.deepcopy(self.executor.live_world_state),
+            )
+            if self.session.current_state == SessionState.EXECUTING:
+                self.session.record_execution_result(
+                    False,
+                    list(self.executor.live_world_state.values()),
+                )
+            return self._compensate_or_contain(
+                certificate,
+                execution,
+                execution_backend,
+                [f"execution raised after dispatch: {type(exc).__name__}: {exc}"],
+            )
+
+        try:
+            self.session.record_execution_result(
+                execution.success,
+                list(self.executor.live_world_state.values()),
+            )
+        except Exception as exc:
+            return self._compensate_or_contain(
+                certificate,
+                execution,
+                execution_backend,
+                [f"could not bind execution attestation: {type(exc).__name__}: {exc}"],
+            )
 
         if execution.success:
             try:
@@ -176,6 +234,13 @@ class TransactionalExecutionManager:
                     execution_backend,
                     blockers,
                 )
+            except Exception as exc:
+                return self._compensate_or_contain(
+                    certificate,
+                    execution,
+                    execution_backend,
+                    [f"commit finalization error: {type(exc).__name__}: {exc}"],
+                )
 
         return self._compensate_or_contain(
             certificate,
@@ -184,10 +249,27 @@ class TransactionalExecutionManager:
             ["execution did not complete with independently witnessed success"],
         )
 
-    def _executed_action_ids(self) -> List[str]:
+    def _plan_for_certificate(self, certificate: AuthorizationCertificate):
+        if certificate.plan_version not in self.session.versions:
+            raise ValueError(f"Plan version {certificate.plan_version} not found in session")
+        return self.session.versions[certificate.plan_version].plan_ir
+
+    @staticmethod
+    def _assert_unique_action_ids(actions: List[ActionIR]) -> None:
+        seen = set()
+        duplicates = set()
+        for action in actions:
+            if action.action_id in seen:
+                duplicates.add(action.action_id)
+            seen.add(action.action_id)
+        if duplicates:
+            rendered = ", ".join(sorted(duplicates))
+            raise ValueError(f"transaction requires unique action_id values; duplicates: {rendered}")
+
+    def _dispatched_action_ids(self) -> List[str]:
         ids: List[str] = []
         for record in self.ledger.records:
-            if record.event_type == LedgerEventType.ACTION_EXECUTED:
+            if record.event_type == LedgerEventType.ACTION_DISPATCHED:
                 step_id = record.payload.get("step_id")
                 if isinstance(step_id, str):
                     ids.append(step_id)
@@ -203,10 +285,10 @@ class TransactionalExecutionManager:
         assert self.session.authorized_version is not None
         plan = self.session.versions[self.session.authorized_version].plan_ir
         action_by_id = {action.action_id: action for action in plan.actions}
-        executed_ids = self._executed_action_ids()
-        effectful_executed = [
+        dispatched_ids = self._dispatched_action_ids()
+        effectful_dispatched = [
             step_id
-            for step_id in executed_ids
+            for step_id in dispatched_ids
             if step_id in action_by_id
             and (
                 action_by_id[step_id].positive_effects
@@ -214,7 +296,7 @@ class TransactionalExecutionManager:
             )
         ]
 
-        if not effectful_executed:
+        if not effectful_dispatched:
             if self.session.current_state == SessionState.EXECUTING:
                 self.session.transition_to(SessionState.FAILED)
             return TransactionSummary(
@@ -227,15 +309,12 @@ class TransactionalExecutionManager:
         if self.session.current_state == SessionState.EXECUTING:
             self.session.transition_to(SessionState.COMPENSATING)
 
-        # Compensation contracts were authorized through the same registry and
-        # policy identity. If either drifts during execution, do not run an
-        # unbound recovery command.
         if self.registry.compute_registry_hash() != certificate.registry_hash:
             return self._containment_failed(
                 execution,
                 [],
                 blockers,
-                effectful_executed[-1],
+                effectful_dispatched[-1],
                 "capability registry drifted before compensation",
             )
         if self.policy_hash != certificate.policy_hash:
@@ -243,12 +322,12 @@ class TransactionalExecutionManager:
                 execution,
                 [],
                 blockers,
-                effectful_executed[-1],
+                effectful_dispatched[-1],
                 "runtime policy drifted before compensation",
             )
 
         results: List[CompensationResult] = []
-        for step_id in reversed(effectful_executed):
+        for step_id in reversed(effectful_dispatched):
             action = action_by_id[step_id]
             cap = self.registry.get(action.capability_name)
             spec = cap.default_compensation
@@ -258,7 +337,7 @@ class TransactionalExecutionManager:
                     results,
                     blockers,
                     step_id,
-                    "executed effectful capability has no registered compensation",
+                    "dispatched effectful capability has no registered compensation",
                 )
 
             result = self._execute_compensation(
