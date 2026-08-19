@@ -147,6 +147,7 @@ from .judges import (
 from .ir_search import (
     EpistemicPlanSearch,
     TokenCostTracker,
+    SearchResult,
     causal_crossover,
     insert_disambiguation_action,
     mutate_action_parameters,

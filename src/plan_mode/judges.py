@@ -4,10 +4,13 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 import time
 from abc import ABC, abstractmethod
+from pathlib import Path
 from typing import Any, Dict, List, Optional
 from pydantic import BaseModel, Field
+import httpx
 
 from plan_mode.epistemic_validator import (
     CausalValidator,
@@ -160,23 +163,46 @@ class BlindJudge(JudgeAdapter):
         )
 
 
+def _resolve_provider_key(env_names: List[str], provider_key: str) -> Optional[str]:
+    """Resolve API key from environment variables or ~/.prime/agent/auth.json."""
+    for name in env_names:
+        val = os.environ.get(name, "").strip()
+        if val:
+            return val
+    try:
+        auth_path = Path.home() / ".prime" / "agent" / "auth.json"
+        if auth_path.exists():
+            data = json.loads(auth_path.read_text(encoding="utf-8"))
+            cred = data.get(provider_key, {})
+            key = cred.get("key") or cred.get("api_key") or cred.get("token")
+            if key:
+                return str(key).strip()
+    except Exception:
+        pass
+    return None
+
+
 class BaseLLMJudge(JudgeAdapter):
-    """Base class for LLM API judges with token cost tracking and graceful error fallback."""
+    """Base class for LLM API judges with real HTTP client dispatch, cost tracking, and error fallback."""
 
     PROVIDER_NAME: str = "base_llm"
     DEFAULT_MODEL: str = "default_model"
+    ENV_KEY_NAMES: List[str] = []
     PROMPT_COST_PER_M: float = 2.50
     COMPLETION_COST_PER_M: float = 10.00
+    ENDPOINT_URL: str = ""
 
     def __init__(
         self,
         model: Optional[str] = None,
         api_key: Optional[str] = None,
+        http_client: Optional[httpx.AsyncClient] = None,
         mock_response: Optional[Dict[str, Any]] = None,
         mock_error: Optional[Exception] = None,
     ):
         self.model = model or self.DEFAULT_MODEL
-        self.api_key = api_key or "mock_key"
+        self.api_key = api_key or _resolve_provider_key(self.ENV_KEY_NAMES, self.PROVIDER_NAME)
+        self.http_client = http_client
         self.mock_response = mock_response
         self.mock_error = mock_error
 
@@ -228,15 +254,117 @@ class BaseLLMJudge(JudgeAdapter):
                 summary=resp.get("summary", f"{self.PROVIDER_NAME} evaluation completed."),
             )
 
-        # Default fallback if no live API key is configured
+        # Fail-closed if no API key and no client configured
+        if not self.api_key and self.http_client is None:
+            latency = (time.time() - t0) * 1000.0
+            return JudgeVerdict(
+                verdict="UNKNOWN",
+                feasibility_0_100=0.0,
+                confidence=0.0,
+                blockers=[f"Provider credential/API key not configured for {self.PROVIDER_NAME}"],
+                summary=f"{self.PROVIDER_NAME} judge cannot evaluate plan: API key not configured.",
+                token_usage={"prompt_tokens": 0, "completion_tokens": 0, "cost_usd": 0.0},
+                latency_ms=round(latency, 2),
+                provider=self.PROVIDER_NAME,
+                model=self.model,
+            )
+
+        # Real HTTP dispatch to provider endpoint
+        try:
+            return await self._dispatch_api_request(plan_ir, goal_description, timeout, t0)
+        except Exception as e:
+            latency = (time.time() - t0) * 1000.0
+            return JudgeVerdict(
+                verdict="UNKNOWN",
+                feasibility_0_100=0.0,
+                confidence=0.0,
+                blockers=[f"{self.PROVIDER_NAME} HTTP dispatch failed: {str(e)}"],
+                summary=f"Failed to evaluate plan due to {self.PROVIDER_NAME} network/API failure.",
+                token_usage={"prompt_tokens": 0, "completion_tokens": 0, "cost_usd": 0.0},
+                latency_ms=round(latency, 2),
+                provider=self.PROVIDER_NAME,
+                model=self.model,
+            )
+
+    async def _dispatch_api_request(
+        self,
+        plan_ir: PlanIR,
+        goal_description: str,
+        timeout: float,
+        t0: float,
+    ) -> JudgeVerdict:
+        """Format and send HTTP request to LLM provider API endpoint."""
+        prompt_content = f"Goal: {goal_description or plan_ir.goal_description}\n\nPlan IR:\n{plan_ir.model_dump_json(indent=2)}"
+        system_msg = (
+            "You are an adversarial plan reviewer. Evaluate feasibility, contradictions, and missing evidence. "
+            "Respond ONLY with a valid JSON object matching this schema: "
+            '{"verdict": "PASS" | "FAIL" | "UNKNOWN" | "REWORK", "feasibility_0_100": float, "confidence": float, "blockers": list, "contradictions": list, "summary": str}'
+        )
+
+        headers = self._get_request_headers()
+        payload = self._get_request_payload(system_msg, prompt_content)
+
+        client = self.http_client or httpx.AsyncClient(timeout=timeout)
+        try:
+            resp = await client.post(self.ENDPOINT_URL, headers=headers, json=payload)
+            resp.raise_for_status()
+            data = resp.json()
+        finally:
+            if self.http_client is None:
+                await client.aclose()
+
         latency = (time.time() - t0) * 1000.0
+        return self._parse_provider_response(data, latency)
+
+    def _get_request_headers(self) -> Dict[str, str]:
+        return {"Authorization": f"Bearer {self.api_key}", "Content-Type": "application/json"}
+
+    def _get_request_payload(self, system_msg: str, user_msg: str) -> Dict[str, Any]:
+        return {
+            "model": self.model,
+            "messages": [
+                {"role": "system", "content": system_msg},
+                {"role": "user", "content": user_msg},
+            ],
+            "response_format": {"type": "json_object"},
+        }
+
+    def _parse_provider_response(self, data: Dict[str, Any], latency_ms: float) -> JudgeVerdict:
+        usage = data.get("usage", {})
+        prompt_toks = usage.get("prompt_tokens", 0)
+        comp_toks = usage.get("completion_tokens", 0)
+        cost = (prompt_toks / 1_000_000.0 * self.PROMPT_COST_PER_M) + (comp_toks / 1_000_000.0 * self.COMPLETION_COST_PER_M)
+
+        choices = data.get("choices", [])
+        if choices and "message" in choices[0]:
+            content_str = choices[0]["message"].get("content", "{}")
+            try:
+                parsed = json.loads(content_str)
+                return JudgeVerdict(
+                    verdict=parsed.get("verdict", "PASS"),
+                    feasibility_0_100=float(parsed.get("feasibility_0_100", 85.0)),
+                    confidence=float(parsed.get("confidence", 0.9)),
+                    blockers=parsed.get("blockers", []),
+                    contradictions=parsed.get("contradictions", []),
+                    missing_evidence=parsed.get("missing", []),
+                    falsifiable_criteria=parsed.get("falsifiable_criteria", True),
+                    suggested_mutations=parsed.get("suggested_mutations", []),
+                    token_usage={"prompt_tokens": prompt_toks, "completion_tokens": comp_toks, "cost_usd": round(cost, 6)},
+                    latency_ms=round(latency_ms, 2),
+                    provider=self.PROVIDER_NAME,
+                    model=self.model,
+                    summary=parsed.get("summary", f"{self.PROVIDER_NAME} live response received."),
+                )
+            except Exception:
+                pass
+
         return JudgeVerdict(
-            verdict="PASS",
-            feasibility_0_100=85.0,
-            confidence=0.85,
-            summary=f"Plan evaluated via {self.PROVIDER_NAME} ({self.model}).",
-            token_usage={"prompt_tokens": 500, "completion_tokens": 100, "cost_usd": 0.00225},
-            latency_ms=round(latency, 2),
+            verdict="UNKNOWN",
+            feasibility_0_100=0.0,
+            confidence=0.0,
+            blockers=["Failed to parse structured JSON from provider response"],
+            token_usage={"prompt_tokens": prompt_toks, "completion_tokens": comp_toks, "cost_usd": round(cost, 6)},
+            latency_ms=round(latency_ms, 2),
             provider=self.PROVIDER_NAME,
             model=self.model,
         )
@@ -246,32 +374,125 @@ class OpenAIJudge(BaseLLMJudge):
     """OpenAI GPT-4o / GPT-4o-mini plan judge adapter."""
     PROVIDER_NAME = "openai"
     DEFAULT_MODEL = "gpt-4o"
+    ENV_KEY_NAMES = ["OPENAI_API_KEY"]
     PROMPT_COST_PER_M = 2.50
     COMPLETION_COST_PER_M = 10.00
+    ENDPOINT_URL = "https://api.openai.com/v1/chat/completions"
 
 
 class AnthropicJudge(BaseLLMJudge):
     """Anthropic Claude 3.5 Sonnet plan judge adapter."""
     PROVIDER_NAME = "anthropic"
     DEFAULT_MODEL = "claude-3-5-sonnet"
+    ENV_KEY_NAMES = ["ANTHROPIC_API_KEY"]
     PROMPT_COST_PER_M = 3.00
     COMPLETION_COST_PER_M = 15.00
+    ENDPOINT_URL = "https://api.anthropic.com/v1/messages"
+
+    def _get_request_headers(self) -> Dict[str, str]:
+        return {
+            "x-api-key": self.api_key or "",
+            "anthropic-version": "2023-06-01",
+            "Content-Type": "application/json",
+        }
+
+    def _get_request_payload(self, system_msg: str, user_msg: str) -> Dict[str, Any]:
+        return {
+            "model": self.model,
+            "max_tokens": 1024,
+            "system": system_msg,
+            "messages": [{"role": "user", "content": user_msg}],
+        }
+
+    def _parse_provider_response(self, data: Dict[str, Any], latency_ms: float) -> JudgeVerdict:
+        usage = data.get("usage", {})
+        prompt_toks = usage.get("input_tokens", 0)
+        comp_toks = usage.get("output_tokens", 0)
+        cost = (prompt_toks / 1_000_000.0 * self.PROMPT_COST_PER_M) + (comp_toks / 1_000_000.0 * self.COMPLETION_COST_PER_M)
+
+        content_list = data.get("content", [])
+        if content_list and "text" in content_list[0]:
+            try:
+                parsed = json.loads(content_list[0]["text"])
+                return JudgeVerdict(
+                    verdict=parsed.get("verdict", "PASS"),
+                    feasibility_0_100=float(parsed.get("feasibility_0_100", 85.0)),
+                    confidence=float(parsed.get("confidence", 0.9)),
+                    blockers=parsed.get("blockers", []),
+                    contradictions=parsed.get("contradictions", []),
+                    missing_evidence=parsed.get("missing", []),
+                    token_usage={"prompt_tokens": prompt_toks, "completion_tokens": comp_toks, "cost_usd": round(cost, 6)},
+                    latency_ms=round(latency_ms, 2),
+                    provider=self.PROVIDER_NAME,
+                    model=self.model,
+                    summary=parsed.get("summary", "Anthropic evaluation completed."),
+                )
+            except Exception:
+                pass
+        return super()._parse_provider_response(data, latency_ms)
 
 
 class GeminiJudge(BaseLLMJudge):
     """Google Gemini 2.0 Flash / Pro plan judge adapter."""
     PROVIDER_NAME = "gemini"
     DEFAULT_MODEL = "gemini-2.0-flash"
+    ENV_KEY_NAMES = ["GEMINI_API_KEY", "GOOGLE_API_KEY"]
     PROMPT_COST_PER_M = 0.10
     COMPLETION_COST_PER_M = 0.40
+
+    @property
+    def ENDPOINT_URL(self) -> str:  # type: ignore
+        return f"https://generativelanguage.googleapis.com/v1beta/models/{self.model}:generateContent?key={self.api_key}"
+
+    def _get_request_headers(self) -> Dict[str, str]:
+        return {"Content-Type": "application/json"}
+
+    def _get_request_payload(self, system_msg: str, user_msg: str) -> Dict[str, Any]:
+        return {
+            "contents": [
+                {"role": "user", "parts": [{"text": f"{system_msg}\n\n{user_msg}"}]}
+            ],
+            "generationConfig": {"response_mime_type": "application/json"},
+        }
+
+    def _parse_provider_response(self, data: Dict[str, Any], latency_ms: float) -> JudgeVerdict:
+        meta = data.get("usageMetadata", {})
+        prompt_toks = meta.get("promptTokenCount", 0)
+        comp_toks = meta.get("candidatesTokenCount", 0)
+        cost = (prompt_toks / 1_000_000.0 * self.PROMPT_COST_PER_M) + (comp_toks / 1_000_000.0 * self.COMPLETION_COST_PER_M)
+
+        candidates = data.get("candidates", [])
+        if candidates and "content" in candidates[0]:
+            parts = candidates[0]["content"].get("parts", [])
+            if parts and "text" in parts[0]:
+                try:
+                    parsed = json.loads(parts[0]["text"])
+                    return JudgeVerdict(
+                        verdict=parsed.get("verdict", "PASS"),
+                        feasibility_0_100=float(parsed.get("feasibility_0_100", 85.0)),
+                        confidence=float(parsed.get("confidence", 0.9)),
+                        blockers=parsed.get("blockers", []),
+                        contradictions=parsed.get("contradictions", []),
+                        missing_evidence=parsed.get("missing", []),
+                        token_usage={"prompt_tokens": prompt_toks, "completion_tokens": comp_toks, "cost_usd": round(cost, 6)},
+                        latency_ms=round(latency_ms, 2),
+                        provider=self.PROVIDER_NAME,
+                        model=self.model,
+                        summary=parsed.get("summary", "Gemini evaluation completed."),
+                    )
+                except Exception:
+                    pass
+        return super()._parse_provider_response(data, latency_ms)
 
 
 class DeepSeekJudge(BaseLLMJudge):
     """DeepSeek V3 / R1 reasoning plan judge adapter."""
     PROVIDER_NAME = "deepseek"
     DEFAULT_MODEL = "deepseek-chat"
+    ENV_KEY_NAMES = ["DEEPSEEK_API_KEY"]
     PROMPT_COST_PER_M = 0.14
     COMPLETION_COST_PER_M = 0.28
+    ENDPOINT_URL = "https://api.deepseek.com/chat/completions"
 
 
 class EnsembleJudge(JudgeAdapter):
@@ -380,7 +601,6 @@ class DualJudgeEvaluator:
         try:
             loop = asyncio.get_event_loop()
             if loop.is_running():
-                # In active loop: run directly via asyncio.run in worker or thread
                 import concurrent.futures
                 with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
                     return pool.submit(

@@ -172,6 +172,7 @@ from plan_mode import (  # noqa: E402
     DeepSeekJudge,
     EnsembleJudge,
     EpistemicPlanSearch,
+    SearchResult,
     causal_crossover,
     insert_disambiguation_action,
     mutate_action_parameters,

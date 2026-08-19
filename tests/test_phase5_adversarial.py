@@ -57,7 +57,9 @@ from plan_mode.ir_search import (
     mutate_replace_action,
     mutate_reorder_actions,
     mutate_delete_action,
+    mutate_insert_action,
     TokenCostTracker,
+    SearchResult,
 )
 
 
@@ -313,11 +315,12 @@ def test_search_revalidates_every_candidate_through_causal_validator(sample_regi
         success_criteria=[SuccessCriterion(criterion_id="c1", description="Cleaned", condition=_cond("file_exists", ["/tmp/src.txt"], FactTruth.VERIFIED_FALSE))],
     )
     searcher = EpistemicPlanSearch(registry=sample_registry)
-    optimized_plan = searcher.search_best_plan(seed_plan=broken_plan, max_iterations=5, beam_width=3)
+    result = searcher.search_best_plan(seed_plan=broken_plan, max_iterations=5, beam_width=3)
 
     # Output plan must have been revalidated through causal validator
+    assert isinstance(result, SearchResult)
     validator = EpistemicCausalValidator()
-    val_res = validator.validate_plan(optimized_plan, registry=sample_registry)
+    val_res = validator.validate_plan(result.plan, registry=sample_registry)
     assert val_res.status in (ValidationStatus.PASS, ValidationStatus.UNKNOWN)
 
 
@@ -381,7 +384,147 @@ def test_search_reproducibility_with_seed(sample_registry):
     searcher_1 = EpistemicPlanSearch(registry=sample_registry, seed=42)
     searcher_2 = EpistemicPlanSearch(registry=sample_registry, seed=42)
 
-    plan_1 = searcher_1.search_best_plan(plan, max_iterations=3, beam_width=2)
-    plan_2 = searcher_2.search_best_plan(plan, max_iterations=3, beam_width=2)
+    result_1 = searcher_1.search_best_plan(plan, max_iterations=3, beam_width=2)
+    result_2 = searcher_2.search_best_plan(plan, max_iterations=3, beam_width=2)
 
-    assert plan_1.compute_hash() == plan_2.compute_hash()
+    assert result_1.plan.compute_hash() == result_2.plan.compute_hash()
+
+
+# ---------------------------------------------------------------------------
+# Test 11: Unconfigured Provider Judge Returns UNKNOWN, Never Fake PASS
+# ---------------------------------------------------------------------------
+@pytest.mark.asyncio
+async def test_unconfigured_provider_judge_returns_unknown_never_fake_pass(monkeypatch):
+    """When no API key is provided, judge must return UNKNOWN with 0 cost, never fabricate a fake PASS."""
+    # Clear all potential provider keys from environment
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+    monkeypatch.delenv("GEMINI_API_KEY", raising=False)
+    monkeypatch.delenv("DEEPSEEK_API_KEY", raising=False)
+
+    plan = PlanIR(
+        plan_id="p11_no_fake_pass",
+        goal_description="Test unconfigured judge",
+        initial_state=[],
+        actions=[],
+    )
+    unconfigured_judge = OpenAIJudge(api_key=None)
+    verdict = await unconfigured_judge.evaluate(plan)
+
+    assert verdict.verdict == "UNKNOWN"
+    assert verdict.confidence == 0.0
+    assert verdict.token_usage["prompt_tokens"] == 0
+    assert verdict.token_usage["cost_usd"] == 0.0
+    assert any("not configured" in b.lower() or "api key" in b.lower() for b in verdict.blockers)
+
+
+# ---------------------------------------------------------------------------
+# Test 12: Real HTTP Client Protocol & Real Token Calculation
+# ---------------------------------------------------------------------------
+@pytest.mark.asyncio
+async def test_real_http_client_protocol_and_token_calculation():
+    """Judge invokes HTTP client transport, extracts real token usage, and computes cost."""
+    import httpx
+
+    # Mock custom HTTP transport simulating a real OpenAI chat completion response
+    def handler(request: httpx.Request):
+        payload = json.loads(request.content)
+        assert "model" in payload
+        assert "messages" in payload
+        response_data = {
+            "choices": [
+                {
+                    "message": {
+                        "content": json.dumps({
+                            "verdict": "PASS",
+                            "feasibility_0_100": 95.0,
+                            "confidence": 0.95,
+                            "blockers": [],
+                            "summary": "Live verified response"
+                        })
+                    }
+                }
+            ],
+            "usage": {
+                "prompt_tokens": 1200,
+                "completion_tokens": 300,
+                "total_tokens": 1500
+            }
+        }
+        return httpx.Response(200, json=response_data)
+
+    mock_transport = httpx.MockTransport(handler)
+    mock_client = httpx.AsyncClient(transport=mock_transport)
+
+    plan = PlanIR(
+        plan_id="p12_http_dispatch",
+        goal_description="Test real client dispatch",
+        initial_state=[],
+        actions=[_action("a1", "fs.create_file", parameters={"path": "/tmp/a.txt"}, positive_effects=[_cond("file_exists", ["/tmp/a.txt"])])],
+    )
+    judge = OpenAIJudge(api_key="sk-test-live-key", http_client=mock_client)
+    verdict = await judge.evaluate(plan)
+
+    assert verdict.verdict == "PASS"
+    assert verdict.feasibility_0_100 == 95.0
+    assert verdict.token_usage["prompt_tokens"] == 1200
+    assert verdict.token_usage["completion_tokens"] == 300
+    # Cost for 1200 in ($2.50/M) + 300 out ($10.00/M) = $0.003 + $0.003 = $0.006
+    assert verdict.token_usage["cost_usd"] == 0.006
+    assert verdict.latency_ms > 0.0
+
+
+# ---------------------------------------------------------------------------
+# Test 13: Closed-World Enforced on Insert and Disambiguation
+# ---------------------------------------------------------------------------
+def test_closed_world_enforced_on_insert_and_disambiguation(sample_registry):
+    """insert_disambiguation_action and mutate_insert_action reject unregistered capabilities when registry is supplied."""
+    plan = PlanIR(
+        plan_id="p13_closed_world",
+        goal_description="Test closed world on insert",
+        initial_state=[],
+        actions=[_action("a1", "fs.create_file", parameters={"path": "/tmp/a.txt"}, positive_effects=[_cond("file_exists", ["/tmp/a.txt"])])],
+    )
+
+    # 1. Disambiguation with unregistered capability
+    m_unregistered = insert_disambiguation_action(
+        plan_ir=plan,
+        target_action_index=0,
+        probe_capability_name="unregistered_probe",
+        parameters={},
+        registry=sample_registry,
+    )
+    assert len(m_unregistered.actions) == 1, "Unregistered disambiguation probe was incorrectly inserted!"
+
+    # 2. Insert with unregistered action
+    unregistered_action = _action("probe_bad", "bad_tool", positive_effects=[_cond("done", [])])
+    m_insert_bad = mutate_insert_action(
+        plan_ir=plan,
+        target_index=0,
+        new_action=unregistered_action,
+        registry=sample_registry,
+    )
+    assert len(m_insert_bad.actions) == 1, "Unregistered action was incorrectly inserted!"
+
+
+# ---------------------------------------------------------------------------
+# Test 14: Structured SearchResult Contract and is_certified Status
+# ---------------------------------------------------------------------------
+def test_search_result_contract_and_is_certified_status(sample_registry):
+    """EpistemicPlanSearch returns a structured SearchResult where is_certified is True ONLY if validation is PASS."""
+    from plan_mode.ir_search import SearchResult
+
+    valid_plan = PlanIR(
+        plan_id="p14_certified",
+        goal_description="Create file",
+        initial_state=[],
+        actions=[_action("a1", "fs.create_file", parameters={"path": "/tmp/test.txt"}, positive_effects=[_cond("file_exists", ["/tmp/test.txt"])])],
+        success_criteria=[SuccessCriterion(criterion_id="c1", description="Created", condition=_cond("file_exists", ["/tmp/test.txt"]))],
+    )
+    searcher = EpistemicPlanSearch(registry=sample_registry)
+    result = searcher.search_best_plan(valid_plan)
+
+    assert isinstance(result, SearchResult)
+    assert result.is_certified is True
+    assert result.validation_status == ValidationStatus.PASS
+    assert "total_cost_usd" in result.cost_summary

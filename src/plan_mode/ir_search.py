@@ -5,6 +5,7 @@ from __future__ import annotations
 import copy
 import json
 import random
+import re
 import time
 from typing import Any, Dict, List, Optional
 from pydantic import BaseModel, Field
@@ -12,6 +13,7 @@ from pydantic import BaseModel, Field
 from plan_mode.epistemic_validator import (
     CausalValidator,
     EpistemicCausalValidator,
+    PlanValidationResult,
     ValidationStatus,
 )
 from plan_mode.ir import (
@@ -37,7 +39,6 @@ class TokenCostTracker(BaseModel):
     calls_by_provider: Dict[str, int] = Field(default_factory=dict)
 
     MODEL_PRICING: Dict[str, tuple[float, float]] = {
-        # model: (prompt_cost_per_M, completion_cost_per_M)
         "gpt-4o": (2.50, 10.00),
         "gpt-4o-mini": (0.15, 0.60),
         "claude-3-5-sonnet": (3.00, 15.00),
@@ -81,6 +82,17 @@ class TokenCostTracker(BaseModel):
             "calls_count": self.calls_count,
             "calls_by_provider": self.calls_by_provider,
         }
+
+
+class SearchResult(BaseModel):
+    """Structured certified result of an IR-native plan search."""
+    plan: PlanIR
+    validation_result: PlanValidationResult
+    validation_status: ValidationStatus
+    is_certified: bool
+    iterations_run: int
+    cost_summary: Dict[str, Any] = Field(default_factory=dict)
+    trajectory: List[Dict[str, Any]] = Field(default_factory=list)
 
 
 def mutate_action_parameters(
@@ -151,8 +163,16 @@ def mutate_insert_action(
     plan_ir: PlanIR,
     target_index: int,
     new_action: ActionIR,
+    registry: Optional[CapabilityRegistry] = None,
 ) -> PlanIR:
-    """Insert a new action at the specified index."""
+    """Insert a new action at the specified index, strictly validating against registry if provided."""
+    if registry is not None:
+        try:
+            registry.get(new_action.capability_name)
+            registry.validate_action(new_action)
+        except Exception:
+            return plan_ir.model_copy(deep=True)
+
     new_plan = plan_ir.model_copy(deep=True)
     idx = max(0, min(target_index, len(new_plan.actions)))
     new_plan.actions.insert(idx, new_action.model_copy(deep=True))
@@ -170,17 +190,14 @@ def mutate_replace_action(
     if action_index < 0 or action_index >= len(plan_ir.actions):
         return plan_ir.model_copy(deep=True)
 
-    # Capability Closed-World Verification: must be registered in CapabilityRegistry
     try:
         cap_entry = registry.get(new_capability_name)
     except CapabilityNotFoundError:
-        # Unregistered capability is strictly rejected; return unmutated plan
         return plan_ir.model_copy(deep=True)
 
     new_plan = plan_ir.model_copy(deep=True)
     old_action = new_plan.actions[action_index]
 
-    # Instantiate declared positive and negative effects
     instantiated_pos: List[PredicateCondition] = []
     for eff in cap_entry.positive_effects:
         inst_args = []
@@ -240,18 +257,39 @@ def insert_disambiguation_action(
     target_action_index: int,
     probe_capability_name: str,
     parameters: Dict[str, Any],
-    positive_effects: List[PredicateCondition],
+    positive_effects: Optional[List[PredicateCondition]] = None,
+    registry: Optional[CapabilityRegistry] = None,
 ) -> PlanIR:
     """Insert an epistemic grounding or probing action ahead of an ungrounded step."""
+    if registry is not None:
+        try:
+            cap_entry = registry.get(probe_capability_name)
+        except CapabilityNotFoundError:
+            return plan_ir.model_copy(deep=True)
+    else:
+        cap_entry = None
+
     new_plan = plan_ir.model_copy(deep=True)
     idx = max(0, min(target_action_index, len(new_plan.actions)))
 
+    if positive_effects is None and cap_entry is not None:
+        inst_effects = []
+        for eff in cap_entry.positive_effects:
+            inst_args = [
+                parameters.get(arg[1:-1], arg) if isinstance(arg, str) and arg.startswith("{") and arg.endswith("}") else arg
+                for arg in eff.args
+            ]
+            inst_effects.append(PredicateCondition(predicate=eff.predicate, args=inst_args, expected_truth=eff.expected_truth))
+        effects_to_use = inst_effects
+    else:
+        effects_to_use = positive_effects or []
+
     probe_action = ActionIR(
-        action_id=f"probe_{probe_capability_name}_{idx}",
+        action_id=f"probe_{probe_capability_name.replace('.', '_')}_{idx}",
         capability_name=probe_capability_name,
         parameters=parameters,
         preconditions=[],
-        positive_effects=positive_effects,
+        positive_effects=effects_to_use,
         is_idempotent=True,
         provenance=Provenance(
             source_type=SourceType.PLANNER_INFERENCE,
@@ -267,6 +305,7 @@ def causal_crossover(
     parent_a: PlanIR,
     parent_b: PlanIR,
     split_index_a: int = 1,
+    registry: Optional[CapabilityRegistry] = None,
 ) -> PlanIR:
     """Splice action subgraphs of two parent plans preserving provenance and schema."""
     new_plan = parent_a.model_copy(deep=True)
@@ -280,6 +319,11 @@ def causal_crossover(
         if cloned.action_id in seen_ids:
             cloned.action_id = f"{cloned.action_id}_cross"
         seen_ids.add(cloned.action_id)
+        if registry is not None:
+            try:
+                registry.get(cloned.capability_name)
+            except Exception:
+                continue
         combined_actions.append(cloned)
 
     new_plan.actions = combined_actions
@@ -311,17 +355,31 @@ class EpistemicPlanSearch:
         max_iterations: int = 10,
         beam_width: int = 5,
         observed_world_state: Optional[List[WorldFact] | Dict[str, WorldFact]] = None,
-    ) -> PlanIR:
-        """Search the PlanIR space to resolve UNKNOWN and FAIL conditions with deterministic revalidation."""
+    ) -> SearchResult:
+        """Search the PlanIR space to resolve UNKNOWN and FAIL conditions, returning certified SearchResult."""
         beam = [seed_plan.model_copy(deep=True)]
         best_plan = seed_plan.model_copy(deep=True)
-        best_score = -100.0
+        best_val_res = self.validator.validate_plan(
+            seed_plan,
+            registry=self.registry,
+            observed_world_state=observed_world_state,
+        )
+        best_score = self._score_validation_result(best_val_res)
+
+        if best_val_res.status == ValidationStatus.PASS:
+            return SearchResult(
+                plan=best_plan,
+                validation_result=best_val_res,
+                validation_status=best_val_res.status,
+                is_certified=True,
+                iterations_run=0,
+                cost_summary=self.cost_tracker.get_summary(),
+            )
 
         for iteration in range(max_iterations):
             next_beam: List[PlanIR] = []
 
             for candidate in beam:
-                # Deterministic Revalidation of every candidate
                 val_res = self.validator.validate_plan(
                     candidate,
                     registry=self.registry,
@@ -332,49 +390,50 @@ class EpistemicPlanSearch:
                 if score > best_score:
                     best_score = score
                     best_plan = candidate.model_copy(deep=True)
+                    best_val_res = val_res
 
                 if val_res.status == ValidationStatus.PASS:
-                    return candidate
+                    return SearchResult(
+                        plan=candidate,
+                        validation_result=val_res,
+                        validation_status=val_res.status,
+                        is_certified=True,
+                        iterations_run=iteration + 1,
+                        cost_summary=self.cost_tracker.get_summary(),
+                    )
 
                 # Flaw-directed mutations for UNKNOWN facts
                 if val_res.status == ValidationStatus.UNKNOWN and val_res.unknown_facts:
                     target_unknown = val_res.unknown_facts[0]
-                    unknown_pred = target_unknown
-                    unknown_args: List[str] = []
-                    if "(" in target_unknown and target_unknown.endswith(")"):
-                        unknown_pred = target_unknown[:target_unknown.find("(")]
-                        raw_args = target_unknown[target_unknown.find("(") + 1 : -1]
-                        unknown_args = [a.strip() for a in raw_args.split(",") if a.strip()]
+                    m = re.match(r"^([\w:-]+)(?:\((.*?)\))?$", target_unknown)
+                    target_pred = m.group(1) if m else target_unknown
 
-                    # Look up capability in registry that produces the missing fact
                     for cap_name, cap in sorted(self.registry.capabilities.items()):
+                        matched_eff = None
                         for eff in cap.positive_effects:
-                            if eff.predicate == unknown_pred or eff.predicate in target_unknown:
-                                probe_params: Dict[str, Any] = {}
-                                for p_idx, (p_name, p_spec) in enumerate(cap.input_schema.items()):
-                                    if p_idx < len(unknown_args):
-                                        probe_params[p_name] = unknown_args[p_idx]
-                                    else:
-                                        probe_params[p_name] = "default_val"
-
-                                mutated = insert_disambiguation_action(
-                                    plan_ir=candidate,
-                                    target_action_index=0,
-                                    probe_capability_name=cap_name,
-                                    parameters=probe_params,
-                                    positive_effects=[
-                                        PredicateCondition(
-                                            predicate=eff.predicate,
-                                            args=unknown_args if unknown_args else eff.args,
-                                        )
-                                    ],
-                                )
-                                next_beam.append(mutated)
+                            if eff.predicate == target_pred or eff.predicate in target_unknown:
+                                matched_eff = eff
                                 break
+                        if matched_eff:
+                            probe_params: Dict[str, Any] = {}
+                            for p_name, p_spec in cap.input_schema.items():
+                                probe_params[p_name] = "default_val"
+
+                            mutated = insert_disambiguation_action(
+                                plan_ir=candidate,
+                                target_action_index=0,
+                                probe_capability_name=cap_name,
+                                parameters=probe_params,
+                                positive_effects=[
+                                    PredicateCondition(predicate=matched_eff.predicate, args=[])
+                                ],
+                                registry=self.registry,
+                            )
+                            next_beam.append(mutated)
+                            break
 
                 # Exploratory closed-world parameter & reordering mutations
                 if candidate.actions:
-                    # Action reordering mutation
                     if len(candidate.actions) >= 2:
                         idx1 = self._rng.randint(0, len(candidate.actions) - 1)
                         idx2 = self._rng.randint(0, len(candidate.actions) - 1)
@@ -385,18 +444,28 @@ class EpistemicPlanSearch:
                 next_beam.append(candidate)
 
             if next_beam:
-                # Deterministically sort beam candidates by validation score
                 scored_candidates = []
                 for c in next_beam:
                     v_res = self.validator.validate_plan(c, registry=self.registry, observed_world_state=observed_world_state)
-                    scored_candidates.append((self._score_validation_result(v_res), c))
+                    scored_candidates.append((self._score_validation_result(v_res), c, v_res))
 
                 scored_candidates.sort(key=lambda item: item[0], reverse=True)
                 beam = [item[1] for item in scored_candidates[:beam_width]]
+                if scored_candidates[0][0] > best_score:
+                    best_score = scored_candidates[0][0]
+                    best_plan = scored_candidates[0][1]
+                    best_val_res = scored_candidates[0][2]
 
-        return best_plan
+        return SearchResult(
+            plan=best_plan,
+            validation_result=best_val_res,
+            validation_status=best_val_res.status,
+            is_certified=(best_val_res.status == ValidationStatus.PASS),
+            iterations_run=max_iterations,
+            cost_summary=self.cost_tracker.get_summary(),
+        )
 
-    def _score_validation_result(self, val_res) -> float:
+    def _score_validation_result(self, val_res: PlanValidationResult) -> float:
         """Deterministic scoring: PASS = 100, UNKNOWN = 50 - 5 * len(unknowns), FAIL = -10."""
         if val_res.status == ValidationStatus.PASS:
             return 100.0 + len(val_res.criteria_satisfied) * 10.0

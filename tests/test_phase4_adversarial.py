@@ -25,6 +25,36 @@ from plan_mode.runtime.sandbox import (
     SymlinkEscapeError,
 )
 from plan_mode.runtime.secret_scrubber import SecretScrubber
+from plan_mode.ir import (
+    ActionIR,
+    FactTruth,
+    PlanIR,
+    PredicateCondition,
+    Provenance,
+    SourceType,
+    WorldFact,
+)
+
+def _cond(predicate: str, args: list, truth: FactTruth = FactTruth.VERIFIED_TRUE) -> PredicateCondition:
+    return PredicateCondition(predicate=predicate, args=args, expected_truth=truth)
+
+def _action(
+    action_id: str,
+    capability_name: str,
+    parameters: dict | None = None,
+    positive_effects: list[PredicateCondition] | None = None,
+    negative_effects: list[PredicateCondition] | None = None,
+    preconditions: list[PredicateCondition] | None = None,
+) -> ActionIR:
+    return ActionIR(
+        action_id=action_id,
+        capability_name=capability_name,
+        parameters=parameters or {},
+        preconditions=preconditions or [],
+        positive_effects=positive_effects or [],
+        negative_effects=negative_effects or [],
+        provenance=Provenance(source_type=SourceType.PLANNER_INFERENCE, source_id=action_id),
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -357,3 +387,105 @@ def test_isolation_policy_capabilities_and_profiles():
 
     net_prof = SecurityProfile.get_profile(SecurityProfile.NETWORK_ALLOWED)
     assert net_prof.allow_network is True
+
+
+# ---------------------------------------------------------------------------
+# Test 15: Fail-Closed Isolation - Refuses execution when bwrap is unavailable
+# ---------------------------------------------------------------------------
+def test_isolation_refuses_execution_when_bwrap_unavailable(tmp_path):
+    """When require_bwrap=True and bwrap is unavailable, execution must be refused rather than run raw on host."""
+    workspace = tmp_path / "workspace"
+    workspace.mkdir(parents=True, exist_ok=True)
+
+    policy = IsolationPolicy(
+        workspace_dir=str(workspace),
+        require_bwrap=True,
+    )
+    sandbox = ExecutionSandbox(policy=policy)
+    # Simulate bwrap missing on the host
+    sandbox._bwrap_binary = None
+
+    cmd = ["echo", "should_not_run"]
+    res = sandbox.execute_argv_pipeline([cmd], cwd=str(workspace))
+
+    assert res.returncode == 126
+    assert any("refused" in res.stderr.lower() or "unavailable" in res.stderr.lower() for _ in [1])
+
+
+# ---------------------------------------------------------------------------
+# Test 16: Filesystem Isolation - Blocks non-shell programmatic writes outside workspace
+# ---------------------------------------------------------------------------
+def test_isolation_blocks_non_shell_file_write_outside_workspace(tmp_path):
+    """Python programmatic open('/outside/path', 'w') must fail with Read-only filesystem error inside bwrap."""
+    workspace = tmp_path / "workspace"
+    workspace.mkdir(parents=True, exist_ok=True)
+    outside_target = tmp_path / "outside_py_write.txt"
+
+    policy = IsolationPolicy(
+        workspace_dir=str(workspace),
+        read_only_root=True,
+    )
+    sandbox = ExecutionSandbox(policy=policy)
+
+    py_script = f"open('{str(outside_target)}', 'w').write('hacked')"
+    cmd = [sys.executable, "-c", py_script]
+    res = sandbox.execute_argv_pipeline([cmd], cwd=str(workspace))
+
+    assert not outside_target.exists()
+    assert res.returncode != 0 or "Read-only file system" in res.stderr
+
+
+# ---------------------------------------------------------------------------
+# Test 17: Transactional Execution Automatically Binds & Wipes Ephemeral Workspace
+# ---------------------------------------------------------------------------
+def test_transactional_execution_automatically_binds_and_wipes_ephemeral_workspace(tmp_path):
+    """TransactionalExecutionManager runs cleanly inside an EphemeralWorkspace with full post-exit teardown."""
+    from plan_mode.registry import CapabilityRegistry, CapabilityEntry, ObservationVerifier
+    from plan_mode.session import PlanningSession
+    from plan_mode.runtime.ledger import EvidenceLedger
+    from plan_mode.runtime.transaction import TransactionalExecutionManager, TransactionOutcome
+    from plan_mode.runtime.sandbox import EphemeralWorkspace, ExecutionSandbox, IsolationPolicy
+
+    reg = CapabilityRegistry()
+    reg.register(
+        CapabilityEntry(
+            name="fs.create_ephemeral",
+            description="Create file",
+            input_schema={"name": {"type": "str", "required": True}},
+            positive_effects=[_cond("done", ["{name}"])],
+            verifiers=[ObservationVerifier(verifier_id="v1", predicate="done", target_args_mapping=["{name}"], command_template=["true"])],
+            executor_command_template=["touch", "{name}"],
+        )
+    )
+
+    with EphemeralWorkspace(base_dir=str(tmp_path)) as ws:
+        target_file = os.path.join(ws.path, "test.txt")
+        plan = PlanIR(
+            plan_id="p_auto_ws",
+            goal_description="Test auto ephemeral workspace",
+            initial_state=[],
+            actions=[_action(action_id="act1", capability_name="fs.create_ephemeral", parameters={"name": target_file}, positive_effects=[_cond("done", [target_file])])],
+        )
+        session = PlanningSession(session_id="s_auto_ws")
+        session.submit_draft(plan)
+        session.validate_candidate(1, reg, observed_world_state=[])
+        session.select_version(1)
+        policy_hash = reg.compute_registry_hash()
+        cert = session.authorize_selected(reg, policy_hash=policy_hash)
+        session.start_execution(reg, policy_hash=policy_hash, current_world_facts=[])
+
+        sandbox = ExecutionSandbox(policy=IsolationPolicy(workspace_dir=ws.path))
+        manager = TransactionalExecutionManager(
+            session=session,
+            registry=reg,
+            ledger=EvidenceLedger(session_id=session.session_id),
+            observed_world_state=[],
+            policy_hash=policy_hash,
+            sandbox=sandbox,
+        )
+        summary = manager.execute_and_finalize(cert)
+        assert summary.outcome == TransactionOutcome.COMMITTED
+        assert os.path.exists(target_file)
+
+    # After exiting context manager, workspace is completely wiped
+    assert not os.path.exists(ws.path)

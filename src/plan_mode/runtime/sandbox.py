@@ -84,6 +84,8 @@ class IsolationPolicy(BaseModel):
         default_factory=lambda: ["PATH", "LANG", "LC_ALL", "TMPDIR", "PYTHONPATH", "HOME"]
     )
     use_bwrap: bool = True
+    require_bwrap: bool = False
+    allow_unisolated_fallback: bool = True
 
 
 class SecurityProfile:
@@ -224,6 +226,13 @@ class ExecutionSandbox:
         """Execute a pipeline of commands: cmd_0 | cmd_1 | ... | cmd_n under full isolation."""
         if not pipeline:
             return SandboxExecutionResult(returncode=0)
+
+        # Fail-closed check: if require_bwrap is enabled, refuse execution when bwrap is missing
+        if self.policy.require_bwrap and not self._bwrap_binary:
+            return SandboxExecutionResult(
+                stderr="Security violation: Kernel container isolation backend (bwrap) is unavailable. Execution refused under fail-closed security policy.",
+                returncode=126,
+            )
 
         effective_cwd = cwd or self.policy.workspace_dir or os.getcwd()
 
