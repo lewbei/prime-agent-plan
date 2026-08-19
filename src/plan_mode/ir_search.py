@@ -15,21 +15,12 @@ from plan_mode.epistemic_validator import (
     PlanValidationResult,
     ValidationStatus,
 )
-from plan_mode.ir import (
-    ActionIR,
-    PlanIR,
-    PredicateCondition,
-    Provenance,
-    SourceType,
-    WorldFact,
-)
+from plan_mode.ir import ActionIR, PlanIR, PredicateCondition, Provenance, SourceType, WorldFact
 from plan_mode.judges import JudgeAdapter, JudgeVerdict
 from plan_mode.registry import CapabilityNotFoundError, CapabilityRegistry
 
 
 class TokenCostTracker(BaseModel):
-    """Aggregate judge token usage, latency, and cost."""
-
     total_prompt_tokens: int = 0
     total_completion_tokens: int = 0
     total_cost_usd: float = 0.0
@@ -62,7 +53,6 @@ class TokenCostTracker(BaseModel):
         self.total_latency_ms += float(latency_ms)
         self.calls_count += 1
         self.calls_by_provider[provider] = self.calls_by_provider.get(provider, 0) + 1
-
         if cost_usd is not None:
             self.total_cost_usd += float(cost_usd)
         else:
@@ -84,8 +74,6 @@ class TokenCostTracker(BaseModel):
 
 
 class SearchResult(BaseModel):
-    """Search output with explicit deterministic certification status."""
-
     plan: PlanIR
     validation_result: PlanValidationResult
     validation_status: ValidationStatus
@@ -95,10 +83,7 @@ class SearchResult(BaseModel):
     trajectory: List[Dict[str, Any]] = Field(default_factory=list)
 
 
-def _instantiate_condition(
-    condition: PredicateCondition,
-    parameters: Dict[str, Any],
-) -> PredicateCondition:
+def _instantiate_condition(condition: PredicateCondition, parameters: Dict[str, Any]) -> PredicateCondition:
     args: List[Any] = []
     for arg in condition.args:
         if isinstance(arg, str) and arg.startswith("{") and arg.endswith("}"):
@@ -125,12 +110,10 @@ def _registered_action(
     *,
     rationale: str,
 ) -> Optional[ActionIR]:
-    """Instantiate an action solely from a registered capability contract."""
     try:
         capability = registry.get(capability_name)
     except CapabilityNotFoundError:
         return None
-
     action = ActionIR(
         action_id=action_id,
         capability_name=capability_name,
@@ -158,14 +141,11 @@ def mutate_action_parameters(
     parameter_updates: Dict[str, Any],
     registry: Optional[CapabilityRegistry] = None,
 ) -> PlanIR:
-    """Mutate parameters; with a registry, re-derive the full action contract."""
     if action_index < 0 or action_index >= len(plan_ir.actions):
         return plan_ir.model_copy(deep=True)
-
     target = plan_ir.actions[action_index]
     parameters = dict(target.parameters)
     parameters.update(parameter_updates)
-
     if registry is not None:
         rebuilt = _registered_action(
             registry,
@@ -176,14 +156,11 @@ def mutate_action_parameters(
         )
         if rebuilt is None:
             return plan_ir.model_copy(deep=True)
-        new_plan = plan_ir.model_copy(deep=True)
-        new_plan.actions[action_index] = rebuilt
-        return new_plan
-
-    # Compatibility helper only.  This path is not used as a certification
-    # boundary and cannot invent a new capability or effect set.
-    new_plan = plan_ir.model_copy(deep=True)
-    new_plan.actions[action_index] = target.model_copy(
+        result = plan_ir.model_copy(deep=True)
+        result.actions[action_index] = rebuilt
+        return result
+    result = plan_ir.model_copy(deep=True)
+    result.actions[action_index] = target.model_copy(
         update={
             "parameters": parameters,
             "provenance": Provenance(
@@ -192,7 +169,7 @@ def mutate_action_parameters(
             ),
         }
     )
-    return new_plan
+    return result
 
 
 def mutate_reorder_actions(plan_ir: PlanIR, index_1: int, index_2: int) -> PlanIR:
@@ -204,20 +181,17 @@ def mutate_reorder_actions(plan_ir: PlanIR, index_1: int, index_2: int) -> PlanI
         or index_1 == index_2
     ):
         return plan_ir.model_copy(deep=True)
-    new_plan = plan_ir.model_copy(deep=True)
-    new_plan.actions[index_1], new_plan.actions[index_2] = (
-        new_plan.actions[index_2],
-        new_plan.actions[index_1],
-    )
-    return new_plan
+    result = plan_ir.model_copy(deep=True)
+    result.actions[index_1], result.actions[index_2] = result.actions[index_2], result.actions[index_1]
+    return result
 
 
 def mutate_delete_action(plan_ir: PlanIR, action_index: int) -> PlanIR:
     if action_index < 0 or action_index >= len(plan_ir.actions):
         return plan_ir.model_copy(deep=True)
-    new_plan = plan_ir.model_copy(deep=True)
-    new_plan.actions.pop(action_index)
-    return new_plan
+    result = plan_ir.model_copy(deep=True)
+    result.actions.pop(action_index)
+    return result
 
 
 def mutate_insert_action(
@@ -226,7 +200,6 @@ def mutate_insert_action(
     new_action: ActionIR,
     registry: Optional[CapabilityRegistry] = None,
 ) -> PlanIR:
-    """Insert only a registry-valid action; missing registry fails closed."""
     if registry is None:
         return plan_ir.model_copy(deep=True)
     try:
@@ -234,10 +207,9 @@ def mutate_insert_action(
         registry.validate_action(new_action)
     except Exception:
         return plan_ir.model_copy(deep=True)
-    new_plan = plan_ir.model_copy(deep=True)
-    idx = max(0, min(target_index, len(new_plan.actions)))
-    new_plan.actions.insert(idx, new_action.model_copy(deep=True))
-    return new_plan
+    result = plan_ir.model_copy(deep=True)
+    result.actions.insert(max(0, min(target_index, len(result.actions))), new_action.model_copy(deep=True))
+    return result
 
 
 def mutate_replace_action(
@@ -249,19 +221,18 @@ def mutate_replace_action(
 ) -> PlanIR:
     if action_index < 0 or action_index >= len(plan_ir.actions):
         return plan_ir.model_copy(deep=True)
-    old_action = plan_ir.actions[action_index]
     replacement = _registered_action(
         registry,
         new_capability_name,
         parameters,
         f"{new_capability_name.replace('.', '_')}_{action_index}",
-        rationale=f"Replaced {old_action.capability_name} with {new_capability_name}",
+        rationale=f"Replaced {plan_ir.actions[action_index].capability_name} with {new_capability_name}",
     )
     if replacement is None:
         return plan_ir.model_copy(deep=True)
-    new_plan = plan_ir.model_copy(deep=True)
-    new_plan.actions[action_index] = replacement
-    return new_plan
+    result = plan_ir.model_copy(deep=True)
+    result.actions[action_index] = replacement
+    return result
 
 
 def insert_disambiguation_action(
@@ -272,22 +243,22 @@ def insert_disambiguation_action(
     positive_effects: Optional[List[PredicateCondition]] = None,
     registry: Optional[CapabilityRegistry] = None,
 ) -> PlanIR:
-    """Insert a probe derived exactly from the registry; caller effects are ignored."""
+    """Insert an exact registry-derived probe. ``positive_effects`` is compatibility-only and ignored."""
     if registry is None:
         return plan_ir.model_copy(deep=True)
-    idx = max(0, min(target_action_index, len(plan_ir.actions)))
+    index = max(0, min(target_action_index, len(plan_ir.actions)))
     probe = _registered_action(
         registry,
         probe_capability_name,
         parameters,
-        f"probe_{probe_capability_name.replace('.', '_')}_{idx}",
+        f"probe_{probe_capability_name.replace('.', '_')}_{index}",
         rationale="Inserted registry-grounded disambiguation probe",
     )
     if probe is None:
         return plan_ir.model_copy(deep=True)
-    new_plan = plan_ir.model_copy(deep=True)
-    new_plan.actions.insert(idx, probe)
-    return new_plan
+    result = plan_ir.model_copy(deep=True)
+    result.actions.insert(index, probe)
+    return result
 
 
 def causal_crossover(
@@ -296,20 +267,14 @@ def causal_crossover(
     split_index_a: int = 1,
     registry: Optional[CapabilityRegistry] = None,
 ) -> PlanIR:
-    """Splice parents only when every resulting action is registry-valid."""
     if registry is None:
         return parent_a.model_copy(deep=True)
-
-    actions_prefix = parent_a.actions[:split_index_a]
-    actions_suffix = (
-        parent_b.actions[split_index_a:]
-        if split_index_a < len(parent_b.actions)
-        else parent_b.actions
-    )
+    prefix = parent_a.actions[:split_index_a]
+    suffix = parent_b.actions[split_index_a:] if split_index_a < len(parent_b.actions) else parent_b.actions
     combined: List[ActionIR] = []
     seen_ids = set()
-    for source_action in actions_prefix + actions_suffix:
-        cloned = source_action.model_copy(deep=True)
+    for source in prefix + suffix:
+        cloned = source.model_copy(deep=True)
         if cloned.action_id in seen_ids:
             cloned.action_id = f"{cloned.action_id}_cross"
         seen_ids.add(cloned.action_id)
@@ -319,19 +284,13 @@ def causal_crossover(
         except Exception:
             return parent_a.model_copy(deep=True)
         combined.append(cloned)
-
-    new_plan = parent_a.model_copy(deep=True)
-    new_plan.actions = combined
-    return new_plan
+    result = parent_a.model_copy(deep=True)
+    result.actions = combined
+    return result
 
 
 class EpistemicPlanSearch:
-    """Search PlanIR while keeping deterministic validation authoritative.
-
-    An optional judge may rank candidates and propose mutations. Judge output is
-    never empirical evidence and can never set ``is_certified``.  Every judge
-    mutation is translated through closed-world operators and then revalidated.
-    """
+    """Search PlanIR with closed-world deterministic certification and advisory judges."""
 
     def __init__(
         self,
@@ -349,6 +308,27 @@ class EpistemicPlanSearch:
         self._rng = random.Random(seed)
         self._judge_cache: Dict[str, JudgeVerdict] = {}
         self._trajectory: List[Dict[str, Any]] = []
+
+    def _validate_candidate(
+        self,
+        plan: PlanIR,
+        observed_world_state: Optional[List[WorldFact] | Dict[str, WorldFact]],
+    ) -> PlanValidationResult:
+        """Closed-world certification boundary: every action must exist in the registry."""
+        for action in plan.actions:
+            try:
+                self.registry.get(action.capability_name)
+            except CapabilityNotFoundError:
+                return PlanValidationResult(
+                    status=ValidationStatus.UNKNOWN,
+                    failed_step_id=action.action_id,
+                    unknown_facts=[f"unregistered_capability({action.capability_name})"],
+                )
+        return self.validator.validate_plan(
+            plan,
+            registry=self.registry,
+            observed_world_state=observed_world_state,
+        )
 
     def _run_judge(
         self,
@@ -392,11 +372,10 @@ class EpistemicPlanSearch:
         )
         return verdict
 
-    def _judge_adjustment(self, verdict: Optional[JudgeVerdict]) -> float:
+    @staticmethod
+    def _judge_adjustment(verdict: Optional[JudgeVerdict]) -> float:
         if verdict is None:
             return 0.0
-        # Advisory only: bounded so it cannot turn FAIL/UNKNOWN into a
-        # deterministic certification.
         adjustment = (verdict.feasibility_0_100 - 50.0) / 10.0
         if verdict.verdict == "FAIL":
             adjustment -= 5.0
@@ -414,15 +393,13 @@ class EpistemicPlanSearch:
             op = str(suggestion.get("op") or suggestion.get("type") or "").lower()
             try:
                 if op in {"replace_action", "replace"}:
-                    mutations.append(
-                        mutate_replace_action(
-                            plan,
-                            int(suggestion["action_index"]),
-                            str(suggestion["capability_name"]),
-                            dict(suggestion.get("parameters", {})),
-                            self.registry,
-                        )
-                    )
+                    mutations.append(mutate_replace_action(
+                        plan,
+                        int(suggestion["action_index"]),
+                        str(suggestion["capability_name"]),
+                        dict(suggestion.get("parameters", {})),
+                        self.registry,
+                    ))
                 elif op in {"insert_action", "insert"}:
                     index = int(suggestion.get("target_index", 0))
                     cap_name = str(suggestion["capability_name"])
@@ -435,26 +412,20 @@ class EpistemicPlanSearch:
                         rationale="Judge-suggested action instantiated from registry",
                     )
                     if action is not None:
-                        mutations.append(
-                            mutate_insert_action(plan, index, action, registry=self.registry)
-                        )
+                        mutations.append(mutate_insert_action(plan, index, action, registry=self.registry))
                 elif op in {"update_parameters", "parameters"}:
-                    mutations.append(
-                        mutate_action_parameters(
-                            plan,
-                            int(suggestion["action_index"]),
-                            dict(suggestion.get("parameters", {})),
-                            registry=self.registry,
-                        )
-                    )
+                    mutations.append(mutate_action_parameters(
+                        plan,
+                        int(suggestion["action_index"]),
+                        dict(suggestion.get("parameters", {})),
+                        registry=self.registry,
+                    ))
                 elif op in {"reorder_actions", "reorder"}:
-                    mutations.append(
-                        mutate_reorder_actions(
-                            plan,
-                            int(suggestion["index_1"]),
-                            int(suggestion["index_2"]),
-                        )
-                    )
+                    mutations.append(mutate_reorder_actions(
+                        plan,
+                        int(suggestion["index_1"]),
+                        int(suggestion["index_2"]),
+                    ))
                 elif op in {"delete_action", "delete"}:
                     mutations.append(mutate_delete_action(plan, int(suggestion["action_index"])))
             except (KeyError, TypeError, ValueError):
@@ -472,11 +443,7 @@ class EpistemicPlanSearch:
         self._judge_cache = {}
         beam = [seed_plan.model_copy(deep=True)]
         best_plan = seed_plan.model_copy(deep=True)
-        best_val_res = self.validator.validate_plan(
-            best_plan,
-            registry=self.registry,
-            observed_world_state=observed_world_state,
-        )
+        best_val_res = self._validate_candidate(best_plan, observed_world_state)
         best_judge = self._run_judge(best_plan, observed_world_state)
         best_score = self._score_validation_result(best_val_res) + self._judge_adjustment(best_judge)
         self._record_trajectory(0, best_plan, best_val_res, best_judge)
@@ -484,31 +451,24 @@ class EpistemicPlanSearch:
         if best_val_res.status == ValidationStatus.PASS:
             return self._result(best_plan, best_val_res, 0)
 
+        iterations_run = 0
         for iteration in range(max_iterations):
+            iterations_run = iteration + 1
             next_beam: List[PlanIR] = []
-
             for candidate in beam:
-                val_res = self.validator.validate_plan(
-                    candidate,
-                    registry=self.registry,
-                    observed_world_state=observed_world_state,
-                )
+                val_res = self._validate_candidate(candidate, observed_world_state)
                 judge_verdict = self._run_judge(candidate, observed_world_state)
-                self._record_trajectory(iteration + 1, candidate, val_res, judge_verdict)
+                self._record_trajectory(iterations_run, candidate, val_res, judge_verdict)
                 score = self._score_validation_result(val_res) + self._judge_adjustment(judge_verdict)
                 if score > best_score:
                     best_score = score
                     best_plan = candidate.model_copy(deep=True)
                     best_val_res = val_res
-
                 if val_res.status == ValidationStatus.PASS:
-                    return self._result(candidate, val_res, iteration + 1)
+                    return self._result(candidate, val_res, iterations_run)
 
-                # Judge advice is translated through closed-world operators.
                 next_beam.extend(self._judge_mutations(candidate, judge_verdict))
 
-                # Deterministic flaw-directed probe insertion.  The action and
-                # effects are instantiated exclusively from the registry.
                 if val_res.status == ValidationStatus.UNKNOWN and val_res.unknown_facts:
                     target_unknown = val_res.unknown_facts[0]
                     match = re.match(r"^([\w:-]+)(?:\((.*?)\))?$", target_unknown)
@@ -519,23 +479,16 @@ class EpistemicPlanSearch:
                         if raw_args
                         else []
                     )
-
                     for cap_name, capability in sorted(self.registry.capabilities.items()):
                         matching_effect = next(
-                            (
-                                effect
-                                for effect in capability.positive_effects
-                                if effect.predicate == target_predicate
-                            ),
+                            (effect for effect in capability.positive_effects if effect.predicate == target_predicate),
                             None,
                         )
                         if matching_effect is None:
                             continue
                         probe_params: Dict[str, Any] = {}
                         for index, param_name in enumerate(capability.input_schema):
-                            probe_params[param_name] = (
-                                unknown_args[index] if index < len(unknown_args) else "default_val"
-                            )
+                            probe_params[param_name] = unknown_args[index] if index < len(unknown_args) else "default_val"
                         mutated = insert_disambiguation_action(
                             candidate,
                             0,
@@ -557,18 +510,10 @@ class EpistemicPlanSearch:
             if not next_beam:
                 break
 
-            # De-duplicate before expensive validation/judging.
-            unique: Dict[str, PlanIR] = {}
-            for candidate in next_beam:
-                unique[candidate.compute_hash()] = candidate
-
+            unique: Dict[str, PlanIR] = {candidate.compute_hash(): candidate for candidate in next_beam}
             scored_candidates = []
             for candidate in unique.values():
-                validation = self.validator.validate_plan(
-                    candidate,
-                    registry=self.registry,
-                    observed_world_state=observed_world_state,
-                )
+                validation = self._validate_candidate(candidate, observed_world_state)
                 judge_verdict = self._run_judge(candidate, observed_world_state)
                 score = self._score_validation_result(validation) + self._judge_adjustment(judge_verdict)
                 scored_candidates.append((score, candidate, validation))
@@ -578,7 +523,7 @@ class EpistemicPlanSearch:
             if scored_candidates and scored_candidates[0][0] > best_score:
                 best_score, best_plan, best_val_res = scored_candidates[0]
 
-        return self._result(best_plan, best_val_res, max_iterations)
+        return self._result(best_plan, best_val_res, iterations_run)
 
     def _record_trajectory(
         self,
@@ -593,13 +538,11 @@ class EpistemicPlanSearch:
             "validation_status": validation.status.value,
         }
         if judge is not None:
-            entry.update(
-                {
-                    "judge_provider": judge.provider,
-                    "judge_verdict": judge.verdict,
-                    "judge_feasibility_0_100": judge.feasibility_0_100,
-                }
-            )
+            entry.update({
+                "judge_provider": judge.provider,
+                "judge_verdict": judge.verdict,
+                "judge_feasibility_0_100": judge.feasibility_0_100,
+            })
         self._trajectory.append(entry)
 
     def _result(
@@ -618,13 +561,10 @@ class EpistemicPlanSearch:
             trajectory=list(self._trajectory),
         )
 
-    def _score_validation_result(self, val_res: PlanValidationResult) -> float:
+    @staticmethod
+    def _score_validation_result(val_res: PlanValidationResult) -> float:
         if val_res.status == ValidationStatus.PASS:
             return 100.0 + len(val_res.criteria_satisfied) * 10.0
         if val_res.status == ValidationStatus.UNKNOWN:
-            return (
-                50.0
-                - len(val_res.unknown_facts) * 5.0
-                + len(val_res.criteria_satisfied) * 2.0
-            )
+            return 50.0 - len(val_res.unknown_facts) * 5.0 + len(val_res.criteria_satisfied) * 2.0
         return -10.0 - len(val_res.blocker_reasons) * 2.0
