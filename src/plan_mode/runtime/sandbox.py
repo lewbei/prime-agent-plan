@@ -202,11 +202,20 @@ class SandboxExecutionResult(BaseModel):
 _NET_BLOCKER_SCRIPT = """
 import socket, builtins, os, io
 if os.environ.get("PRIME_NETWORK_DENY") == "1":
-    def _blocked_socket(*args, **kwargs):
-        raise OSError(101, "Network unreachable (ExecutionSandbox default-deny policy)")
-    socket.socket = _blocked_socket
+    class _BlockedSocket(socket.socket):
+        def connect(self, *args, **kwargs):
+            raise OSError(101, "Network unreachable (ExecutionSandbox default-deny policy)")
+        def connect_ex(self, *args, **kwargs):
+            return 101
+        def send(self, *args, **kwargs):
+            raise OSError(101, "Network unreachable")
+        def sendto(self, *args, **kwargs):
+            raise OSError(101, "Network unreachable")
+    socket.socket = _BlockedSocket
     if hasattr(socket, 'create_connection'):
-        socket.create_connection = _blocked_socket
+        def _blocked_conn(*args, **kwargs):
+            raise OSError(101, "Network unreachable (ExecutionSandbox default-deny policy)")
+        socket.create_connection = _blocked_conn
 _ws_dir = os.environ.get("PRIME_WORKSPACE_DIR")
 _ro_root = os.environ.get("PRIME_READ_ONLY_ROOT") == "1"
 if _ro_root and _ws_dir:
