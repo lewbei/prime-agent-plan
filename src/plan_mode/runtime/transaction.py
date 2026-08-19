@@ -18,7 +18,7 @@ from plan_mode.ir import (
     WitnessabilityStatus,
     WorldFact,
 )
-from plan_mode.registry import CapabilityEntry, CapabilityRegistry, CompensationAction
+from plan_mode.registry import CapabilityRegistry, CompensationAction
 from plan_mode.runtime.executor import (
     ExecutionBackend,
     ExecutionPlanManager,
@@ -26,7 +26,7 @@ from plan_mode.runtime.executor import (
     WitnessStatus,
 )
 from plan_mode.runtime.ledger import EvidenceLedger, LedgerEventType
-from plan_mode.runtime.sandbox import ExecutionSandbox, SandboxExecutionResult
+from plan_mode.runtime.sandbox import ExecutionSandbox
 from plan_mode.session import (
     AuthorizationCertificate,
     CommitGateError,
@@ -74,15 +74,18 @@ def _resolve_tokens(tokens: List[str], params: Dict[str, Any]) -> List[str]:
 def _resolve_parameter_mapping(
     mapping: Dict[str, str], original_params: Dict[str, Any]
 ) -> Dict[str, Any]:
+    """Resolve compensation params, rejecting missing explicit placeholders."""
     resolved: Dict[str, Any] = {}
     for target, source in mapping.items():
-        source_name = source
-        if source.startswith("{") and source.endswith("}"):
-            source_name = source[1:-1]
-        elif source.startswith("$"):
-            source_name = source[1:]
+        is_braced = source.startswith("{") and source.endswith("}")
+        is_dollar = source.startswith("$")
+        source_name = source[1:-1] if is_braced else (source[1:] if is_dollar else source)
         if source_name in original_params:
             resolved[target] = original_params[source_name]
+        elif is_braced or is_dollar:
+            raise ValueError(
+                f"compensation parameter '{target}' references missing original parameter '{source_name}'"
+            )
         else:
             resolved[target] = source
     return resolved
@@ -168,12 +171,14 @@ class TransactionalExecutionManager:
             except CommitGateError as exc:
                 blockers = list(exc.blockers)
                 return self._compensate_or_contain(
+                    certificate,
                     execution,
                     execution_backend,
                     blockers,
                 )
 
         return self._compensate_or_contain(
+            certificate,
             execution,
             execution_backend,
             ["execution did not complete with independently witnessed success"],
@@ -190,6 +195,7 @@ class TransactionalExecutionManager:
 
     def _compensate_or_contain(
         self,
+        certificate: AuthorizationCertificate,
         execution: ExecutionSummary,
         execution_backend: Optional[ExecutionBackend],
         blockers: List[str],
@@ -221,6 +227,26 @@ class TransactionalExecutionManager:
         if self.session.current_state == SessionState.EXECUTING:
             self.session.transition_to(SessionState.COMPENSATING)
 
+        # Compensation contracts were authorized through the same registry and
+        # policy identity. If either drifts during execution, do not run an
+        # unbound recovery command.
+        if self.registry.compute_registry_hash() != certificate.registry_hash:
+            return self._containment_failed(
+                execution,
+                [],
+                blockers,
+                effectful_executed[-1],
+                "capability registry drifted before compensation",
+            )
+        if self.policy_hash != certificate.policy_hash:
+            return self._containment_failed(
+                execution,
+                [],
+                blockers,
+                effectful_executed[-1],
+                "runtime policy drifted before compensation",
+            )
+
         results: List[CompensationResult] = []
         for step_id in reversed(effectful_executed):
             action = action_by_id[step_id]
@@ -237,7 +263,6 @@ class TransactionalExecutionManager:
 
             result = self._execute_compensation(
                 action,
-                cap,
                 spec,
                 execution_backend,
             )
@@ -263,7 +288,6 @@ class TransactionalExecutionManager:
     def _execute_compensation(
         self,
         original_action: ActionIR,
-        original_capability: CapabilityEntry,
         spec: CompensationAction,
         execution_backend: Optional[ExecutionBackend],
     ) -> CompensationResult:
@@ -279,7 +303,18 @@ class TransactionalExecutionManager:
                 error_message=f"compensation capability unavailable: {exc}",
             )
 
-        params = _resolve_parameter_mapping(spec.parameter_mapping, original_action.parameters)
+        try:
+            params = _resolve_parameter_mapping(spec.parameter_mapping, original_action.parameters)
+        except ValueError as exc:
+            return CompensationResult(
+                original_step_id=original_action.action_id,
+                compensation_id=spec.compensation_id,
+                capability_name=comp_cap.name,
+                executed=False,
+                verified=False,
+                error_message=str(exc),
+            )
+
         comp_action = ActionIR(
             action_id=f"compensate:{original_action.action_id}:{spec.compensation_id}",
             capability_name=comp_cap.name,
@@ -316,6 +351,31 @@ class TransactionalExecutionManager:
                 verified=False,
                 error_message="compensation capability has no executor contract",
             )
+        if not (comp_action.positive_effects or comp_action.negative_effects):
+            return CompensationResult(
+                original_step_id=original_action.action_id,
+                compensation_id=spec.compensation_id,
+                capability_name=comp_cap.name,
+                executed=False,
+                verified=False,
+                error_message="compensation capability declares no observable postcondition effects",
+            )
+
+        for pre in comp_action.preconditions:
+            fact = self.executor.live_world_state.get(pre.fact_key)
+            if fact is None or fact.truth != pre.expected_truth:
+                observed = fact.truth.value if fact is not None else "MISSING"
+                return CompensationResult(
+                    original_step_id=original_action.action_id,
+                    compensation_id=spec.compensation_id,
+                    capability_name=comp_cap.name,
+                    executed=False,
+                    verified=False,
+                    error_message=(
+                        f"compensation precondition '{pre.fact_key}' expected "
+                        f"{pre.expected_truth.value}, observed {observed}"
+                    ),
+                )
 
         self.ledger.append_record(
             LedgerEventType.COMPENSATION_TRIGGERED,
