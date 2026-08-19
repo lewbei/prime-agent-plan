@@ -14,7 +14,7 @@ The current prototype branch includes:
 - Capability/effect registry binding with exact typed verifier targets.
 - Structured argv execution with independent post-execution attestation.
 - Explicit plan/registry/policy/world identity checks before execution.
-- Transactional Phase 3 finalization: execution produces evidence only; commit requires an attested successful execution and empirically verified mandatory success criteria.
+- Transactional finalization: execution produces evidence only; commit requires an attested successful execution and empirically verified mandatory success criteria.
 - Saga compensation for dispatched effectful actions, executed in reverse order through registered compensation capabilities and independently verified postconditions.
 - Fail-closed `CONTAINMENT_FAILED` when compensation is missing, invalid, unobservable, blocked by drift/preconditions, fails execution/verification, or raises during recovery.
 
