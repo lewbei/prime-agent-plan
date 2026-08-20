@@ -42,12 +42,15 @@ class FakeVerifier:
         )
 
 
-def test_normal_assess_candidates_inherits_session_implementation_model(tmp_path):
+def test_normal_assess_candidates_inherits_session_model_and_thinking(tmp_path):
     session = plan.start(
         "choose implementation",
         plans_dir=tmp_path,
         session_id="inherited-selector",
-        meta={"implementation_model": "deepseek-v4-flash"},
+        meta={
+            "implementation_model": "deepseek-v4-flash",
+            "implementation_thinking": "high",
+        },
     )
     verifier = FakeVerifier(selected=1)
 
@@ -58,18 +61,28 @@ def test_normal_assess_candidates_inherits_session_implementation_model(tmp_path
         verifier=verifier,
     )
 
-    assert result["selection_method"] == "inherited-same-model-self-verification"
+    expected_thinking = {
+        "mode": "level",
+        "thinking_level": "high",
+        "reasoning_effort": "high",
+    }
+    assert result["selection_method"] == "inherited-same-model-same-thinking-self-verification"
     assert result["selected_candidate"] == 1
     assert result["implementation_model"] == "deepseek-v4-flash"
     assert result["generator_model"] == "deepseek-v4-flash"
     assert result["verifier_model"] == "deepseek-v4-flash"
+    assert result["implementation_thinking"] == expected_thinking
+    assert result["generator_thinking"] == expected_thinking
+    assert result["verifier_thinking"] == expected_thinking
     assert result["is_self_verification"] is True
+    assert result["is_same_thinking"] is True
     assert verifier.calls[0]["model"] == "deepseek-v4-flash"
+    assert verifier.calls[0]["thinking_profile"] == expected_thinking
     assert verifier.calls[0]["n_evaluations"] == 2
     assert verifier.calls[0]["pivots"] == 1
 
 
-def test_explicit_runtime_model_is_inherited_without_architecture_default(tmp_path):
+def test_explicit_runtime_model_and_thinking_are_inherited_without_defaults(tmp_path):
     session = plan.start(
         "choose runtime model",
         plans_dir=tmp_path,
@@ -83,11 +96,34 @@ def test_explicit_runtime_model_is_inherited_without_architecture_default(tmp_pa
         plans_dir=tmp_path,
         verifier=verifier,
         implementation_model="gemini-3.7-flash",
+        implementation_thinking="medium",
     )
 
     assert result["implementation_model"] == "gemini-3.7-flash"
     assert result["verifier_model"] == "gemini-3.7-flash"
+    assert result["implementation_thinking"]["thinking_level"] == "medium"
+    assert result["verifier_thinking"] == result["implementation_thinking"]
     assert verifier.calls[0]["model"] == "gemini-3.7-flash"
+    assert verifier.calls[0]["thinking_profile"] == result["implementation_thinking"]
+
+
+def test_absent_thinking_override_inherits_same_provider_default(tmp_path):
+    session = plan.start(
+        "choose default-thinking runtime",
+        plans_dir=tmp_path,
+        session_id="default-thinking",
+        meta={"implementation_model": "model-default"},
+    )
+    verifier = FakeVerifier(selected=0)
+    result = plan.assess_candidates(
+        session,
+        [DRAFT_A, DRAFT_B],
+        plans_dir=tmp_path,
+        verifier=verifier,
+    )
+    assert result["generator_thinking"] == {"mode": "default"}
+    assert result["verifier_thinking"] == {"mode": "default"}
+    assert verifier.calls[0]["thinking_profile"] == {"mode": "default"}
 
 
 def test_unknown_model_identity_falls_back_without_calling_verifier(tmp_path):
@@ -121,7 +157,10 @@ def test_verifier_outage_inherits_pr1_deterministic_fallback(tmp_path):
         "choose with fallback",
         plans_dir=tmp_path,
         session_id="inherited-fallback",
-        meta={"implementation_model": "model-z"},
+        meta={
+            "implementation_model": "model-z",
+            "implementation_thinking": "low",
+        },
     )
     result = plan.assess_candidates(
         session,
@@ -132,6 +171,7 @@ def test_verifier_outage_inherits_pr1_deterministic_fallback(tmp_path):
 
     assert result["selection_method"] == "deterministic-fallback"
     assert result["implementation_model"] == "model-z"
+    assert result["implementation_thinking"]["thinking_level"] == "low"
     assert result["self_verification_available"] is False
     assert "provider unavailable" in result["self_verification_error"]
 
