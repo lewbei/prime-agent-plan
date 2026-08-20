@@ -2,9 +2,9 @@
 
 ## Status
 
-Self-verification is an **inherited Prime candidate-ranking behavior**, not a separate mode that callers must select. It is still not an empirical truth source and not a benchmark claim.
+Self-verification is an **inherited Prime candidate-ranking behavior**, not a separate mode that callers must select. It is not an empirical truth source and not a benchmark claim.
 
-This work is layered on the complete PR #1 runtime already merged into `main`. PR #2 therefore inherits the full Phase 0–5 architecture; its diff only shows the new verification-scaling changes relative to that merged base.
+This work is layered on the complete PR #1 runtime already merged into `main`. PR #2 therefore inherits the full Phase 0–5 architecture. GitHub shows only the new verification-scaling files in PR #2 because its diff is relative to the current `main`, which already contains PR #1.
 
 It is inspired by **LLM-as-a-Verifier: A General-Purpose Verification Framework** (arXiv:2607.05391) and the public `llm-as-a-verifier/llm-as-a-verifier` implementation. The upstream project demonstrates **same-model self-verification** on Terminal-Bench 2.1: `deepseek-v4-flash` generates multiple mini-swe-agent trajectories and the same `deepseek-v4-flash` model ranks/verifies those trajectories. Their reported Best-of-5 result improves from 78.7% Pass@1 to 88.0% ± 0.6% after self-verifier selection. Those numbers belong to the upstream project and are **not Prime results**.
 
@@ -70,7 +70,7 @@ Gemini 3.7 Flash
 
 ## Inherited same-model defaults
 
-Normal selection already uses the same-model configuration; no separate `select_same_model()` call is required:
+Normal selection already uses the same-model configuration; no separate mode or helper is required:
 
 ```python
 from plan_mode.self_verification import PlanSelfVerifier
@@ -92,7 +92,7 @@ pivots:            1
 
 For difficult work, the harness should generate **5 independent candidates**; for routine work, 3 candidates can reduce cost. Candidate generation remains the responsibility of the agent/harness.
 
-`select_same_model()` remains only as a backward-compatible alias. It is not the normal API requirement.
+`select_same_model()` remains only as a deprecated compatibility alias. It is not the normal API requirement.
 
 `result.is_self_verification` records that generator and verifier model identities match. This flag is descriptive only; it does not change certification semantics.
 
@@ -141,7 +141,7 @@ These criteria are advisory. A high probabilistic score cannot override a determ
 
 ## Installation and provider availability
 
-The self-verification behavior is part of Prime's architecture, while the external probabilistic provider backend is kept as a lazy dependency so deterministic Prime still operates when provider credentials are unavailable.
+The self-verification behavior is part of Prime's architecture, while the external probabilistic/logprob backend is lazy so deterministic Prime remains usable when provider credentials are unavailable.
 
 ```bash
 pip install -e '.[verification]'
