@@ -62,3 +62,8 @@ venv.bak/
 *.swo
 *~
 .DS_Store
+
+# Harbor benchmark artifacts and downloaded dataset
+benchmarks/harbor_dataset/
+jobs/
+results/
