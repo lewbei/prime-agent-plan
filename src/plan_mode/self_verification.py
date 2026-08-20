@@ -1,13 +1,16 @@
 """Optional probabilistic Best-of-N self-verification for plans and trajectories.
 
 This module is inspired by LLM-as-a-Verifier (arXiv:2607.05391) and its
-self-verification workflow. It is deliberately advisory: probabilistic LLM
-scores rank candidates but never create empirical facts, change FactTruth, or
-certify execution. Plan certification remains the responsibility of the
-closed-world deterministic validator and runtime empirical witnesses.
+same-model self-verification workflow. It is deliberately advisory:
+probabilistic LLM scores rank candidates but never create empirical facts,
+change FactTruth, or certify execution. Plan certification remains the
+responsibility of the closed-world deterministic validator and runtime
+empirical witnesses.
 
-The optional ``llm-verifier`` package is loaded lazily. Core Prime runtime and
-CI therefore do not require a verifier provider or API credential.
+Prime's recommended implementation configuration uses ``gemini-3.7-flash``
+as both generator and probabilistic verifier. The optional ``llm-verifier``
+package is loaded lazily, so the core runtime and CI do not require a verifier
+provider or API credential.
 """
 from __future__ import annotations
 
@@ -18,6 +21,15 @@ from pydantic import BaseModel, Field
 from plan_mode.epistemic_validator import CausalValidator, PlanValidationResult, ValidationStatus
 from plan_mode.ir import PlanIR, WorldFact
 from plan_mode.registry import CapabilityNotFoundError, CapabilityRegistry
+
+
+# Prime's recommended same-model configuration. The upstream Terminal-Bench
+# 2.1 self-verification reproduction uses K=2 repeated evaluations and one
+# pivot for Best-of-5. We reuse those verification settings while using the
+# implementation model actually used by Prime.
+DEFAULT_SELF_VERIFICATION_MODEL = "gemini-3.7-flash"
+DEFAULT_SELF_VERIFICATION_N_EVALUATIONS = 2
+DEFAULT_SELF_VERIFICATION_PIVOTS = 1
 
 
 DEFAULT_VERIFICATION_CRITERIA: Dict[str, str] = {
@@ -40,8 +52,8 @@ class ProbabilisticSelection(BaseModel):
     ranking: List[int] = Field(default_factory=list)
     scores: List[float] = Field(default_factory=list)
     verifier_model: Optional[str] = None
-    n_evaluations: int = 1
-    pivots: int = 1
+    n_evaluations: int = DEFAULT_SELF_VERIFICATION_N_EVALUATIONS
+    pivots: int = DEFAULT_SELF_VERIFICATION_PIVOTS
 
 
 class PlanSelfVerificationResult(BaseModel):
@@ -60,21 +72,32 @@ class PlanSelfVerificationResult(BaseModel):
     generator_model: Optional[str] = None
     verifier_model: Optional[str] = None
     is_self_verification: bool = False
-    n_evaluations: int = 1
-    pivots: int = 1
+    n_evaluations: int = DEFAULT_SELF_VERIFICATION_N_EVALUATIONS
+    pivots: int = DEFAULT_SELF_VERIFICATION_PIVOTS
     criteria: Dict[str, str] = Field(default_factory=dict)
 
 
 class ProbabilisticSelfVerifier:
-    """Thin adapter over ``llm_verifier.select`` with an injectable test seam.
+    """Thin adapter over ``llm_verifier.select`` with injectable seams.
 
-    The upstream verifier computes fine-grained probabilistic scores and uses a
-    pivot tournament for Best-of-N selection. Prime treats the returned score
+    The upstream verifier computes fine-grained probabilistic scores and uses
+    a pivot tournament for Best-of-N selection. Prime treats the returned score
     only as a preference signal.
+
+    ``client`` is optional and is useful for pinning the verifier to a specific
+    backend. In particular, same-model Gemini verification should use a Vertex
+    AI ``google-genai`` client/backend that exposes token-level logprobs rather
+    than allowing environment-key precedence to silently choose another
+    provider.
     """
 
-    def __init__(self, select_fn: Optional[Callable[..., Any]] = None):
+    def __init__(
+        self,
+        select_fn: Optional[Callable[..., Any]] = None,
+        client: Any = None,
+    ):
         self._select_fn = select_fn
+        self._client = client
 
     def _resolve_select_fn(self) -> Callable[..., Any]:
         if self._select_fn is not None:
@@ -94,9 +117,10 @@ class ProbabilisticSelfVerifier:
         problem: str,
         candidates: List[str],
         criteria: Optional[Dict[str, str]] = None,
-        model: Optional[str] = None,
-        n_evaluations: int = 4,
-        pivots: int = 2,
+        model: str = DEFAULT_SELF_VERIFICATION_MODEL,
+        n_evaluations: int = DEFAULT_SELF_VERIFICATION_N_EVALUATIONS,
+        pivots: int = DEFAULT_SELF_VERIFICATION_PIVOTS,
+        client: Any = None,
     ) -> ProbabilisticSelection:
         if not candidates:
             raise ValueError("Best-of-N verification requires at least one candidate")
@@ -110,11 +134,13 @@ class ProbabilisticSelfVerifier:
             "problem": problem,
             "candidates": candidates,
             "criteria": criteria or DEFAULT_VERIFICATION_CRITERIA,
+            "model": model,
             "n_evaluations": n_evaluations,
             "pivots": min(pivots, len(candidates)),
         }
-        if model:
-            kwargs["model"] = model
+        selected_client = client if client is not None else self._client
+        if selected_client is not None:
+            kwargs["client"] = selected_client
         raw = select_fn(**kwargs)
 
         selected_index = int(getattr(raw, "index"))
@@ -192,12 +218,13 @@ class PlanSelfVerifier:
         criteria: Optional[Dict[str, str]] = None,
         generator_model: Optional[str] = None,
         verifier_model: Optional[str] = None,
-        n_evaluations: int = 4,
-        pivots: int = 2,
+        n_evaluations: int = DEFAULT_SELF_VERIFICATION_N_EVALUATIONS,
+        pivots: int = DEFAULT_SELF_VERIFICATION_PIVOTS,
     ) -> PlanSelfVerificationResult:
         if not candidates:
             raise ValueError("Plan self-verification requires at least one candidate")
 
+        effective_verifier_model = verifier_model or DEFAULT_SELF_VERIFICATION_MODEL
         validations = [self._validate(plan, observed_world_state) for plan in candidates]
         statuses = {i: result.status for i, result in enumerate(validations)}
         pass_indices = [i for i, result in enumerate(validations) if result.status == ValidationStatus.PASS]
@@ -214,8 +241,10 @@ class PlanSelfVerifier:
                 is_certified=False,
                 requires_rework=True,
                 generator_model=generator_model,
-                verifier_model=verifier_model,
-                is_self_verification=bool(generator_model and verifier_model and generator_model == verifier_model),
+                verifier_model=effective_verifier_model,
+                is_self_verification=bool(
+                    generator_model and generator_model == effective_verifier_model
+                ),
                 n_evaluations=n_evaluations,
                 pivots=pivots,
                 criteria=criteria or DEFAULT_VERIFICATION_CRITERIA,
@@ -227,7 +256,7 @@ class PlanSelfVerifier:
             problem=problem,
             candidates=rendered,
             criteria=criteria or DEFAULT_VERIFICATION_CRITERIA,
-            model=verifier_model,
+            model=effective_verifier_model,
             n_evaluations=n_evaluations,
             pivots=pivots,
         )
@@ -253,9 +282,41 @@ class PlanSelfVerifier:
             is_certified=certified,
             requires_rework=not certified,
             generator_model=generator_model,
-            verifier_model=verifier_model,
-            is_self_verification=bool(generator_model and verifier_model and generator_model == verifier_model),
+            verifier_model=effective_verifier_model,
+            is_self_verification=bool(
+                generator_model and generator_model == effective_verifier_model
+            ),
             n_evaluations=n_evaluations,
             pivots=min(pivots, len(eligible_indices)),
             criteria=criteria or DEFAULT_VERIFICATION_CRITERIA,
+        )
+
+    def select_same_model(
+        self,
+        candidates: List[PlanIR],
+        *,
+        model: str = DEFAULT_SELF_VERIFICATION_MODEL,
+        goal_description: Optional[str] = None,
+        observed_world_state: Optional[List[WorldFact] | Dict[str, WorldFact]] = None,
+        criteria: Optional[Dict[str, str]] = None,
+        n_evaluations: int = DEFAULT_SELF_VERIFICATION_N_EVALUATIONS,
+        pivots: int = DEFAULT_SELF_VERIFICATION_PIVOTS,
+    ) -> PlanSelfVerificationResult:
+        """Rank candidates using the same model identity for generation and verification.
+
+        This is the direct Prime analogue of the paper/repository's
+        DeepSeek-V4-Flash -> DeepSeek-V4-Flash self-verification experiment.
+        Prime's recommended model is Gemini 3.7 Flash because it is the model
+        used for implementation. The method only records/uses model identity;
+        it does not weaken deterministic certification.
+        """
+        return self.select(
+            candidates,
+            goal_description=goal_description,
+            observed_world_state=observed_world_state,
+            criteria=criteria,
+            generator_model=model,
+            verifier_model=model,
+            n_evaluations=n_evaluations,
+            pivots=pivots,
         )
