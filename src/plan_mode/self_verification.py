@@ -25,10 +25,6 @@ from plan_mode.ir import PlanIR, WorldFact
 from plan_mode.registry import CapabilityNotFoundError, CapabilityRegistry
 
 
-# Prime's inherited same-model configuration. The upstream Terminal-Bench 2.1
-# self-verification reproduction uses K=2 repeated evaluations and one pivot
-# for Best-of-5. Prime keeps those verification settings while using its main
-# implementation model.
 DEFAULT_SELF_VERIFICATION_MODEL = "gemini-3.7-flash"
 DEFAULT_SELF_VERIFICATION_N_EVALUATIONS = 2
 DEFAULT_SELF_VERIFICATION_PIVOTS = 1
@@ -48,8 +44,6 @@ class SelfVerificationUnavailableError(RuntimeError):
 
 
 class ProbabilisticSelection(BaseModel):
-    """Provider-neutral result from soft Best-of-N verification."""
-
     selected_index: int
     ranking: List[int] = Field(default_factory=list)
     scores: List[float] = Field(default_factory=list)
@@ -59,8 +53,6 @@ class ProbabilisticSelection(BaseModel):
 
 
 class PlanSelfVerificationResult(BaseModel):
-    """Best-of-N result after the hard deterministic gate is re-applied."""
-
     selected_index: Optional[int] = None
     selected_plan: Optional[PlanIR] = None
     ranking: List[int] = Field(default_factory=list)
@@ -80,24 +72,9 @@ class PlanSelfVerificationResult(BaseModel):
 
 
 class ProbabilisticSelfVerifier:
-    """Thin adapter over ``llm_verifier.select`` with injectable seams.
+    """Thin adapter over ``llm_verifier.select`` with injectable seams."""
 
-    The upstream verifier computes fine-grained probabilistic scores and uses
-    a pivot tournament for Best-of-N selection. Prime treats the returned score
-    only as a preference signal.
-
-    ``client`` is optional and is useful for pinning the verifier to a specific
-    backend. In particular, Gemini self-verification should use a Vertex AI
-    ``google-genai`` client/backend that exposes token-level logprobs rather
-    than allowing environment-key precedence to silently choose another
-    provider.
-    """
-
-    def __init__(
-        self,
-        select_fn: Optional[Callable[..., Any]] = None,
-        client: Any = None,
-    ):
+    def __init__(self, select_fn: Optional[Callable[..., Any]] = None, client: Any = None):
         self._select_fn = select_fn
         self._client = client
 
@@ -106,7 +83,7 @@ class ProbabilisticSelfVerifier:
             return self._select_fn
         try:
             import llm_verifier  # type: ignore
-        except ImportError as exc:  # pragma: no cover - depends on optional extra
+        except ImportError as exc:  # pragma: no cover
             raise SelfVerificationUnavailableError(
                 "Probabilistic self-verification requires the verification backend: "
                 "pip install 'plan[verification]'"
@@ -174,13 +151,6 @@ class PlanSelfVerifier:
 
     Default behavior is Gemini 3.7 Flash -> Gemini 3.7 Flash. There is no
     separate self-verification mode to select.
-
-    Policy:
-    * deterministic FAIL candidates are never shown to the LLM verifier;
-    * if at least one deterministic PASS exists, only PASS candidates compete;
-    * otherwise UNKNOWN candidates may be ranked for repair/rework only;
-    * the selected plan is deterministically revalidated after ranking;
-    * ``is_certified`` is true only for deterministic PASS.
     """
 
     def __init__(
@@ -304,7 +274,7 @@ class PlanSelfVerifier:
         n_evaluations: int = DEFAULT_SELF_VERIFICATION_N_EVALUATIONS,
         pivots: int = DEFAULT_SELF_VERIFICATION_PIVOTS,
     ) -> PlanSelfVerificationResult:
-        """Backward-compatible alias; normal ``select`` is already same-model by default."""
+        """Deprecated compatibility alias; normal ``select`` is already same-model."""
         return self.select(
             candidates,
             goal_description=goal_description,
