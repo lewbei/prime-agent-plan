@@ -210,6 +210,26 @@ results = await plan.execute_plan(best_plan_text, task_handlers={1: run_task1})
 
 ---
 
+
+### Epistemic Planning & Verification Runtime API (Phases 1–5)
+
+| Symbol / Class | Description |
+| :--- | :--- |
+| `plan_mode.PlanIR` | Canonical typed Plan IR with initial state facts, action sequences, hard constraints, and success criteria. |
+| `plan_mode.WorldFact` | Typed empirical state atom with `predicate`, `args` (type-preserving), `truth` (`FactTruth`), and `provenance`. |
+| `plan_mode.FactTruth` | 4-state empirical truth lattice: `VERIFIED_TRUE`, `VERIFIED_FALSE`, `UNKNOWN`, `CONFLICT`. |
+| `plan_mode.ProjectedTruth` | Plan-time causal projection: `SUPPORTED_TRUE`, `SUPPORTED_FALSE`, `CONTRADICTED`, `UNSUPPORTED`. |
+| `plan_mode.EpistemicCausalValidator` | Deterministic epistemic causal validator verifying precondition grounding, invariant satisfaction, and effect witnessability. |
+| `plan_mode.CapabilityRegistry` / `plan_mode.CapabilityEntry` | Grounded capability catalog with input/output schemas, declared effects, and `ObservationVerifier` bindings. |
+| `plan_mode.ObservationVerifier` | Independent empirical state witnessing contract attesting command effects against external ground truth. |
+| `plan_mode.PlanningSession` | Authoritative planning session managing draft submission, candidate validation, version selection, and HMAC authorization. |
+| `plan_mode.AuthorizationCertificate` | Cryptographic HMAC-signed certificate binding PlanIR hash, world state hash, registry hash, and isolation policy hash. |
+| `plan_mode.TransactionalExecutionManager` | Commit-gated execution manager enforcing preflight validation, step attestation, and LIFO reverse saga rollback. |
+| `plan_mode.EphemeralWorkspace` | Private `0700` ephemeral workspace manager with automatic lifecycle cleanup. |
+| `plan_mode.ExecutionSandbox` / `plan_mode.IsolationPolicy` | Linux namespace boundary (`bwrap`), POSIX resource limits (`prlimit`), and network default-deny with socket hooks. |
+| `plan_mode.DualJudgeEvaluator` / `plan_mode.EnsembleJudge` | Multi-provider LLM judge consensus (OpenAI, Anthropic, Gemini, DeepSeek) with blind optimism detection. |
+| `plan_mode.EpistemicPlanSearch` / `plan_mode.TokenCostTracker` | Certified closed-world plan search with mutation operators and real token cost tracking. |
+
 ## Concurrency & Safety Model
 
 - **Reentrant Process/Thread Lock (`session_lock`)**: All state-mutating entrypoints (`assess`, `record_judge`, `log_progress`, `release`, `finish`, `fold_history`) execute within an in-process thread-aware depth tracker backed by POSIX `fcntl.flock`, eliminating race conditions across parallel subagents without self-deadlock.
