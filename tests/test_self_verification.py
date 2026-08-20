@@ -6,7 +6,13 @@ from types import SimpleNamespace
 from plan_mode.epistemic_validator import PlanValidationResult, ValidationStatus
 from plan_mode.ir import ActionIR, PlanIR, Provenance, SourceType
 from plan_mode.registry import CapabilityEntry, CapabilityRegistry
-from plan_mode.self_verification import PlanSelfVerifier, ProbabilisticSelfVerifier
+from plan_mode.self_verification import (
+    DEFAULT_SELF_VERIFICATION_MODEL,
+    DEFAULT_SELF_VERIFICATION_N_EVALUATIONS,
+    DEFAULT_SELF_VERIFICATION_PIVOTS,
+    PlanSelfVerifier,
+    ProbabilisticSelfVerifier,
+)
 
 
 def _action(action_id: str, capability: str) -> ActionIR:
@@ -24,6 +30,13 @@ def _registry() -> CapabilityRegistry:
     return reg
 
 
+def _plans() -> list[PlanIR]:
+    return [
+        PlanIR(plan_id="p0", goal_description="choose", actions=[_action("a0", "noop.a")]),
+        PlanIR(plan_id="p1", goal_description="choose", actions=[_action("a1", "noop.b")]),
+    ]
+
+
 def test_same_model_best_of_n_selection_is_advisory_and_certified_only_after_validator_pass():
     calls = []
 
@@ -33,15 +46,11 @@ def test_same_model_best_of_n_selection_is_advisory_and_certified_only_after_val
 
     verifier = ProbabilisticSelfVerifier(select_fn=fake_select)
     selector = PlanSelfVerifier(registry=_registry(), verifier=verifier)
-    candidates = [
-        PlanIR(plan_id="p0", goal_description="choose", actions=[_action("a0", "noop.a")]),
-        PlanIR(plan_id="p1", goal_description="choose", actions=[_action("a1", "noop.b")]),
-    ]
 
     result = selector.select(
-        candidates,
-        generator_model="deepseek-v4-flash",
-        verifier_model="deepseek-v4-flash",
+        _plans(),
+        generator_model="gemini-3.7-flash",
+        verifier_model="gemini-3.7-flash",
         n_evaluations=2,
         pivots=1,
     )
@@ -52,6 +61,33 @@ def test_same_model_best_of_n_selection_is_advisory_and_certified_only_after_val
     assert result.validation_status == ValidationStatus.PASS
     assert result.ranking == [1, 0]
     assert result.scores == [0.25, 0.91]
+    assert calls[0]["model"] == "gemini-3.7-flash"
+    assert calls[0]["n_evaluations"] == 2
+    assert calls[0]["pivots"] == 1
+
+
+def test_same_model_helper_defaults_to_gemini_3_7_flash_and_paper_matched_verification_settings():
+    calls = []
+
+    def fake_select(**kwargs):
+        calls.append(kwargs)
+        return SimpleNamespace(index=0, ranking=[0, 1], scores=[0.9, 0.2])
+
+    selector = PlanSelfVerifier(
+        registry=_registry(),
+        verifier=ProbabilisticSelfVerifier(select_fn=fake_select),
+    )
+    result = selector.select_same_model(_plans())
+
+    assert DEFAULT_SELF_VERIFICATION_MODEL == "gemini-3.7-flash"
+    assert DEFAULT_SELF_VERIFICATION_N_EVALUATIONS == 2
+    assert DEFAULT_SELF_VERIFICATION_PIVOTS == 1
+    assert result.generator_model == "gemini-3.7-flash"
+    assert result.verifier_model == "gemini-3.7-flash"
+    assert result.is_self_verification is True
+    assert result.n_evaluations == 2
+    assert result.pivots == 1
+    assert calls[0]["model"] == "gemini-3.7-flash"
     assert calls[0]["n_evaluations"] == 2
     assert calls[0]["pivots"] == 1
 
@@ -76,11 +112,11 @@ def test_deterministic_fail_candidate_is_never_sent_to_llm_selector():
     bad = PlanIR(plan_id="bad", goal_description="x", actions=[_action("bad", "noop.a")])
     good = PlanIR(plan_id="good", goal_description="x", actions=[_action("good", "noop.b")])
 
-    result = selector.select([bad, good], verifier_model="v")
+    result = selector.select([bad, good], verifier_model="gemini-3.7-flash")
     assert result.selected_index == 1
     assert result.is_certified is True
     assert len(seen) == 1
-    assert '"plan_id":"good"' in seen[0].replace(" ", "")
+    assert '\"plan_id\":\"good\"' in seen[0].replace(" ", "")
 
 
 def test_unknown_candidates_may_be_ranked_for_rework_but_never_certified():
@@ -100,7 +136,7 @@ def test_unknown_candidates_may_be_ranked_for_rework_but_never_certified():
         PlanIR(plan_id="u0", goal_description="x", actions=[_action("u0", "noop.a")]),
         PlanIR(plan_id="u1", goal_description="x", actions=[_action("u1", "noop.b")]),
     ]
-    result = selector.select(plans, verifier_model="v")
+    result = selector.select(plans, verifier_model="gemini-3.7-flash")
 
     assert result.selected_index == 1
     assert result.validation_status == ValidationStatus.UNKNOWN
@@ -121,7 +157,7 @@ def test_unregistered_action_cannot_be_certified_even_if_verifier_prefers_it():
         goal_description="x",
         actions=[_action("m", "magic.capability")],
     )
-    result = selector.select([unknown], verifier_model="v")
+    result = selector.select([unknown], verifier_model="gemini-3.7-flash")
 
     assert result.is_certified is False
     assert result.validation_status == ValidationStatus.UNKNOWN
