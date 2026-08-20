@@ -192,5 +192,152 @@ from plan_mode import (  # noqa: E402
     ExecutionBackend,
     DEFAULT_RUBRIC,
 )
+from plan_mode.self_verification import (  # noqa: E402
+    DEFAULT_SELF_VERIFICATION_MODEL,
+    DEFAULT_SELF_VERIFICATION_N_EVALUATIONS,
+    DEFAULT_SELF_VERIFICATION_PIVOTS,
+    ProbabilisticSelfVerifier as _ProbabilisticSelfVerifier,
+)
+
+
+# Preserve the PR #1 deterministic selector as the fail-safe path. The public
+# Prime entrypoint below adds inherited same-model verification automatically;
+# callers continue to use plan.assess_candidates(...) without selecting a new
+# mode or helper.
+_deterministic_assess_candidates = assess_candidates
+
+
+def assess_candidates(
+    session,
+    drafts,
+    *,
+    notes=None,
+    plans_dir=None,
+    verifier=None,
+    generator_model=DEFAULT_SELF_VERIFICATION_MODEL,
+    verifier_model=DEFAULT_SELF_VERIFICATION_MODEL,
+    n_evaluations=DEFAULT_SELF_VERIFICATION_N_EVALUATIONS,
+    pivots=DEFAULT_SELF_VERIFICATION_PIVOTS,
+):
+    """Inherited Best-of-N selection: deterministic gate + Gemini self-verifier.
+
+    The existing PR #1 deterministic checks remain the hard prefilter and
+    fallback. When at least two eligible drafts exist and the probabilistic
+    backend is available, Gemini 3.7 Flash ranks the candidates by default.
+    The selected draft is then passed through the normal ``assess`` pipeline.
+
+    Missing provider/backend credentials never disable deterministic Prime;
+    selection falls back to the original PR #1 selector and reports the
+    fallback in the returned metadata.
+    """
+    if not drafts:
+        raise ValueError("drafts must be non-empty")
+    if len(drafts) == 1:
+        result = _deterministic_assess_candidates(
+            session, drafts, notes=notes, plans_dir=plans_dir
+        )
+        result["selection_method"] = "deterministic-single-candidate"
+        return result
+
+    # Hard deterministic prefilter inherited from PR #1. Broken candidates do
+    # not compete with clean candidates merely because the LLM prefers them.
+    checked = []
+    pass_indices = []
+    for i, draft in enumerate(drafts):
+        v = plan_mode.verify(draft)
+        gc = plan_mode.ground_check(draft)
+        sim = plan_mode.simulate(draft, initial_state=set(gc.get("verified", [])))
+        hard_pass = bool(v.get("ok") and gc.get("ok") and sim.get("executable_plan"))
+        checked.append({
+            "candidate": i,
+            "verify_ok": bool(v.get("ok")),
+            "feasibility_ok": bool(gc.get("ok")),
+            "sim_ok": bool(sim.get("executable_plan")),
+            "hard_pass": hard_pass,
+        })
+        if hard_pass:
+            pass_indices.append(i)
+
+    # If no draft is fully clean, all drafts remain eligible for selecting the
+    # best rework target. This does not certify them; assess/release gates still
+    # apply afterward.
+    eligible = pass_indices if pass_indices else list(range(len(drafts)))
+    if len(eligible) == 1:
+        chosen = eligible[0]
+        result = plan_mode.assess(
+            session,
+            drafts[chosen],
+            note=(notes or [None] * len(drafts))[chosen],
+            plans_dir=plans_dir,
+        )
+        result.update({
+            "selection_method": "deterministic-prefilter-single",
+            "selected_candidate": chosen,
+            "candidate_checks": checked,
+            "candidates_scored": len(drafts),
+        })
+        return result
+
+    if isinstance(session, dict):
+        objective = str(session.get("objective") or "Select the best candidate plan")
+    else:
+        try:
+            objective = str(plan_mode.status(session, plans_dir=plans_dir).get("objective") or "Select the best candidate plan")
+        except Exception:
+            objective = "Select the best candidate plan"
+
+    soft_verifier = verifier or _ProbabilisticSelfVerifier()
+    try:
+        soft = soft_verifier.select(
+            problem=objective,
+            candidates=[drafts[i] for i in eligible],
+            model=verifier_model or DEFAULT_SELF_VERIFICATION_MODEL,
+            n_evaluations=n_evaluations,
+            pivots=pivots,
+        )
+        chosen = eligible[soft.selected_index]
+        result = plan_mode.assess(
+            session,
+            drafts[chosen],
+            note=(notes or [None] * len(drafts))[chosen],
+            plans_dir=plans_dir,
+        )
+        result.update({
+            "selection_method": "inherited-same-model-self-verification",
+            "selected_candidate": chosen,
+            "generator_model": generator_model or DEFAULT_SELF_VERIFICATION_MODEL,
+            "verifier_model": verifier_model or DEFAULT_SELF_VERIFICATION_MODEL,
+            "is_self_verification": (
+                (generator_model or DEFAULT_SELF_VERIFICATION_MODEL)
+                == (verifier_model or DEFAULT_SELF_VERIFICATION_MODEL)
+            ),
+            "n_evaluations": n_evaluations,
+            "pivots": min(pivots, len(eligible)),
+            "eligible_candidates": eligible,
+            "candidate_checks": checked,
+            "probabilistic_scores": soft.scores,
+            "probabilistic_ranking": [eligible[i] for i in soft.ranking],
+            "candidates_scored": len(drafts),
+        })
+        return result
+    except Exception as exc:
+        # Provider/API/logprob availability is a soft dependency. A verifier
+        # outage must not disable the deterministic PR #1 runtime.
+        result = _deterministic_assess_candidates(
+            session, drafts, notes=notes, plans_dir=plans_dir
+        )
+        result.update({
+            "selection_method": "deterministic-fallback",
+            "self_verification_available": False,
+            "self_verification_error": f"{type(exc).__name__}: {exc}",
+            "candidate_checks": checked,
+        })
+        return result
+
+
+# Make the inherited behavior visible through both public imports once the
+# global `plan` entrypoint is loaded. This preserves all PR #1 functionality
+# while removing any need to select a separate verification mode.
+plan_mode.assess_candidates = assess_candidates
 
 __all__ = list(plan_mode.__all__)
