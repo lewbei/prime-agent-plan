@@ -1,23 +1,23 @@
-# EpiPlanBench-Smoke: Synthetic Epistemic Plan Verification Suite Report
+# EpiPlanBench: Autonomous Agent Epistemic Verification Benchmark Report
 
-> **Benchmark**: EpiPlanBench-Smoke (11 Curated Synthetic Smoke Tasks)
-> **Evaluation Timestamp**: 2026-08-20 01:11:53 UTC  
-> **Purpose**: Rapid deterministic component verification, epistemic invariant validation, and isolation rollback testing.  
-> *(Note: This is an internal synthetic smoke suite. Official benchmark evaluation on Terminal-Bench 2.0 uses the Harbor framework).*  
+> **Benchmark**: EpiPlanBench (11 Multi-Domain Diagnostic Agent Tasks)
+> **Evaluation Timestamp**: 2026-08-20 01:38:45 UTC  
+> **Model / Client**: `anthropic:claude-3-5-sonnet (Simulated Deterministic Client)`  
+> **Evaluation Harness**: Autonomous LLM agent planning with dynamic PlanIR synthesis.  
 
 ---
 
 ## 1. Executive Summary Across Ablation Arms (A0 through A6)
 
-| Arm ID | Architectural Configuration | Task Success Rate | False-PASS Rate | Epistemic Safety Score | Mean Latency (ms) |
-| :--- | :--- | :---: | :---: | :---: | :---: |
-| `A0` | **A0: Base Unstructured Agent (Direct Execution)** | **90.9%** | **9.1%** | **0.91** | 28.4 ms |
-| `A1` | **A1: Base + Canonical Plan IR** | **90.9%** | **9.1%** | **0.91** | 29.8 ms |
-| `A2` | **A2: Base + PlanIR + Epistemic Validator** | **100.0%** | **0.0%** | **1.00** | 30.4 ms |
-| `A3` | **A3: A2 + IR-Native Closed-World Search** | **100.0%** | **0.0%** | **1.00** | 27.3 ms |
-| `A4` | **A4: A3 + Multi-Provider / Heuristic Judges** | **100.0%** | **0.0%** | **1.00** | 28.2 ms |
-| `A5` | **A5: A4 + Authorization & Preflight Verification** | **100.0%** | **0.0%** | **1.00** | 29.9 ms |
-| `A6` | **A6: FULL PRIME (Ephemeral Workspace + Transaction Manager + Saga)** | **100.0%** | **0.0%** | **1.00** | 56.1 ms |
+| Arm ID | Architectural Configuration | Task Success Rate | False-PASS Rate | Epistemic Safety Score | Mean Latency (ms) | Measured Token Cost ($) |
+| :--- | :--- | :---: | :---: | :---: | :---: | :---: |
+| `A0` | **A0: Base Unstructured Agent (Direct Execution)** | **90.9%** | **9.1%** | **0.91** | 27.6 ms | $0.009084 |
+| `A1` | **A1: Base + Canonical Plan IR** | **90.9%** | **9.1%** | **0.91** | 27.8 ms | $0.009084 |
+| `A2` | **A2: Base + PlanIR + Epistemic Validator** | **100.0%** | **0.0%** | **1.00** | 25.8 ms | $0.009084 |
+| `A3` | **A3: A2 + IR-Native Closed-World Search** | **100.0%** | **0.0%** | **1.00** | 27.6 ms | $0.009084 |
+| `A4` | **A4: A3 + Multi-Provider / Heuristic Judges** | **100.0%** | **0.0%** | **1.00** | 27.4 ms | $0.009084 |
+| `A5` | **A5: A4 + Authorization & Preflight Verification** | **100.0%** | **0.0%** | **1.00** | 25.6 ms | $0.009084 |
+| `A6` | **A6: FULL PRIME (Ephemeral Workspace + Transaction Manager + Saga)** | **100.0%** | **0.0%** | **1.00** | 56.4 ms | $0.009084 |
 
 ---
 

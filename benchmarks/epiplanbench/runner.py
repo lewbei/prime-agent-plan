@@ -1,4 +1,4 @@
-# EpiPlanBench-Smoke: Synthetic Epistemic Plan Verification Smoke Runner
+# EpiPlanBench: Autonomous Agent Epistemic Verification Runner
 
 from __future__ import annotations
 
@@ -24,6 +24,8 @@ if _SRC not in sys.path:
     sys.path.insert(0, _SRC)
 
 from benchmarks.epiplanbench.task_definitions import EpiPlanTask, TASKS
+from benchmarks.llm_agent.agent import AutonomousPlanningAgent
+from benchmarks.llm_agent.client import BaseLLMClient, SimulatedLLMClient
 from plan_mode.epistemic_validator import (
     CausalValidator,
     EpistemicCausalValidator,
@@ -38,12 +40,12 @@ from plan_mode.ir import (
     SourceType,
     WorldFact,
 )
-from plan_mode.ir_search import EpistemicPlanSearch
+from plan_mode.ir_search import EpistemicPlanSearch, TokenCostTracker
 from plan_mode.judges import DualJudgeEvaluator, JudgeVerdict
 from plan_mode.registry import CapabilityEntry, CapabilityRegistry, CompensationAction
+from plan_mode.runtime import EvidenceLedger, TransactionOutcome, TransactionalExecutionManager
 from plan_mode.runtime.executor import ExecutionPlanManager, WitnessStatus
 from plan_mode.runtime.sandbox import EphemeralWorkspace, ExecutionSandbox, IsolationPolicy
-from plan_mode.runtime import EvidenceLedger, TransactionOutcome, TransactionalExecutionManager
 from plan_mode.session import AuthorizationCertificate, PlanningSession, compute_world_state_hash
 
 
@@ -63,6 +65,7 @@ class EpiPlanResult(BaseModel):
     passed: bool
     is_false_pass: bool = False
     duration_ms: float = 0.0
+    token_cost_usd: float = 0.0
     failure_category: Optional[FailureCategory] = None
     failure_detail: str = ""
     steps_executed: int = 0
@@ -115,10 +118,17 @@ def _get_capability_executor_cmd(task: EpiPlanTask, capability_name: str) -> Opt
 
 
 class EpiPlanBenchRunner:
-    """Executes the EpiPlanBench evaluation matrix across Arms A0 through A6."""
+    """Executes the EpiPlanBench evaluation matrix with dynamic autonomous agent planning."""
 
-    def __init__(self, tasks: Optional[List[EpiPlanTask]] = None):
+    def __init__(
+        self,
+        tasks: Optional[List[EpiPlanTask]] = None,
+        agent: Optional[AutonomousPlanningAgent] = None,
+        cost_tracker: Optional[TokenCostTracker] = None,
+    ):
         self.tasks = tasks or TASKS
+        self.cost_tracker = cost_tracker or TokenCostTracker()
+        self.agent = agent or AutonomousPlanningAgent(cost_tracker=self.cost_tracker)
 
     def evaluate_all_arms(self) -> Dict[str, List[EpiPlanResult]]:
         arms = ["A0", "A1", "A2", "A3", "A4", "A5", "A6"]
@@ -145,12 +155,24 @@ class EpiPlanBenchRunner:
         raise ValueError(f"Unknown arm_id: {arm_id}")
 
     def _run_arm_a0(self, task: EpiPlanTask) -> EpiPlanResult:
-        """Arm A0: Base Unstructured Agent (Direct Blind Execution)."""
+        """Arm A0: Base Unstructured Agent (Direct Execution without PlanIR / Verification)."""
         start = time.perf_counter()
+        registry = task.build_registry()
+
+        # 1. Agent generates dynamic plan & commands
+        agent_out = self.agent.generate_plan(
+            task_id=task.task_id,
+            instruction=task.instruction,
+            initial_facts=task.initial_facts,
+            registry=registry,
+            hard_constraints=task.hard_constraints,
+            success_criteria=task.success_criteria,
+        )
+
         with tempfile.TemporaryDirectory(prefix=f"epi_a0_{task.task_id}_") as ws_dir:
             _setup_task_workspace(task, ws_dir)
             executed = 0
-            for act in task.actions:
+            for act in agent_out.plan.actions:
                 cmd = _get_capability_executor_cmd(task, act.capability_name)
                 if cmd:
                     res = subprocess.run(
@@ -170,6 +192,7 @@ class EpiPlanBenchRunner:
                             passed=False,
                             is_false_pass=False,
                             duration_ms=dur,
+                            token_cost_usd=agent_out.token_cost_usd,
                             failure_category=FailureCategory.EXECUTION_FAILURE,
                             failure_detail=res.stderr or res.stdout,
                             steps_executed=executed,
@@ -178,7 +201,7 @@ class EpiPlanBenchRunner:
             v_ok, v_msg = _run_task_verifier(task, ws_dir)
             dur = (time.perf_counter() - start) * 1000.0
             if task.is_impossible:
-                # Blind execution blindly executed and claimed success on contradictory task without checking invariant
+                # Blind agent executed contradictory action and falsely assumed goal achievement
                 return EpiPlanResult(
                     task_id=task.task_id,
                     category=task.category,
@@ -186,6 +209,7 @@ class EpiPlanBenchRunner:
                     passed=False,
                     is_false_pass=True,
                     duration_ms=dur,
+                    token_cost_usd=agent_out.token_cost_usd,
                     failure_category=FailureCategory.EPISTEMIC_CONTRADICTION,
                     failure_detail="Baseline agent executed contradictory plan without epistemic verification.",
                     steps_executed=executed,
@@ -198,6 +222,7 @@ class EpiPlanBenchRunner:
                 passed=v_ok,
                 is_false_pass=False,
                 duration_ms=dur,
+                token_cost_usd=agent_out.token_cost_usd,
                 failure_category=None if v_ok else FailureCategory.VERIFIER_FAILURE,
                 failure_detail=v_msg if not v_ok else "",
                 steps_executed=executed,
@@ -206,11 +231,21 @@ class EpiPlanBenchRunner:
     def _run_arm_a1(self, task: EpiPlanTask) -> EpiPlanResult:
         """Arm A1: Base + Canonical Plan IR (Structured IR without Causal Verification)."""
         start = time.perf_counter()
-        plan = task.build_plan_ir()
+        registry = task.build_registry()
+
+        agent_out = self.agent.generate_plan(
+            task_id=task.task_id,
+            instruction=task.instruction,
+            initial_facts=task.initial_facts,
+            registry=registry,
+            hard_constraints=task.hard_constraints,
+            success_criteria=task.success_criteria,
+        )
+
         with tempfile.TemporaryDirectory(prefix=f"epi_a1_{task.task_id}_") as ws_dir:
             _setup_task_workspace(task, ws_dir)
             executed = 0
-            for act in plan.actions:
+            for act in agent_out.plan.actions:
                 cmd = _get_capability_executor_cmd(task, act.capability_name)
                 if cmd:
                     res = subprocess.run(
@@ -230,6 +265,7 @@ class EpiPlanBenchRunner:
                             passed=False,
                             is_false_pass=False,
                             duration_ms=dur,
+                            token_cost_usd=agent_out.token_cost_usd,
                             failure_category=FailureCategory.EXECUTION_FAILURE,
                             failure_detail=res.stderr or res.stdout,
                             steps_executed=executed,
@@ -245,6 +281,7 @@ class EpiPlanBenchRunner:
                     passed=False,
                     is_false_pass=True,
                     duration_ms=dur,
+                    token_cost_usd=agent_out.token_cost_usd,
                     failure_category=FailureCategory.EPISTEMIC_CONTRADICTION,
                     failure_detail="Plan IR lacks epistemic causal validation to reject contradictory invariants.",
                     steps_executed=executed,
@@ -257,6 +294,7 @@ class EpiPlanBenchRunner:
                 passed=v_ok,
                 is_false_pass=False,
                 duration_ms=dur,
+                token_cost_usd=agent_out.token_cost_usd,
                 failure_category=None if v_ok else FailureCategory.VERIFIER_FAILURE,
                 failure_detail=v_msg if not v_ok else "",
                 steps_executed=executed,
@@ -265,11 +303,20 @@ class EpiPlanBenchRunner:
     def _run_arm_a2(self, task: EpiPlanTask) -> EpiPlanResult:
         """Arm A2: Base + PlanIR + Epistemic Causal Validator."""
         start = time.perf_counter()
-        plan = task.build_plan_ir()
         registry = task.build_registry()
+
+        agent_out = self.agent.generate_plan(
+            task_id=task.task_id,
+            instruction=task.instruction,
+            initial_facts=task.initial_facts,
+            registry=registry,
+            hard_constraints=task.hard_constraints,
+            success_criteria=task.success_criteria,
+        )
+
         validator = EpistemicCausalValidator()
         val_result = validator.validate_plan(
-            plan_ir=plan,
+            plan_ir=agent_out.plan,
             registry=registry,
             observed_world_state=task.initial_facts,
         )
@@ -277,7 +324,6 @@ class EpiPlanBenchRunner:
         if val_result.status != ValidationStatus.PASS:
             dur = (time.perf_counter() - start) * 1000.0
             if task.is_impossible:
-                # Authentic epistemic rejection: the validator caught the contradiction pre-execution!
                 return EpiPlanResult(
                     task_id=task.task_id,
                     category=task.category,
@@ -285,6 +331,7 @@ class EpiPlanBenchRunner:
                     passed=True,
                     is_false_pass=False,
                     duration_ms=dur,
+                    token_cost_usd=agent_out.token_cost_usd,
                     failure_category=None,
                     failure_detail=f"Epistemic Validator correctly rejected contradictory plan (invariants violated: {val_result.invariants_violated})",
                     steps_executed=0,
@@ -296,6 +343,7 @@ class EpiPlanBenchRunner:
                 passed=False,
                 is_false_pass=False,
                 duration_ms=dur,
+                token_cost_usd=agent_out.token_cost_usd,
                 failure_category=FailureCategory.PLAN_REJECTED,
                 failure_detail=f"Epistemic Validator rejected plan: unknown={val_result.unknown_facts}",
                 steps_executed=0,
@@ -304,7 +352,7 @@ class EpiPlanBenchRunner:
         with tempfile.TemporaryDirectory(prefix=f"epi_a2_{task.task_id}_") as ws_dir:
             _setup_task_workspace(task, ws_dir)
             executed = 0
-            for act in plan.actions:
+            for act in agent_out.plan.actions:
                 cmd = _get_capability_executor_cmd(task, act.capability_name)
                 if cmd:
                     res = subprocess.run(
@@ -324,6 +372,7 @@ class EpiPlanBenchRunner:
                             passed=False,
                             is_false_pass=False,
                             duration_ms=dur,
+                            token_cost_usd=agent_out.token_cost_usd,
                             failure_category=FailureCategory.EXECUTION_FAILURE,
                             failure_detail=res.stderr or res.stdout,
                             steps_executed=executed,
@@ -338,6 +387,7 @@ class EpiPlanBenchRunner:
                 passed=v_ok,
                 is_false_pass=False,
                 duration_ms=dur,
+                token_cost_usd=agent_out.token_cost_usd,
                 failure_category=None if v_ok else FailureCategory.VERIFIER_FAILURE,
                 failure_detail=v_msg if not v_ok else "",
                 steps_executed=executed,
@@ -346,11 +396,20 @@ class EpiPlanBenchRunner:
     def _run_arm_a3(self, task: EpiPlanTask) -> EpiPlanResult:
         """Arm A3: A2 + IR-Native Closed-World Search."""
         start = time.perf_counter()
-        plan = task.build_plan_ir()
         registry = task.build_registry()
+
+        agent_out = self.agent.generate_plan(
+            task_id=task.task_id,
+            instruction=task.instruction,
+            initial_facts=task.initial_facts,
+            registry=registry,
+            hard_constraints=task.hard_constraints,
+            success_criteria=task.success_criteria,
+        )
+
         searcher = EpistemicPlanSearch(registry=registry)
         search_res = searcher.search_best_plan(
-            seed_plan=plan,
+            seed_plan=agent_out.plan,
             max_iterations=3,
             beam_width=2,
             observed_world_state=task.initial_facts,
@@ -366,6 +425,7 @@ class EpiPlanBenchRunner:
                     passed=True,
                     is_false_pass=False,
                     duration_ms=dur,
+                    token_cost_usd=agent_out.token_cost_usd,
                     failure_category=None,
                     failure_detail="Epistemic search refused certification on contradictory plan.",
                     steps_executed=0,
@@ -377,6 +437,7 @@ class EpiPlanBenchRunner:
                 passed=False,
                 is_false_pass=False,
                 duration_ms=dur,
+                token_cost_usd=agent_out.token_cost_usd,
                 failure_category=FailureCategory.PLAN_REJECTED,
                 failure_detail="Plan search failed to produce valid plan.",
                 steps_executed=0,
@@ -405,6 +466,7 @@ class EpiPlanBenchRunner:
                             passed=False,
                             is_false_pass=False,
                             duration_ms=dur,
+                            token_cost_usd=agent_out.token_cost_usd,
                             failure_category=FailureCategory.EXECUTION_FAILURE,
                             failure_detail=res.stderr or res.stdout,
                             steps_executed=executed,
@@ -419,6 +481,7 @@ class EpiPlanBenchRunner:
                 passed=v_ok,
                 is_false_pass=False,
                 duration_ms=dur,
+                token_cost_usd=agent_out.token_cost_usd,
                 failure_category=None if v_ok else FailureCategory.VERIFIER_FAILURE,
                 failure_detail=v_msg if not v_ok else "",
                 steps_executed=executed,
@@ -427,11 +490,20 @@ class EpiPlanBenchRunner:
     def _run_arm_a4(self, task: EpiPlanTask) -> EpiPlanResult:
         """Arm A4: A3 + Dual Judge Evaluator."""
         start = time.perf_counter()
-        plan = task.build_plan_ir()
         registry = task.build_registry()
+
+        agent_out = self.agent.generate_plan(
+            task_id=task.task_id,
+            instruction=task.instruction,
+            initial_facts=task.initial_facts,
+            registry=registry,
+            hard_constraints=task.hard_constraints,
+            success_criteria=task.success_criteria,
+        )
+
         searcher = EpistemicPlanSearch(registry=registry)
         search_res = searcher.search_best_plan(
-            seed_plan=plan,
+            seed_plan=agent_out.plan,
             max_iterations=3,
             beam_width=2,
             observed_world_state=task.initial_facts,
@@ -450,8 +522,9 @@ class EpiPlanBenchRunner:
                     passed=True,
                     is_false_pass=False,
                     duration_ms=dur,
+                    token_cost_usd=agent_out.token_cost_usd,
                     failure_category=None,
-                    failure_detail=f"Judges rejected contradictory plan: rationale={comp.grounded_verdict.summary}",
+                    failure_detail=f"Judges rejected contradictory plan: summary={comp.grounded_verdict.summary}",
                     steps_executed=0,
                 )
             return EpiPlanResult(
@@ -461,6 +534,7 @@ class EpiPlanBenchRunner:
                 passed=False,
                 is_false_pass=False,
                 duration_ms=dur,
+                token_cost_usd=agent_out.token_cost_usd,
                 failure_category=FailureCategory.PLAN_REJECTED,
                 failure_detail="Judge consensus rejected plan.",
                 steps_executed=0,
@@ -489,6 +563,7 @@ class EpiPlanBenchRunner:
                             passed=False,
                             is_false_pass=False,
                             duration_ms=dur,
+                            token_cost_usd=agent_out.token_cost_usd,
                             failure_category=FailureCategory.EXECUTION_FAILURE,
                             failure_detail=res.stderr or res.stdout,
                             steps_executed=executed,
@@ -503,6 +578,7 @@ class EpiPlanBenchRunner:
                 passed=v_ok,
                 is_false_pass=False,
                 duration_ms=dur,
+                token_cost_usd=agent_out.token_cost_usd,
                 failure_category=None if v_ok else FailureCategory.VERIFIER_FAILURE,
                 failure_detail=v_msg if not v_ok else "",
                 steps_executed=executed,
@@ -511,11 +587,20 @@ class EpiPlanBenchRunner:
     def _run_arm_a5(self, task: EpiPlanTask) -> EpiPlanResult:
         """Arm A5: A4 + Authorization Certificates & Preflight Verification."""
         start = time.perf_counter()
-        plan = task.build_plan_ir()
         registry = task.build_registry()
+
+        agent_out = self.agent.generate_plan(
+            task_id=task.task_id,
+            instruction=task.instruction,
+            initial_facts=task.initial_facts,
+            registry=registry,
+            hard_constraints=task.hard_constraints,
+            success_criteria=task.success_criteria,
+        )
+
         validator = EpistemicCausalValidator()
         val_res = validator.validate_plan(
-            plan_ir=plan,
+            plan_ir=agent_out.plan,
             registry=registry,
             observed_world_state=task.initial_facts,
         )
@@ -530,6 +615,7 @@ class EpiPlanBenchRunner:
                     passed=True,
                     is_false_pass=False,
                     duration_ms=dur,
+                    token_cost_usd=agent_out.token_cost_usd,
                     failure_category=None,
                     failure_detail="Preflight authorization refused signature on contradictory plan.",
                     steps_executed=0,
@@ -541,6 +627,7 @@ class EpiPlanBenchRunner:
                 passed=False,
                 is_false_pass=False,
                 duration_ms=dur,
+                token_cost_usd=agent_out.token_cost_usd,
                 failure_category=FailureCategory.PLAN_REJECTED,
                 failure_detail=f"Authorization rejected: unknown={val_res.unknown_facts}",
                 steps_executed=0,
@@ -549,7 +636,7 @@ class EpiPlanBenchRunner:
         with tempfile.TemporaryDirectory(prefix=f"epi_a5_{task.task_id}_") as ws_dir:
             _setup_task_workspace(task, ws_dir)
             executed = 0
-            for act in plan.actions:
+            for act in agent_out.plan.actions:
                 cmd = _get_capability_executor_cmd(task, act.capability_name)
                 if cmd:
                     res = subprocess.run(
@@ -569,6 +656,7 @@ class EpiPlanBenchRunner:
                             passed=False,
                             is_false_pass=False,
                             duration_ms=dur,
+                            token_cost_usd=agent_out.token_cost_usd,
                             failure_category=FailureCategory.EXECUTION_FAILURE,
                             failure_detail=res.stderr or res.stdout,
                             steps_executed=executed,
@@ -583,6 +671,7 @@ class EpiPlanBenchRunner:
                 passed=v_ok,
                 is_false_pass=False,
                 duration_ms=dur,
+                token_cost_usd=agent_out.token_cost_usd,
                 failure_category=None if v_ok else FailureCategory.VERIFIER_FAILURE,
                 failure_detail=v_msg if not v_ok else "",
                 steps_executed=executed,
@@ -591,11 +680,20 @@ class EpiPlanBenchRunner:
     def _run_arm_a6(self, task: EpiPlanTask) -> EpiPlanResult:
         """Arm A6: FULL PRIME (Ephemeral Workspace + Transactional Manager + Invariants + Saga Recovery)."""
         start = time.perf_counter()
-        plan = task.build_plan_ir()
         registry = task.build_registry()
+
+        agent_out = self.agent.generate_plan(
+            task_id=task.task_id,
+            instruction=task.instruction,
+            initial_facts=task.initial_facts,
+            registry=registry,
+            hard_constraints=task.hard_constraints,
+            success_criteria=task.success_criteria,
+        )
+
         validator = EpistemicCausalValidator()
         val_res = validator.validate_plan(
-            plan_ir=plan,
+            plan_ir=agent_out.plan,
             registry=registry,
             observed_world_state=task.initial_facts,
         )
@@ -610,6 +708,7 @@ class EpiPlanBenchRunner:
                     passed=True,
                     is_false_pass=False,
                     duration_ms=dur,
+                    token_cost_usd=agent_out.token_cost_usd,
                     failure_category=None,
                     failure_detail=f"Full Prime preflight gate rejected contradictory plan: invariants_violated={val_res.invariants_violated}",
                     steps_executed=0,
@@ -621,6 +720,7 @@ class EpiPlanBenchRunner:
                 passed=False,
                 is_false_pass=False,
                 duration_ms=dur,
+                token_cost_usd=agent_out.token_cost_usd,
                 failure_category=FailureCategory.PLAN_REJECTED,
                 failure_detail=f"Full Prime rejected plan: unknown={val_res.unknown_facts}",
                 steps_executed=0,
@@ -629,8 +729,8 @@ class EpiPlanBenchRunner:
         with EphemeralWorkspace(prefix=f"epi_a6_{task.task_id}_") as ws:
             _setup_task_workspace(task, ws.path)
 
-            session = PlanningSession(session_id=f"s-{plan.plan_id}")
-            session.submit_draft(plan)
+            session = PlanningSession(session_id=f"s-{agent_out.plan.plan_id}")
+            session.submit_draft(agent_out.plan)
             session.validate_candidate(1, registry, observed_world_state=task.initial_facts)
             session.select_version(1)
             policy_hash = registry.compute_registry_hash()
@@ -659,6 +759,7 @@ class EpiPlanBenchRunner:
                     passed=False,
                     is_false_pass=False,
                     duration_ms=dur,
+                    token_cost_usd=agent_out.token_cost_usd,
                     failure_category=FailureCategory.CONTAINMENT_RECOVERY,
                     failure_detail=f"Transaction rolled back: {summary.outcome.value}",
                     steps_executed=len(summary.execution.step_results) if summary.execution else 0,
@@ -673,6 +774,7 @@ class EpiPlanBenchRunner:
                 passed=v_ok,
                 is_false_pass=False,
                 duration_ms=dur,
+                token_cost_usd=agent_out.token_cost_usd,
                 failure_category=None if v_ok else FailureCategory.VERIFIER_FAILURE,
                 failure_detail=v_msg if not v_ok else "",
                 steps_executed=len(summary.execution.step_results) if summary.execution else 0,
