@@ -1,20 +1,10 @@
-"""Plan-to-execution trace alignment.
+"""Plan-to-execution trace alignment with optional empirical re-verification.
 
-A plan is only as good as the execution that discharges it. This module
-defines the execution-evidence schema and the deterministic verifier that
-matches each plan obligation against a real execution trace.
-
-The verifier specifically catches the "green report / stubbed work" failure:
-- declared output files must appear in the trace
-- declared functions/classes/variables must appear in the audited symbols
-- exit criteria must have a command result with matching stdout content
-- executor and verifier provenance must differ when both are declared
-
-Literature:
-- AgentRewind (2608.14380): aligned context/environment recovery.
-- ACID-Agent (2608.13900): evidence obligations and validated-effect-only commits.
-- Capability Sheaves (2608.13228): detect disagreement between components.
-- FlowScout (2608.10039): execution feedback drives plan repair.
+A supplied JSON trace is a *claim*.  When ``cwd`` is provided, Prime binds that
+claim to the live workspace: declared files must exist, symbol contracts are
+re-audited, verification commands and exit criteria are re-run through the
+strict execution-contract sandbox, and executor/verifier provenance must be
+independent.  Only those observations can support a strict release gate.
 """
 from __future__ import annotations
 
@@ -25,7 +15,14 @@ from pathlib import Path
 from typing import Any, Optional
 
 from .causal_validator import PlanParser
-from .execution_contract import ExecutionContract, parse_execution_contract
+from .execution_contract import (
+    ExecutionContract,
+    artifact_audit,
+    parse_execution_contract,
+    run_exit_criteria,
+    run_verification_commands,
+    symbol_audit,
+)
 
 
 @dataclass
@@ -71,11 +68,12 @@ def _as_command_result(value: Any) -> CommandResult:
     )
 
 
-def parse_execution_evidence(evidence: str | dict[str, Any] | None) -> Optional[ExecutionEvidence]:
-    """Parse execution evidence from a JSON string or dict. Unknown shapes are safe."""
+def parse_execution_evidence(evidence: str | dict[str, Any] | ExecutionEvidence | None) -> Optional[ExecutionEvidence]:
+    if isinstance(evidence, ExecutionEvidence):
+        return evidence
     if evidence is None:
         return None
-    data: dict[str, Any] = {}
+    data: dict[str, Any]
     if isinstance(evidence, str):
         text = evidence.strip()
         start, end = text.find("{"), text.rfind("}")
@@ -99,11 +97,13 @@ def parse_execution_evidence(evidence: str | dict[str, Any] | None) -> Optional[
         if not isinstance(raw, dict):
             continue
         raw_symbols = raw.get("symbols", {}) if isinstance(raw.get("symbols"), dict) else {}
-        symbols = {
-            str(k): (v if isinstance(v, dict) else {}) for k, v in raw_symbols.items()
-        }
+        symbols = {str(k): (v if isinstance(v, dict) else {}) for k, v in raw_symbols.items()}
+        try:
+            task_id = int(raw.get("task_id") or 0)
+        except (TypeError, ValueError):
+            task_id = 0
         tasks.append(TaskExecution(
-            task_id=int(raw.get("task_id") or 0),
+            task_id=task_id,
             status=str(raw.get("status") or "done"),
             files_created=_as_str_list(raw.get("files_created")),
             files_modified=_as_str_list(raw.get("files_modified")),
@@ -136,19 +136,18 @@ def _command_matches(result: CommandResult, criterion: dict[str, Any]) -> list[s
     if expected_count is not None:
         try:
             count = len(re.findall(r"\d+(?:\.\d+)?", stdout))
-        except Exception:
-            count = 0
-        if count < int(expected_count):
-            errors.append(f"command {result.command} reported {count} numeric outputs, expected at least {expected_count}")
+            if count < int(expected_count):
+                errors.append(f"command {result.command} reported {count} numeric outputs, expected at least {expected_count}")
+        except (TypeError, ValueError):
+            errors.append(f"command {result.command} has invalid expected_count={expected_count!r}")
     return errors
 
 
 def extract_declared_obligations(plan_text: str) -> dict[str, Any]:
-    """Extract outputs and symbols declared by the plan."""
-    ast = PlanParser.parse_plan(plan_text)
+    ast_tree = PlanParser.parse_plan(plan_text)
     contract, _ = parse_execution_contract(plan_text)
     obligations: dict[int, dict[str, Any]] = {}
-    for action in ast.actions:
+    for action in ast_tree.actions:
         obligations[action.id] = {
             "outputs": list(action.outputs),
             "inputs": list(action.inputs),
@@ -156,16 +155,15 @@ def extract_declared_obligations(plan_text: str) -> dict[str, Any]:
         }
     if contract:
         for path, syms in contract.symbols.items():
-            obligations.setdefault(0, {})  # ensure key exists
-            for action in ast.actions:
+            for action in ast_tree.actions:
                 if path in action.outputs:
+                    obligations.setdefault(action.id, {"outputs": [], "inputs": [], "symbols": {}})
                     obligations[action.id]["symbols"][path] = syms
                     break
     return obligations
 
 
 def align_task_evidence(plan_text: str, evidence: ExecutionEvidence) -> dict[str, Any]:
-    """Compare declared plan obligations with an execution trace."""
     obligations = extract_declared_obligations(plan_text)
     by_task = {t.task_id: t for t in evidence.tasks}
     errors: list[str] = []
@@ -210,68 +208,139 @@ def align_task_evidence(plan_text: str, evidence: ExecutionEvidence) -> dict[str
             if undeclared:
                 warnings.append(f"task {task_id}: {path} has undeclared symbols {sorted(undeclared)}")
         matches.append({"task_id": task_id, "matched": True})
-
     return {"ok": not errors, "errors": errors, "warnings": warnings, "matches": matches}
 
 
-def verify_execution_trace(plan_text: str, evidence: str | dict[str, Any] | None,
-                           *, cwd: str | Path | None = None) -> dict[str, Any]:
-    """Verify that an execution trace discharges the plan's obligations."""
+def _trace_exit_errors(contract: ExecutionContract, parsed: ExecutionEvidence) -> list[str]:
+    errors: list[str] = []
+    for criterion in contract.exit_criteria:
+        task_id = int(criterion.get("task") or criterion.get("task_id") or 0)
+        entry = next((t for t in parsed.tasks if t.task_id == task_id), None)
+        if entry is None:
+            errors.append(f"exit criterion for task {task_id}: no task evidence")
+            continue
+        expected_command = _as_str_list(criterion.get("command"))
+        result = next((c for c in entry.commands if c.command == expected_command), None)
+        if result is None:
+            errors.append(f"exit criterion for task {task_id}: command {criterion.get('command')!r} was not recorded")
+        else:
+            errors.extend(_command_matches(result, criterion))
+    return errors
+
+
+def _workspace_reverify(plan_text: str, contract: ExecutionContract, cwd: Path) -> dict[str, Any]:
+    """Independently re-observe the workspace instead of trusting trace claims."""
+    errors: list[str] = []
+
+    artifacts = artifact_audit(contract, cwd=cwd)
+    if not artifacts["ok"]:
+        errors.extend(f"[workspace artifact] {e}" for e in artifacts["errors"])
+
+    symbols = symbol_audit(plan_text, cwd=cwd)
+    if contract.symbols and not symbols["ok"]:
+        errors.extend(f"[workspace symbol] {e}" for e in symbols["errors"])
+
+    verification = run_verification_commands(contract, cwd=cwd)
+    if contract.verification_commands and not verification["ok"]:
+        errors.extend(f"[workspace verification] {e}" for e in verification.get("errors", []))
+
+    exit_criteria = run_exit_criteria(contract, cwd=cwd)
+    if contract.exit_criteria and not exit_criteria["ok"]:
+        errors.extend(f"[workspace exit] {e}" for e in exit_criteria.get("errors", []))
+
+    obligations = extract_declared_obligations(plan_text)
+    actual_outputs: dict[str, bool] = {}
+    for ob in obligations.values():
+        for raw in ob.get("outputs", []):
+            p = Path(raw) if Path(raw).is_absolute() else cwd / raw
+            actual_outputs[raw] = p.exists()
+            if not p.exists():
+                errors.append(f"[workspace output] declared output {raw!r} does not exist")
+
+    return {
+        "ok": not errors,
+        "errors": errors,
+        "artifact_audit": artifacts,
+        "symbol_audit": symbols,
+        "verification_commands": verification,
+        "exit_criteria": exit_criteria,
+        "actual_outputs": actual_outputs,
+    }
+
+
+def verify_execution_trace(
+    plan_text: str,
+    evidence: str | dict[str, Any] | ExecutionEvidence | None,
+    *,
+    cwd: str | Path | None = None,
+    require_independent_verifier: bool | None = None,
+) -> dict[str, Any]:
+    """Verify trace consistency and, when ``cwd`` is supplied, empirical truth."""
     parsed = parse_execution_evidence(evidence)
     if parsed is None:
-        return {"ok": False, "errors": ["execution evidence missing or unparseable"],
-                "warnings": [], "evidence": None, "alignment": None, "exit_criteria": None}
+        return {
+            "ok": False,
+            "errors": ["execution evidence missing or unparseable"],
+            "warnings": [],
+            "evidence": None,
+            "alignment": None,
+            "exit_criteria": None,
+            "workspace_reverification": None,
+        }
 
     alignment = align_task_evidence(plan_text, parsed)
     errors = list(alignment["errors"])
     warnings = list(alignment["warnings"])
 
-    # Executor/verifier independence
-    if parsed.verifier_agent_id and parsed.agent_id == parsed.verifier_agent_id:
+    strict_provenance = (cwd is not None) if require_independent_verifier is None else bool(require_independent_verifier)
+    if strict_provenance and not parsed.verifier_agent_id:
+        errors.append("independent verifier provenance is missing")
+    elif parsed.verifier_agent_id and parsed.agent_id == parsed.verifier_agent_id:
         errors.append("executor and verifier provenance is identical; independent verification required")
 
-    # Exit criteria against recorded command results
     contract, _ = parse_execution_contract(plan_text)
-    exit_errors: list[str] = []
+    trace_exit_errors: list[str] = []
     if contract:
-        for criterion in contract.raw.get("exit_criteria", []):
-            if not isinstance(criterion, dict):
-                continue
-            task_id = int(criterion.get("task") or criterion.get("task_id") or 0)
-            entry = next((t for t in parsed.tasks if t.task_id == task_id), None)
-            if entry is None:
-                exit_errors.append(f"exit criterion for task {task_id}: no task evidence")
-                continue
-            result = next((c for c in entry.commands if c.command == _as_str_list(criterion.get("command"))), None)
-            if result is None:
-                exit_errors.append(f"exit criterion for task {task_id}: command {criterion.get('command')!r} was not recorded")
-            else:
-                exit_errors.extend(_command_matches(result, criterion))
-        errors.extend(exit_errors)
+        trace_exit_errors = _trace_exit_errors(contract, parsed)
+        errors.extend(trace_exit_errors)
 
-    # Green report contradiction check
     for report in parsed.reports:
         if str(report.get("claim") or "").lower() in ("green", "ok", "pass"):
-            for entry in parsed.tasks:
-                failed = [c for c in entry.commands if c.exit_code not in (None, 0)]
-                if failed:
-                    errors.append(f"report claims green but task {entry.task_id} recorded failing commands")
-                    break
+            if any(c.exit_code not in (None, 0) for entry in parsed.tasks for c in entry.commands):
+                errors.append("report claims green but execution trace contains a failing command")
+                break
 
-    return {"ok": not errors, "errors": errors, "warnings": warnings,
-            "evidence": parsed, "alignment": alignment,
-            "exit_criteria": {"ok": not exit_errors, "errors": exit_errors}}
+    workspace = None
+    if cwd is not None:
+        if contract is None:
+            errors.append("workspace re-verification requires an execution contract")
+        else:
+            workspace = _workspace_reverify(plan_text, contract, Path(cwd).resolve())
+            errors.extend(workspace["errors"])
+
+    return {
+        "ok": not errors,
+        "errors": errors,
+        "warnings": warnings,
+        "evidence": parsed,
+        "alignment": alignment,
+        "exit_criteria": {"ok": not trace_exit_errors, "errors": trace_exit_errors},
+        "workspace_reverification": workspace,
+    }
 
 
-def verify_negative_constraints(plan_text: str,
-                                evidence: str | dict[str, Any] | None = None) -> dict[str, Any]:
-    """Check plan-declared falsifiers against execution evidence."""
+def verify_negative_constraints(
+    plan_text: str,
+    evidence: str | dict[str, Any] | ExecutionEvidence | None = None,
+    *,
+    cwd: str | Path | None = None,
+) -> dict[str, Any]:
     parsed = parse_execution_evidence(evidence)
     declared = re.findall(r"^\s*-\s*NF-\d+\s*:\s*(.+)$", plan_text, re.M)
     violations: list[str] = []
     checked = len(declared)
     if parsed:
-        trace = verify_execution_trace(plan_text, parsed)
+        trace = verify_execution_trace(plan_text, parsed, cwd=cwd, require_independent_verifier=False)
         if not trace["ok"]:
             violations.extend(trace["errors"])
         for nf in declared:
@@ -285,5 +354,9 @@ def verify_negative_constraints(plan_text: str,
                         failed = any(c.exit_code not in (None, 0) for t in parsed.tasks for c in t.commands)
                         if failed:
                             violations.append(f"NF violation: {nf}")
-    return {"ok": not violations, "declared_constraints": declared,
-            "checked": checked, "violations": violations}
+    return {
+        "ok": not violations,
+        "declared_constraints": declared,
+        "checked": checked,
+        "violations": violations,
+    }
