@@ -1,16 +1,18 @@
-"""Optional probabilistic Best-of-N self-verification for plans and trajectories.
+"""Probabilistic Best-of-N self-verification inherited by Prime candidate ranking.
 
 This module is inspired by LLM-as-a-Verifier (arXiv:2607.05391) and its
-same-model self-verification workflow. It is deliberately advisory:
-probabilistic LLM scores rank candidates but never create empirical facts,
-change FactTruth, or certify execution. Plan certification remains the
-responsibility of the closed-world deterministic validator and runtime
-empirical witnesses.
+same-model self-verification workflow. Probabilistic LLM scores rank candidate
+plans but never create empirical facts, change FactTruth, or certify execution.
+Plan certification remains the responsibility of the closed-world deterministic
+validator and runtime empirical witnesses.
 
-Prime's recommended implementation configuration uses ``gemini-3.7-flash``
-as both generator and probabilistic verifier. The optional ``llm-verifier``
-package is loaded lazily, so the core runtime and CI do not require a verifier
-provider or API credential.
+Prime's inherited/default implementation configuration uses
+``gemini-3.7-flash`` as both generator and probabilistic verifier. Callers do
+not need to select a separate "same model" mode: ``PlanSelfVerifier.select``
+uses Gemini 3.7 Flash -> Gemini 3.7 Flash unless explicitly overridden.
+
+The external ``llm-verifier`` backend is loaded lazily so provider or credential
+unavailability does not weaken the deterministic Prime truth boundary.
 """
 from __future__ import annotations
 
@@ -23,10 +25,10 @@ from plan_mode.ir import PlanIR, WorldFact
 from plan_mode.registry import CapabilityNotFoundError, CapabilityRegistry
 
 
-# Prime's recommended same-model configuration. The upstream Terminal-Bench
-# 2.1 self-verification reproduction uses K=2 repeated evaluations and one
-# pivot for Best-of-5. We reuse those verification settings while using the
-# implementation model actually used by Prime.
+# Prime's inherited same-model configuration. The upstream Terminal-Bench 2.1
+# self-verification reproduction uses K=2 repeated evaluations and one pivot
+# for Best-of-5. Prime keeps those verification settings while using its main
+# implementation model.
 DEFAULT_SELF_VERIFICATION_MODEL = "gemini-3.7-flash"
 DEFAULT_SELF_VERIFICATION_N_EVALUATIONS = 2
 DEFAULT_SELF_VERIFICATION_PIVOTS = 1
@@ -42,7 +44,7 @@ DEFAULT_VERIFICATION_CRITERIA: Dict[str, str] = {
 
 
 class SelfVerificationUnavailableError(RuntimeError):
-    """Raised when the optional probabilistic verifier backend is unavailable."""
+    """Raised when the probabilistic verifier backend is unavailable."""
 
 
 class ProbabilisticSelection(BaseModel):
@@ -85,8 +87,8 @@ class ProbabilisticSelfVerifier:
     only as a preference signal.
 
     ``client`` is optional and is useful for pinning the verifier to a specific
-    backend. In particular, same-model Gemini verification should use a Vertex
-    AI ``google-genai`` client/backend that exposes token-level logprobs rather
+    backend. In particular, Gemini self-verification should use a Vertex AI
+    ``google-genai`` client/backend that exposes token-level logprobs rather
     than allowing environment-key precedence to silently choose another
     provider.
     """
@@ -106,7 +108,7 @@ class ProbabilisticSelfVerifier:
             import llm_verifier  # type: ignore
         except ImportError as exc:  # pragma: no cover - depends on optional extra
             raise SelfVerificationUnavailableError(
-                "Probabilistic self-verification requires the optional 'verification' extra: "
+                "Probabilistic self-verification requires the verification backend: "
                 "pip install 'plan[verification]'"
             ) from exc
         return llm_verifier.select
@@ -168,7 +170,10 @@ class ProbabilisticSelfVerifier:
 
 
 class PlanSelfVerifier:
-    """Select among PlanIR candidates without weakening Prime's truth boundary.
+    """Rank PlanIR candidates with inherited same-model self-verification.
+
+    Default behavior is Gemini 3.7 Flash -> Gemini 3.7 Flash. There is no
+    separate self-verification mode to select.
 
     Policy:
     * deterministic FAIL candidates are never shown to the LLM verifier;
@@ -216,14 +221,15 @@ class PlanSelfVerifier:
         goal_description: Optional[str] = None,
         observed_world_state: Optional[List[WorldFact] | Dict[str, WorldFact]] = None,
         criteria: Optional[Dict[str, str]] = None,
-        generator_model: Optional[str] = None,
-        verifier_model: Optional[str] = None,
+        generator_model: Optional[str] = DEFAULT_SELF_VERIFICATION_MODEL,
+        verifier_model: Optional[str] = DEFAULT_SELF_VERIFICATION_MODEL,
         n_evaluations: int = DEFAULT_SELF_VERIFICATION_N_EVALUATIONS,
         pivots: int = DEFAULT_SELF_VERIFICATION_PIVOTS,
     ) -> PlanSelfVerificationResult:
         if not candidates:
             raise ValueError("Plan self-verification requires at least one candidate")
 
+        effective_generator_model = generator_model or DEFAULT_SELF_VERIFICATION_MODEL
         effective_verifier_model = verifier_model or DEFAULT_SELF_VERIFICATION_MODEL
         validations = [self._validate(plan, observed_world_state) for plan in candidates]
         statuses = {i: result.status for i, result in enumerate(validations)}
@@ -240,11 +246,9 @@ class PlanSelfVerifier:
                 validation_status=first.status,
                 is_certified=False,
                 requires_rework=True,
-                generator_model=generator_model,
+                generator_model=effective_generator_model,
                 verifier_model=effective_verifier_model,
-                is_self_verification=bool(
-                    generator_model and generator_model == effective_verifier_model
-                ),
+                is_self_verification=effective_generator_model == effective_verifier_model,
                 n_evaluations=n_evaluations,
                 pivots=pivots,
                 criteria=criteria or DEFAULT_VERIFICATION_CRITERIA,
@@ -281,11 +285,9 @@ class PlanSelfVerifier:
             validation_status=final_validation.status,
             is_certified=certified,
             requires_rework=not certified,
-            generator_model=generator_model,
+            generator_model=effective_generator_model,
             verifier_model=effective_verifier_model,
-            is_self_verification=bool(
-                generator_model and generator_model == effective_verifier_model
-            ),
+            is_self_verification=effective_generator_model == effective_verifier_model,
             n_evaluations=n_evaluations,
             pivots=min(pivots, len(eligible_indices)),
             criteria=criteria or DEFAULT_VERIFICATION_CRITERIA,
@@ -302,14 +304,7 @@ class PlanSelfVerifier:
         n_evaluations: int = DEFAULT_SELF_VERIFICATION_N_EVALUATIONS,
         pivots: int = DEFAULT_SELF_VERIFICATION_PIVOTS,
     ) -> PlanSelfVerificationResult:
-        """Rank candidates using the same model identity for generation and verification.
-
-        This is the direct Prime analogue of the paper/repository's
-        DeepSeek-V4-Flash -> DeepSeek-V4-Flash self-verification experiment.
-        Prime's recommended model is Gemini 3.7 Flash because it is the model
-        used for implementation. The method only records/uses model identity;
-        it does not weaken deterministic certification.
-        """
+        """Backward-compatible alias; normal ``select`` is already same-model by default."""
         return self.select(
             candidates,
             goal_description=goal_description,
