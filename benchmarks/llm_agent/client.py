@@ -103,6 +103,61 @@ class LiveLLMClient(BaseLLMClient):
                     latency_ms=dur,
                 )
 
+                elif self.provider in ("gemini", "google"):
+            if not self.api_key:
+                self.api_key = os.environ.get("GEMINI_API_KEY") or os.environ.get("GOOGLE_API_KEY")
+            if not self.api_key:
+                raise ValueError("GEMINI_API_KEY (or GOOGLE_API_KEY) is not set.")
+            url = f"https://generativelanguage.googleapis.com/v1beta/models/{self.model}:generateContent?key={self.api_key}"
+            headers = {"Content-Type": "application/json"}
+            payload = {
+                "contents": [
+                    {"role": "user", "parts": [{"text": f"{system_prompt}\n\n{user_prompt}"}]}
+                ]
+            }
+            with httpx.Client(timeout=60.0) as client:
+                res = client.post(url, headers=headers, json=payload)
+                res.raise_for_status()
+                data = res.json()
+                dur = (time.perf_counter() - start) * 1000.0
+                text = ""
+                candidates = data.get("candidates", [])
+                if candidates:
+                    parts = candidates[0].get("content", {}).get("parts", [])
+                    text = "".join(p.get("text", "") for p in parts)
+                usage = data.get("usageMetadata", {})
+                return LLMResponse(
+                    content=text,
+                    provider="gemini",
+                    model=self.model,
+                    prompt_tokens=usage.get("promptTokenCount", 0),
+                    completion_tokens=usage.get("candidatesTokenCount", 0),
+                    latency_ms=dur,
+                )
+
+                elif self.provider in ("vertex_ai", "vertex", "google_vertex"):
+            import litellm
+            model_target = self.model if self.model.startswith("vertex_ai/") else f"vertex_ai/{self.model}"
+            resp = litellm.completion(
+                model=model_target,
+                messages=[
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": user_prompt},
+                ],
+                reasoning_effort="high",
+            )
+            dur = (time.perf_counter() - start) * 1000.0
+            choice = resp.choices[0].message
+            usage = resp.usage or {}
+            return LLMResponse(
+                content=choice.content or "",
+                provider="vertex_ai",
+                model=self.model,
+                prompt_tokens=getattr(usage, "prompt_tokens", 0) or 0,
+                completion_tokens=getattr(usage, "completion_tokens", 0) or 0,
+                latency_ms=dur,
+            )
+
         raise NotImplementedError(f"Provider {self.provider} not supported for synchronous direct dispatch.")
 
 

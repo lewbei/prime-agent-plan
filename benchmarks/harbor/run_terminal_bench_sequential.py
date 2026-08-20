@@ -35,7 +35,7 @@ def prune_docker_storage() -> None:
         pass
 
 
-def run_all_89_tasks(arm: str = "A6", model: str = "claude-3-5-sonnet", max_tasks: int | None = None, out_dir: str = "results") -> None:
+def run_all_89_tasks(arm: str = "A6", model: str = "vertex_ai/gemini-2.0-flash", provider: str = "vertex_ai", max_tasks: int | None = None, out_dir: str = "results") -> None:
     task_dirs = sorted([d for d in DATASET_DIR.iterdir() if d.is_dir()])
     if max_tasks:
         task_dirs = task_dirs[:max_tasks]
@@ -64,6 +64,7 @@ def run_all_89_tasks(arm: str = "A6", model: str = "claude-3-5-sonnet", max_task
             "--path", str(task_dir),
             "--agent", "benchmarks.harbor.harbor_adapter:PrimeHarborAgent",
             "--agent-kwarg", f"ablation_arm={arm}",
+            "--agent-kwarg", f"provider={provider}",
             "--model", model,
             "--n-attempts", "1",
             "--n-concurrent", "1",
@@ -154,12 +155,13 @@ def run_all_89_tasks(arm: str = "A6", model: str = "claude-3-5-sonnet", max_task
 def main():
     parser = argparse.ArgumentParser(description="Official Terminal-Bench 2.0 Sequential Evaluator")
     parser.add_argument("--arm", default="A6", help="Ablation arm (A0-A6)")
-    parser.add_argument("--model", default="claude-3-5-sonnet", help="Model name")
+    parser.add_argument("--model", default="vertex_ai/gemini-2.0-flash", help="Model name (e.g. vertex_ai/gemini-2.0-flash, claude-3-7-sonnet)")
+    parser.add_argument("--provider", default="vertex_ai", help="Provider (vertex_ai/gemini/anthropic/openai)")
     parser.add_argument("--limit", type=int, default=None, help="Limit number of tasks")
     parser.add_argument("--out", default="results", help="Output directory")
     args = parser.parse_args()
 
-    run_all_89_tasks(arm=args.arm, model=args.model, max_tasks=args.limit, out_dir=args.out)
+    run_all_89_tasks(arm=args.arm, model=args.model, provider=args.provider, max_tasks=args.limit, out_dir=args.out)
 
 
 if __name__ == "__main__":

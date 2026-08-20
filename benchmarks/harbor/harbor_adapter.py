@@ -64,14 +64,26 @@ class PrimeHarborAgent(BaseAgent):
     ):
         super().__init__(logs_dir=logs_dir, model_name=model_name, logger=logger, *args, **kwargs)
         self.ablation_arm = ablation_arm
-        self.model_name = model_name or "claude-3-5-sonnet"
-        self.provider = provider
+        self.model_name = model_name or "gemini-2.0-flash"
+        if "vertex" in self.model_name.lower() or "vertex" in provider.lower():
+            self.provider = "vertex_ai"
+        elif "gemini" in self.model_name.lower():
+            self.provider = "gemini"
+        elif "gpt" in self.model_name.lower() or "o1" in self.model_name.lower() or "o3" in self.model_name.lower():
+            self.provider = "openai"
+        elif "deepseek" in self.model_name.lower():
+            self.provider = "deepseek"
+        elif "claude" in self.model_name.lower():
+            self.provider = "anthropic"
+        else:
+            self.provider = provider
+
         self.cost_tracker = TokenCostTracker()
         self.registry = CapabilityRegistry()
         self._setup_capabilities()
 
         # Initialize LLM client
-        api_key = os.environ.get(f"{self.provider.upper()}_API_KEY")
+        api_key = os.environ.get(f"{self.provider.upper()}_API_KEY") or (os.environ.get("GOOGLE_API_KEY") if self.provider == "gemini" else None)
         if api_key:
             self.llm_client: BaseLLMClient = LiveLLMClient(provider=self.provider, model=self.model_name, api_key=api_key)
         else:
