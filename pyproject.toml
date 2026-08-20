@@ -17,6 +17,9 @@ test = [
     "anyio>=3.7.0",
     "typeguard>=4.0.0",
 ]
+verification = [
+    "llm-verifier>=0.2.0,<0.3.0",
+]
 
 [build-system]
 requires = ["hatchling"]
