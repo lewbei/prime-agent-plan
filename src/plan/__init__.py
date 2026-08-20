@@ -1,13 +1,18 @@
-"""plan - hardened public Plan Mode entrypoint.
+"""Public, fail-closed Plan Mode entrypoint.
 
-The bundled ``plan_mode`` engine remains the implementation core.  This module
-adds user-facing fail-closed wrappers for convergence, release and legacy
-Cordis execution, then installs those wrappers back onto ``plan_mode`` so the
-normal ``import plan`` workflow cannot accidentally bypass them.
+``plan_mode`` remains the implementation package.  This module re-exports its
+public API and strengthens the user-facing convergence/release/execution paths
+without replacing unrelated ``plan_mode`` functions at import time.  The sole
+intentional alias installed back onto ``plan_mode`` is ``assess_candidates`` —
+matching the established same-model/same-thinking integration contract.
 """
 from __future__ import annotations
 
+import asyncio
+import concurrent.futures
+import hashlib
 import inspect
+import random
 import sys
 from pathlib import Path
 
@@ -25,47 +30,8 @@ while _repo != _repo.parent:
     _repo = _repo.parent
 
 import plan_mode
-from plan_mode import (  # noqa: E402
-    __version__, start, assess, assess_candidates, run, status, history, best,
-    committed, checkpoint, rewind, finish, log_progress, suggest, list_sessions,
-    rubric, verify, judge, record_judge, release, plan_dag, simulate, plan_quality,
-    edit_file, rollback, deps_check, ground_check, constraint_check, fold_history,
-    judge_ensemble, template, selfcheck, search_expand, search_select,
-    search_backtrack, search_report, search, Context, Fiber, LifecycleState,
-    TwistedMonoid, get_root_context, reset_root_context, create_subagent_context,
-    provide_tool, execute_plan, execute_plan_sync, speculative_rollout,
-    speculative_rollout_async, session_lock, ExecutionContract,
-    parse_execution_contract, validate_execution_contract, parse_exit_criteria,
-    validate_exit_criteria, run_exit_criteria, probe_contract, symbol_audit,
-    scan_symbols, parity_audit, run_verification_commands, ExecutionEvidence,
-    TaskExecution, CommandResult, parse_execution_evidence, AgentIsolation,
-    OperationIsolation, ArtifactVersion, ConflictReport, IsolationManager,
-    acquire_artifact, release_artifact, detect_conflicts, DriftEvidence,
-    RecoveryDecision, RecoveryGraph, classify_drift, recovery_decision,
-    PredicateSignature, validate_typed_atom, feedback_penalty,
-    extract_declared_obligations, align_task_evidence, verify_execution_trace,
-    verify_negative_constraints, RoTRuleBase, RoTRule, ReplanningLadder,
-    ContextBudgeter, mutate_flaw_directed, mutate_exploratory, crossover_ast,
-    ast_distance, PopulationMember, ASTSearchEngine, Proposition, PlanParser,
-    PlanAST, CausalValidator, CausalLink, CausalFlaw, ActionSchema, ActionIR,
-    FactTruth, ProjectedTruth, HardConstraint, PlanIR, PredicateCondition,
-    Provenance, SourceType, SuccessCriterion, WitnessabilityStatus, WorldFact,
-    render_markdown_view, CapabilityEntry, CapabilityRegistry,
-    CompensationAction, ObservationVerifier, EpistemicCausalValidator,
-    PlanValidationResult, ValidationStatus, merge_fact_truth,
-    AuthorizationCertificate, PlanningSession, PlanVersion, SessionState,
-    DiagnosticProbe, VOIProbingEngine, RecoveryStatus, SagaRecoveryManager,
-    SagaRecoveryReport, BlindJudge, DualJudgeComparison, DualJudgeEvaluator,
-    GroundedEpistemicJudge, JudgeVerdict, JudgeAdapter, OpenAIJudge,
-    AnthropicJudge, GeminiJudge, DeepSeekJudge, EnsembleJudge,
-    EpistemicPlanSearch, SearchResult, causal_crossover,
-    insert_disambiguation_action, mutate_action_parameters, DEFAULT_PLANS_DIR,
-    RUBRIC_PATH, REPO_ROOT, DEFAULT_MAX_ROUNDS, MAX_PLATEAU_ROUNDS,
-    MIN_DELTA_TO_CONTINUE, JOURNAL_PATH, EphemeralWorkspace, ExecutionSandbox,
-    IsolationPolicy, TransactionalExecutionManager, TransactionOutcome,
-    ExecutionPlanManager, ExecutionBackend, DEFAULT_RUBRIC,
-)
-from plan_mode.self_verification import (  # noqa: E402
+import plan_mode.search_engine as _search_engine
+from plan_mode.self_verification import (
     DEFAULT_SELF_VERIFICATION_N_EVALUATIONS,
     DEFAULT_SELF_VERIFICATION_PIVOTS,
     DEFAULT_VERIFIER_MAX_CALLS,
@@ -76,11 +42,18 @@ from plan_mode.self_verification import (  # noqa: E402
     resolve_implementation_thinking,
 )
 
-_raw_assess = assess
-_raw_release = release
-_raw_finish = finish
-_raw_execute_plan = execute_plan
-_deterministic_assess_candidates = assess_candidates
+# Re-export the implementation package's declared public API first.  Hardened
+# wrappers defined below intentionally replace selected names in this module.
+for _public_name in getattr(plan_mode, "__all__", []):
+    if hasattr(plan_mode, _public_name):
+        globals()[_public_name] = getattr(plan_mode, _public_name)
+__version__ = plan_mode.__version__
+
+_raw_assess = plan_mode.assess
+_raw_release = plan_mode.release
+_raw_finish = plan_mode.finish
+_raw_execute_plan = plan_mode.execute_plan
+_deterministic_assess_candidates = plan_mode.assess_candidates
 
 
 def _plans_dir_for(session, plans_dir=None) -> Path:
@@ -88,7 +61,7 @@ def _plans_dir_for(session, plans_dir=None) -> Path:
         return Path(plans_dir)
     if isinstance(session, dict) and session.get("plans_dir"):
         return Path(session["plans_dir"])
-    return Path(DEFAULT_PLANS_DIR)
+    return Path(plan_mode.DEFAULT_PLANS_DIR)
 
 
 def _load_state(session, plans_dir=None):
@@ -129,13 +102,7 @@ def assess(session, plan_text, *, note=None, addressed=None, plans_dir=None,
            require_execution_contract=False, run_probe=False, probe_cwd=None,
            execution_evidence=None, require_execution_evidence=False,
            conflicts=None, require_conflict_free=False):
-    """Assess a plan, but reserve ``converged`` for a clean deterministic state.
-
-    The underlying optimizer may stop because it plateaued or exhausted its
-    round budget.  That is not equivalent to correctness.  If it returns
-    ``converged`` while critiques or hard checks remain, the public status is
-    changed to ``plateaued`` and the persisted session is not release-eligible.
-    """
+    """Assess while reserving ``converged`` for a clean deterministic state."""
     result = _raw_assess(
         session,
         plan_text,
@@ -154,14 +121,14 @@ def assess(session, plan_text, *, note=None, addressed=None, plans_dir=None,
         return result
 
     cwd = Path(probe_cwd or Path.cwd())
-    checked_verify = plan_mode.verify(plan_text)
-    checked_ground = plan_mode.ground_check(plan_text, cwd=cwd)
-    checked_sim = plan_mode.simulate(plan_text, initial_state=set(checked_ground.get("verified", [])))
+    verified = plan_mode.verify(plan_text)
+    grounded = plan_mode.ground_check(plan_text, cwd=cwd)
+    simulated = plan_mode.simulate(plan_text, initial_state=set(grounded.get("verified", [])))
     clean = bool(
         not result.get("critiques")
-        and checked_verify.get("ok")
-        and checked_ground.get("ok")
-        and checked_sim.get("executable_plan")
+        and verified.get("ok")
+        and grounded.get("ok")
+        and simulated.get("executable_plan")
     )
     if require_execution_contract:
         contract = result.get("execution_contract") or {}
@@ -174,18 +141,20 @@ def assess(session, plan_text, *, note=None, addressed=None, plans_dir=None,
     result["clean_convergence"] = clean
     result["convergence_checks"] = {
         "zero_critiques": not bool(result.get("critiques")),
-        "verify_ok": bool(checked_verify.get("ok")),
-        "ground_ok": bool(checked_ground.get("ok")),
-        "sim_ok": bool(checked_sim.get("executable_plan")),
+        "verify_ok": bool(verified.get("ok")),
+        "ground_ok": bool(grounded.get("ok")),
+        "sim_ok": bool(simulated.get("executable_plan")),
     }
     if clean:
         _persist_status(session, "converged", plans_dir, convergence_quality="clean")
         return result
 
-    result["status"] = "plateaued"
-    result["continue"] = False
-    result["requires_revision"] = True
-    result["convergence_quality"] = "stopped-with-open-issues"
+    result.update({
+        "status": "plateaued",
+        "continue": False,
+        "requires_revision": True,
+        "convergence_quality": "stopped-with-open-issues",
+    })
     _persist_status(
         session,
         "plateaued",
@@ -195,12 +164,20 @@ def assess(session, plan_text, *, note=None, addressed=None, plans_dir=None,
     return result
 
 
+def run(objective, draft_plan, *, plans_dir=None,
+        max_rounds=plan_mode.DEFAULT_MAX_ROUNDS, note=None):
+    """Start a session and assess its first draft through the hardened wrapper."""
+    session = plan_mode.start(objective, plans_dir=plans_dir, max_rounds=max_rounds)
+    assess(session, draft_plan, note=note, plans_dir=plans_dir)
+    return session
+
+
 def release(session, *, min_score=90.0, require_judge=True,
             require_external_judge=False, require_execution_contract=False,
             execution_cwd=None, execution_evidence=None,
             require_execution_evidence=False, conflicts=None,
             require_conflict_free=False, plans_dir=None):
-    """Release with an additional canonical-CWD feasibility/simulation guard."""
+    """Release with an additional canonical-execution-CWD truth gate."""
     gate = _raw_release(
         session,
         min_score=min_score,
@@ -218,24 +195,30 @@ def release(session, *, min_score=90.0, require_judge=True,
         return gate
 
     text = _best_plan_text(session, plans_dir)
-    strict_gc = plan_mode.ground_check(text, cwd=Path(execution_cwd)) if text else {"ok": False, "missing": ["no best plan"]}
-    strict_sim = plan_mode.simulate(text, initial_state=set(strict_gc.get("verified", []))) if text else {"executable_plan": False, "problems": ["no best plan"]}
-    gate["execution_cwd_checks"] = {
-        "cwd": str(Path(execution_cwd).resolve()),
-        "ground_ok": bool(strict_gc.get("ok")),
-        "sim_ok": bool(strict_sim.get("executable_plan")),
-        "missing": strict_gc.get("missing", []),
-        "simulation_problems": strict_sim.get("problems", []),
+    canonical_cwd = Path(execution_cwd).resolve()
+    grounded = plan_mode.ground_check(text, cwd=canonical_cwd) if text else {
+        "ok": False, "missing": ["no best plan"], "verified": []
     }
-    if not strict_gc.get("ok"):
+    simulated = plan_mode.simulate(
+        text,
+        initial_state=set(grounded.get("verified", [])),
+    ) if text else {"executable_plan": False, "problems": ["no best plan"]}
+    gate["execution_cwd_checks"] = {
+        "cwd": str(canonical_cwd),
+        "ground_ok": bool(grounded.get("ok")),
+        "sim_ok": bool(simulated.get("executable_plan")),
+        "missing": grounded.get("missing", []),
+        "simulation_problems": simulated.get("problems", []),
+    }
+    if not grounded.get("ok"):
         gate["ok"] = False
         gate.setdefault("problems", []).append(
-            f"execution_cwd grounding failed: {strict_gc.get('missing', [])[:5]}"
+            f"execution_cwd grounding failed: {grounded.get('missing', [])[:5]}"
         )
-    if not strict_sim.get("executable_plan"):
+    if not simulated.get("executable_plan"):
         gate["ok"] = False
         gate.setdefault("problems", []).append(
-            f"execution_cwd simulation failed: {strict_sim.get('problems', [])[:5]}"
+            f"execution_cwd simulation failed: {simulated.get('problems', [])[:5]}"
         )
     return gate
 
@@ -267,8 +250,6 @@ def finish(session, *, verdict="converged", plans_dir=None, require_release=True
                 "error": "release gate failed",
                 "release_gate": gate,
             }
-        # Gate already ran with canonical cwd/evidence; avoid the legacy
-        # internal release pass using a different cwd.
         result = _raw_finish(
             session,
             verdict=verdict,
@@ -296,13 +277,7 @@ def _is_async_handler(handler) -> bool:
 async def execute_plan(plan_text, task_handlers=None, *, dry_run=False,
                        continue_on_error=False, timeout_per_task=None,
                        context=None):
-    """Fail-closed compatibility wrapper around the legacy Cordis executor.
-
-    Production capability execution should use ``TransactionalExecutionManager``.
-    This compatibility API now requires one async handler for every task and a
-    finite timeout, so a missing handler can never become synthetic success and
-    a blocking synchronous callback cannot bypass the timeout.
-    """
+    """Fail-closed compatibility wrapper around the legacy Cordis executor."""
     handlers = dict(task_handlers or {})
     nodes = list((plan_mode.plan_dag(plan_text) or {}).get("nodes", []))
     if not dry_run:
@@ -315,7 +290,10 @@ async def execute_plan(plan_text, task_handlers=None, *, dry_run=False,
                 "executed_tasks": [],
                 "recovered": False,
             }
-        sync_handlers = [task_id for task_id, handler in handlers.items() if not _is_async_handler(handler)]
+        sync_handlers = [
+            task_id for task_id, handler in handlers.items()
+            if not _is_async_handler(handler)
+        ]
         if sync_handlers:
             return {
                 "ok": False,
@@ -335,6 +313,28 @@ async def execute_plan(plan_text, task_handlers=None, *, dry_run=False,
         timeout_per_task=effective_timeout,
         context=context,
     )
+
+
+def execute_plan_sync(plan_text, task_handlers=None, *, dry_run=False,
+                      continue_on_error=False, timeout_per_task=None,
+                      context=None):
+    """Synchronous wrapper that delegates to the hardened async executor."""
+    def _run():
+        return asyncio.run(execute_plan(
+            plan_text,
+            task_handlers=task_handlers,
+            dry_run=dry_run,
+            continue_on_error=continue_on_error,
+            timeout_per_task=timeout_per_task,
+            context=context,
+        ))
+
+    try:
+        asyncio.get_running_loop()
+    except RuntimeError:
+        return _run()
+    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+        return pool.submit(_run).result()
 
 
 def _compat_ranking(checks, preferred_order=None):
@@ -400,8 +400,13 @@ def assess_candidates(
     for i, draft in enumerate(drafts):
         verified = plan_mode.verify(draft)
         grounded = plan_mode.ground_check(draft)
-        simulated = plan_mode.simulate(draft, initial_state=set(grounded.get("verified", [])))
-        hard_pass = bool(verified.get("ok") and grounded.get("ok") and simulated.get("executable_plan"))
+        simulated = plan_mode.simulate(
+            draft, initial_state=set(grounded.get("verified", []))
+        )
+        hard_pass = bool(
+            verified.get("ok") and grounded.get("ok")
+            and simulated.get("executable_plan")
+        )
         checked.append({
             "candidate": i,
             "verify_ok": bool(verified.get("ok")),
@@ -431,19 +436,30 @@ def assess_candidates(
         return result
 
     session_state = _session_state_for_model(session, plans_dir)
-    active_model = resolve_implementation_model(implementation_model, session=session_state)
-    active_thinking = resolve_implementation_thinking(implementation_thinking, session=session_state)
+    active_model = resolve_implementation_model(
+        implementation_model, session=session_state
+    )
+    active_thinking = resolve_implementation_thinking(
+        implementation_thinking, session=session_state
+    )
     if not active_model:
-        result = _deterministic_assess_candidates(session, drafts, notes=notes, plans_dir=plans_dir)
+        result = _deterministic_assess_candidates(
+            session, drafts, notes=notes, plans_dir=plans_dir
+        )
         result.update({
             "selection_method": "deterministic-fallback-no-model",
             "self_verification_available": False,
-            "self_verification_error": "Active implementation-model identity unavailable; no verifier model was substituted",
+            "self_verification_error": (
+                "Active implementation-model identity unavailable; "
+                "no verifier model was substituted"
+            ),
             "candidate_checks": checked,
         })
         return result
 
-    objective = str((session_state or {}).get("objective") or "Select the best candidate plan")
+    objective = str(
+        (session_state or {}).get("objective") or "Select the best candidate plan"
+    )
     soft_verifier = verifier or _ProbabilisticSelfVerifier()
     try:
         soft = soft_verifier.select(
@@ -488,7 +504,9 @@ def assess_candidates(
         })
         return result
     except Exception as exc:
-        result = _deterministic_assess_candidates(session, drafts, notes=notes, plans_dir=plans_dir)
+        result = _deterministic_assess_candidates(
+            session, drafts, notes=notes, plans_dir=plans_dir
+        )
         result.update({
             "selection_method": "deterministic-fallback",
             "implementation_model": active_model,
@@ -500,12 +518,37 @@ def assess_candidates(
         return result
 
 
-# Install hardened public wrappers back onto plan_mode for code that imports
-# ``plan`` first and subsequently reaches through the implementation module.
-plan_mode.assess = assess
-plan_mode.release = release
-plan_mode.finish = finish
-plan_mode.execute_plan = execute_plan
+def _stable_search_mutations(plan_text, width, critiques=None):
+    """Stable cross-process replacement for search_engine._mutations."""
+    digest = hashlib.sha256(_search_engine._norm(plan_text).encode("utf-8")).digest()
+    rng = random.Random(int.from_bytes(digest[:8], "big"))
+    targeted = []
+    if critiques:
+        seen = set()
+        for critique in critiques:
+            section = (
+                critique.get("id", "").split(":", 1)[0]
+                if isinstance(critique, dict)
+                else str(critique).split(":", 1)[0]
+            )
+            for key, template in _search_engine._SECTION_TEMPLATES.items():
+                if key in section and key not in seen:
+                    seen.add(key)
+                    targeted.append((
+                        f"target-{key}",
+                        lambda text, template=template: text + template,
+                    ))
+    choices = targeted if targeted else list(_search_engine._MUTATIONS)
+    selected = rng.sample(choices, min(width, len(choices)))
+    return [{"text": fn(plan_text), "note": name} for name, fn in selected]
+
+
+# Determinism is a safe global invariant: unlike behavioral wrapper monkey-
+# patches, this only replaces Python's process-randomized hash seed with a
+# stable SHA-256-derived seed for the exact same mutation library.
+_search_engine._mutations = _stable_search_mutations
+
+# Preserve the already-established identity invariant used by callers/tests.
 plan_mode.assess_candidates = assess_candidates
 
-__all__ = list(plan_mode.__all__)
+__all__ = list(getattr(plan_mode, "__all__", []))
