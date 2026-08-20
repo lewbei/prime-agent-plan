@@ -275,9 +275,22 @@ async def _legacy_deepseek_propose(
     variants = [v for v in parsed.get("variants", []) if isinstance(v, str) and v.strip()][:width]
     if not variants:
         raise RuntimeError("LLM proposer returned no valid variants")
-    usage = (data.get("usage") or {})
+    usage = data.get("usage") or {}
     tokens = int(usage.get("output_tokens", 0) or 0) + int(usage.get("input_tokens", 0) or 0)
     return variants, tokens
+
+
+def _is_async_callable(fn: Callable[..., Any]) -> bool:
+    """Return True only when invoking ``fn`` is expected to yield cooperatively.
+
+    Arbitrary synchronous callbacks cannot be force-cancelled safely inside an
+    asyncio process. Rejecting them up front keeps the proposal timeout an
+    enforceable API contract rather than a best-effort promise.
+    """
+    return bool(
+        inspect.iscoroutinefunction(fn)
+        or inspect.iscoroutinefunction(getattr(fn, "__call__", None))
+    )
 
 
 async def _invoke_runtime_proposer(
@@ -296,8 +309,9 @@ async def _invoke_runtime_proposer(
         model=model,
         thinking_profile=dict(thinking_profile),
     )
-    if inspect.isawaitable(result):
-        result = await result
+    if not inspect.isawaitable(result):
+        raise RuntimeError("runtime llm_proposer violated the async proposer contract")
+    result = await result
     if isinstance(result, tuple) and len(result) == 2:
         variants, tokens = result
     else:
@@ -436,14 +450,14 @@ async def search(
     width: int = 2,
     exploration: float = 1.4,
     cost_penalty: float = 0.0,
-    mode: str = "ast",                 # safe default: local deterministic search
-    expansion: str = "rules",          # online LLM expansion requires explicit opt-in
+    mode: str = "ast",
+    expansion: str = "rules",
     judge_evals: bool = False,
     max_nodes: int = 64,
     depth: int = 2,
     beam_width: int = 3,
     prune_margin: float | None = 0.15,
-    model: str | None = None,           # backward-compatible alias for implementation_model
+    model: str | None = None,
     implementation_model: str | None = None,
     implementation_thinking: Any = None,
     llm_proposer: Callable[..., Any] | None = None,
@@ -463,15 +477,15 @@ async def search(
 
     A bare call is intentionally safe: AST search with deterministic rule
     expansion, no network. Set ``mode='mcts'``/``'beam'`` explicitly for those
-    algorithms. Set ``expansion='llm'`` only when a runtime proposer is
+    algorithms. Set ``expansion='llm'`` only when an async runtime proposer is
     supplied; that proposer receives the same implementation model/thinking
     profile recorded by Prime.
 
-    ``search_timeout_seconds`` is a hard wall-clock budget between search
-    steps. Each online proposal is additionally wrapped in ``asyncio.wait_for``
-    with ``proposal_timeout_seconds`` (or the remaining total budget,
-    whichever is smaller). On a proposal error/timeout, Prime records a warning
-    and falls back to deterministic mutations rather than hanging silently.
+    ``search_timeout_seconds`` is checked between search steps. Each online
+    proposal is additionally wrapped in ``asyncio.wait_for`` with
+    ``proposal_timeout_seconds`` (or the remaining total budget, whichever is
+    smaller). Synchronous custom proposers are rejected before invocation
+    because Python cannot safely force-cancel an arbitrary blocking callback.
     """
     if iterations < 0 or width < 1 or max_nodes < 1:
         raise ValueError("iterations must be >= 0; width/max_nodes must be >= 1")
@@ -482,7 +496,7 @@ async def search(
     if proposal_timeout_seconds <= 0 or search_timeout_seconds <= 0:
         raise ValueError("search/proposal timeouts must be > 0")
 
-    from . import DEFAULT_PLANS_DIR, _load_session, _save_session
+    from . import DEFAULT_PLANS_DIR, _load_session, _save_session, ground_check
 
     started = time.monotonic()
     deadline = started + float(search_timeout_seconds)
@@ -508,9 +522,14 @@ async def search(
         raise ValueError("search needs a root plan (pass root_plan or run assess first)")
 
     root_rollout = _rollout(root_plan, rubric)
+    root_ground = ground_check(root_plan, cwd=cwd or Path.cwd())
+    root_ground_ok = bool(root_ground.get("ok"))
+    convergence_checks = {
+        "verify_ok": bool(root_rollout["verify_ok"]),
+        "ground_ok": root_ground_ok,
+        "sim_ok": bool(root_rollout["sim_ok"]),
+    }
 
-    # A changed root invalidates the persisted transposition tree. Keeping the
-    # old tree caused stale-node selection across repeated search calls.
     old_tree = s.get("search_tree")
     old_root_text = None
     if isinstance(old_tree, dict):
@@ -526,13 +545,12 @@ async def search(
         t["best_node"] = root_id
         t["best_value"] = root_rollout["value"]
 
-    # Do not spend test-time compute on a plan that is already essentially
-    # perfect and passes both deterministic structural checks and simulation.
     if (
         skip_if_converged
         and root_rollout["score"] >= float(convergence_score)
-        and root_rollout["verify_ok"]
-        and root_rollout["sim_ok"]
+        and convergence_checks["verify_ok"]
+        and convergence_checks["ground_ok"]
+        and convergence_checks["sim_ok"]
     ):
         elapsed = round(time.monotonic() - started, 3)
         entry = {
@@ -547,6 +565,7 @@ async def search(
             "best_score": root_rollout["score"],
             "best_value": round(root_rollout["value"], 3),
             "termination_reason": "already-converged",
+            "convergence_checks": convergence_checks,
         }
         s.setdefault("search_log", []).append(entry)
         _save_session(plans_dir, s)
@@ -562,6 +581,7 @@ async def search(
             "expansion": expansion,
             "termination_reason": "already-converged",
             "timed_out": False,
+            "convergence_checks": convergence_checks,
             "escalations": t.get("escalations", []),
             "tree": t,
             "report": _report(t),
@@ -571,7 +591,6 @@ async def search(
         from . import checkpoint as session_checkpoint
         session_checkpoint(s, plans_dir=plans_dir, note=f"search:{mode}:pre-expansion")
 
-    # Seed pool is local but bounded by the same wall-clock budget.
     if t.get("seeded") is None and not expired():
         t["seeded"] = True
         candidates: list[tuple[int, str]] = []
@@ -617,6 +636,11 @@ async def search(
             raise ValueError(
                 "LLM search expansion requires the active implementation model; "
                 "Prime will not silently choose a verifier/search model"
+            )
+        if llm_proposer is not None and not _is_async_callable(llm_proposer):
+            raise ValueError(
+                "runtime llm_proposer must be async so proposal_timeout_seconds can be enforced; "
+                "synchronous blocking proposers are not accepted"
             )
         if llm_proposer is None:
             if not allow_legacy_deepseek_expansion:
@@ -685,10 +709,8 @@ async def search(
 
     if mode in {"ast", "evolutionary"}:
         from .ast_search import ASTSearchEngine, PlanParser, apply_execution_feedback
-        from . import ground_check
 
-        gc = ground_check(root_plan, cwd=cwd or Path.cwd())
-        initial_state = set(gc.get("verified", []))
+        initial_state = set(root_ground.get("verified", []))
         engine = ASTSearchEngine(
             objective=s.get("objective", ""),
             initial_state=initial_state,
@@ -714,7 +736,12 @@ async def search(
             if expired():
                 timed_out, termination_reason = True, "search-timeout"
                 break
-            _emit_progress(progress_callback, {"event": "iteration", "mode": "ast", "iteration": iter_idx + 1, "total": iterations})
+            _emit_progress(progress_callback, {
+                "event": "iteration",
+                "mode": "ast",
+                "iteration": iter_idx + 1,
+                "total": iterations,
+            })
             evolved = engine.evolve_step(
                 population_size=max(2, width),
                 rubric_score_fn=lambda pt: _rollout(pt, rubric)["score"],
@@ -775,7 +802,13 @@ async def search(
             if len(nodes) >= max_nodes:
                 termination_reason = "max-nodes"
                 break
-            _emit_progress(progress_callback, {"event": "iteration", "mode": "mcts", "iteration": it + 1, "total": iterations, "width": width})
+            _emit_progress(progress_callback, {
+                "event": "iteration",
+                "mode": "mcts",
+                "iteration": it + 1,
+                "total": iterations,
+                "width": width,
+            })
             sel = _select(t, exploration, cost_penalty)
             plan = nodes[sel]["plan_text"]
             crits = nodes[sel]["critiques"] + _feedback_critiques(execution_feedback)
@@ -834,8 +867,6 @@ async def search(
             t["expansions"] += 1
 
             best_score_now = nodes[t["best_node"]]["score"] if t.get("best_node") in nodes else 0.0
-            # Never widen an already-converged search. The previous behavior
-            # spent more compute precisely when the plan was already ~perfect.
             if best_score_now < float(convergence_score):
                 if abs(t["best_value"] - prev_best) < 0.01:
                     plateau += 1
@@ -868,12 +899,10 @@ async def search(
         "escalations": len(t.get("escalations", [])),
         "termination_reason": termination_reason,
         "warnings": list(t.get("warnings", [])),
+        "convergence_checks": convergence_checks,
     })
     _save_session(plans_dir, s)
 
-    # Preserve historical behavior: if search really found a changed/better
-    # plan, assess it as a new round. Already-converged early exit never reaches
-    # this mutation point.
     from . import assess
     if best_node["score"] > (s.get("best_score") or 0) or best_node["plan_text"] != root_plan:
         assess(
@@ -900,6 +929,7 @@ async def search(
         "termination_reason": termination_reason,
         "timed_out": timed_out,
         "warnings": list(t.get("warnings", [])),
+        "convergence_checks": convergence_checks,
         "escalations": t.get("escalations", []),
         "tree": t,
         "report": _report(t),
