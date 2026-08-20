@@ -17,8 +17,6 @@ test = [
     "anyio>=3.7.0",
     "typeguard>=4.0.0",
 ]
-# Verification policy is part of Prime; this extra installs only the external
-# logprob backend. Deterministic Prime remains operational without credentials.
 verification = [
     "llm-verifier>=0.2.0,<0.3.0",
 ]
