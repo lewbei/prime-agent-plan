@@ -116,6 +116,18 @@ from .epistemic_validator import (
     ValidationStatus,
     merge_fact_truth,
 )
+from .runtime import (
+    EphemeralWorkspace,
+    EvidenceLedger,
+    ExecutionBackend,
+    ExecutionPlanManager,
+    ExecutionSandbox,
+    IsolationPolicy,
+    LedgerEventType,
+    TransactionOutcome,
+    TransactionalExecutionManager,
+    WitnessStatus,
+)
 from .session import (
     AuthorizationCertificate,
     PlanningSession,
@@ -2295,19 +2307,6 @@ __all__ = [
     "GroundedEpistemicJudge", "JudgeVerdict",
     "EpistemicPlanSearch", "causal_crossover", "insert_disambiguation_action",
     "mutate_action_parameters",
-    "EphemeralWorkspace", "ExecutionSandbox", "IsolationPolicy", "TransactionalExecutionManager", "TransactionOutcome", "ExecutionPlanManager", "SubprocessExecutionBackend", "DEFAULT_PLANS_DIR", "RUBRIC_PATH", "REPO_ROOT", "DEFAULT_MAX_ROUNDS",
+    "EphemeralWorkspace", "ExecutionSandbox", "IsolationPolicy", "TransactionalExecutionManager", "TransactionOutcome", "ExecutionPlanManager", "DEFAULT_PLANS_DIR", "RUBRIC_PATH", "REPO_ROOT", "DEFAULT_MAX_ROUNDS",
     "MAX_PLATEAU_ROUNDS", "MIN_DELTA_TO_CONTINUE", "JOURNAL_PATH", "DEFAULT_RUBRIC",
-from plan_mode.runtime import (
-    EphemeralWorkspace,
-    EvidenceLedger,
-    ExecutionBackend,
-    ExecutionPlanManager,
-    ExecutionSandbox,
-    IsolationPolicy,
-    LedgerEventType,
-    SubprocessExecutionBackend,
-    TransactionOutcome,
-    TransactionalExecutionManager,
-    WitnessStatus,
-)
 ]

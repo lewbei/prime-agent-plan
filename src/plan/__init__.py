@@ -183,14 +183,14 @@ from plan_mode import (  # noqa: E402
     MAX_PLATEAU_ROUNDS,
     MIN_DELTA_TO_CONTINUE,
     JOURNAL_PATH,
-    DEFAULT_RUBRIC,
-)
-
-__all__ = list(plan_mode.__all__)from plan_mode.runtime import (
     EphemeralWorkspace,
     ExecutionSandbox,
     IsolationPolicy,
     TransactionalExecutionManager,
     TransactionOutcome,
+    ExecutionPlanManager,
+    ExecutionBackend,
+    DEFAULT_RUBRIC,
 )
-"EphemeralWorkspace", "ExecutionSandbox", "IsolationPolicy", "TransactionalExecutionManager", "TransactionOutcome", 
+
+__all__ = list(plan_mode.__all__)
