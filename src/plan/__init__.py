@@ -72,6 +72,7 @@ from plan_mode.self_verification import (  # noqa: E402
     DEFAULT_SELF_VERIFICATION_PIVOTS,
     ProbabilisticSelfVerifier as _ProbabilisticSelfVerifier,
     resolve_implementation_model,
+    resolve_implementation_thinking,
 )
 
 _deterministic_assess_candidates = assess_candidates
@@ -126,14 +127,16 @@ def assess_candidates(
     plans_dir=None,
     verifier=None,
     implementation_model=None,
+    implementation_thinking=None,
     n_evaluations=DEFAULT_SELF_VERIFICATION_N_EVALUATIONS,
     pivots=DEFAULT_SELF_VERIFICATION_PIVOTS,
 ):
-    """Inherited Best-of-N with model-agnostic same-model self-verification.
+    """Inherited Best-of-N with same-model, same-thinking self-verification.
 
-    The model is inherited from the active implementation runtime/session. If
-    model M generated the candidates, model M verifies/ranks them. Prime never
-    silently substitutes a hard-coded Gemini, DeepSeek, or other model.
+    The implementation model and reasoning profile are inherited from the
+    active runtime/session. Model M with thinking profile T verifies the
+    candidates as M with the same T. Prime never silently substitutes a
+    different model or a deeper/shallower reasoning setting.
     """
     if not drafts:
         raise ValueError("drafts must be non-empty")
@@ -184,6 +187,10 @@ def assess_candidates(
         implementation_model,
         session=session_state,
     )
+    active_thinking = resolve_implementation_thinking(
+        implementation_thinking,
+        session=session_state,
+    )
     if not active_model:
         result = _deterministic_assess_candidates(
             session, drafts, notes=notes, plans_dir=plans_dir
@@ -209,6 +216,7 @@ def assess_candidates(
             problem=objective,
             candidates=[drafts[i] for i in eligible],
             model=active_model,
+            thinking_profile=active_thinking,
             n_evaluations=n_evaluations,
             pivots=pivots,
         )
@@ -221,12 +229,16 @@ def assess_candidates(
             plans_dir=plans_dir,
         )
         result.update({
-            "selection_method": "inherited-same-model-self-verification",
+            "selection_method": "inherited-same-model-same-thinking-self-verification",
             "selected_candidate": chosen,
             "implementation_model": active_model,
             "generator_model": active_model,
             "verifier_model": active_model,
+            "implementation_thinking": dict(active_thinking),
+            "generator_thinking": dict(active_thinking),
+            "verifier_thinking": dict(active_thinking),
             "is_self_verification": True,
+            "is_same_thinking": True,
             "n_evaluations": n_evaluations,
             "pivots": min(pivots, len(eligible)),
             "eligible_candidates": eligible,
@@ -244,6 +256,7 @@ def assess_candidates(
         result.update({
             "selection_method": "deterministic-fallback",
             "implementation_model": active_model,
+            "implementation_thinking": dict(active_thinking),
             "self_verification_available": False,
             "self_verification_error": f"{type(exc).__name__}: {exc}",
             "candidate_checks": checked,
