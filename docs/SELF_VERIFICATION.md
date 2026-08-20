@@ -13,7 +13,7 @@ Prime deterministic validator -> certify/reject
 Prime runtime witness -> verify empirical effects
 ```
 
-`PlanSelfVerifier.select(candidate_plans)` defaults to `gemini-3.7-flash` for both generator and verifier, `n_evaluations=2`, and `pivots=1`. A separate same-model selection mode is not required; `select_same_model()` is only a compatibility alias.
+`PlanSelfVerifier.select(candidate_plans)` defaults to `gemini-3.7-flash` for both generator and verifier, with `n_evaluations=2` and `pivots=1`. A separate same-model selection mode is not required; `select_same_model()` is only a compatibility alias.
 
 Probabilistic ranking cannot override deterministic truth: FAIL is excluded, PASS outranks UNKNOWN eligibility, the selected plan is revalidated, and only deterministic PASS can be certified. PR #1 authorization, isolation, witnessing, and recovery remain unchanged.
 
