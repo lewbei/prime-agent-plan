@@ -37,7 +37,7 @@ def _plans() -> list[PlanIR]:
     ]
 
 
-def test_same_model_best_of_n_selection_is_advisory_and_certified_only_after_validator_pass():
+def test_default_selection_inherits_gemini_same_model_verification_and_certifies_only_after_validator_pass():
     calls = []
 
     def fake_select(**kwargs):
@@ -47,15 +47,12 @@ def test_same_model_best_of_n_selection_is_advisory_and_certified_only_after_val
     verifier = ProbabilisticSelfVerifier(select_fn=fake_select)
     selector = PlanSelfVerifier(registry=_registry(), verifier=verifier)
 
-    result = selector.select(
-        _plans(),
-        generator_model="gemini-3.7-flash",
-        verifier_model="gemini-3.7-flash",
-        n_evaluations=2,
-        pivots=1,
-    )
+    # No model mode is selected here: same-model Gemini verification is the default.
+    result = selector.select(_plans())
 
     assert result.selected_index == 1
+    assert result.generator_model == "gemini-3.7-flash"
+    assert result.verifier_model == "gemini-3.7-flash"
     assert result.is_self_verification is True
     assert result.is_certified is True
     assert result.validation_status == ValidationStatus.PASS
@@ -66,7 +63,7 @@ def test_same_model_best_of_n_selection_is_advisory_and_certified_only_after_val
     assert calls[0]["pivots"] == 1
 
 
-def test_same_model_helper_defaults_to_gemini_3_7_flash_and_paper_matched_verification_settings():
+def test_inherited_defaults_match_prime_model_and_paper_matched_verification_settings():
     calls = []
 
     def fake_select(**kwargs):
@@ -77,7 +74,7 @@ def test_same_model_helper_defaults_to_gemini_3_7_flash_and_paper_matched_verifi
         registry=_registry(),
         verifier=ProbabilisticSelfVerifier(select_fn=fake_select),
     )
-    result = selector.select_same_model(_plans())
+    result = selector.select(_plans())
 
     assert DEFAULT_SELF_VERIFICATION_MODEL == "gemini-3.7-flash"
     assert DEFAULT_SELF_VERIFICATION_N_EVALUATIONS == 2
@@ -90,6 +87,20 @@ def test_same_model_helper_defaults_to_gemini_3_7_flash_and_paper_matched_verifi
     assert calls[0]["model"] == "gemini-3.7-flash"
     assert calls[0]["n_evaluations"] == 2
     assert calls[0]["pivots"] == 1
+
+
+def test_same_model_helper_remains_only_as_backward_compatible_alias():
+    def fake_select(**kwargs):
+        return SimpleNamespace(index=0, ranking=[0, 1], scores=[0.9, 0.2])
+
+    selector = PlanSelfVerifier(
+        registry=_registry(),
+        verifier=ProbabilisticSelfVerifier(select_fn=fake_select),
+    )
+    result = selector.select_same_model(_plans())
+    assert result.generator_model == DEFAULT_SELF_VERIFICATION_MODEL
+    assert result.verifier_model == DEFAULT_SELF_VERIFICATION_MODEL
+    assert result.is_self_verification is True
 
 
 def test_deterministic_fail_candidate_is_never_sent_to_llm_selector():
@@ -112,7 +123,7 @@ def test_deterministic_fail_candidate_is_never_sent_to_llm_selector():
     bad = PlanIR(plan_id="bad", goal_description="x", actions=[_action("bad", "noop.a")])
     good = PlanIR(plan_id="good", goal_description="x", actions=[_action("good", "noop.b")])
 
-    result = selector.select([bad, good], verifier_model="gemini-3.7-flash")
+    result = selector.select([bad, good])
     assert result.selected_index == 1
     assert result.is_certified is True
     assert len(seen) == 1
@@ -136,7 +147,7 @@ def test_unknown_candidates_may_be_ranked_for_rework_but_never_certified():
         PlanIR(plan_id="u0", goal_description="x", actions=[_action("u0", "noop.a")]),
         PlanIR(plan_id="u1", goal_description="x", actions=[_action("u1", "noop.b")]),
     ]
-    result = selector.select(plans, verifier_model="gemini-3.7-flash")
+    result = selector.select(plans)
 
     assert result.selected_index == 1
     assert result.validation_status == ValidationStatus.UNKNOWN
@@ -157,7 +168,7 @@ def test_unregistered_action_cannot_be_certified_even_if_verifier_prefers_it():
         goal_description="x",
         actions=[_action("m", "magic.capability")],
     )
-    result = selector.select([unknown], verifier_model="gemini-3.7-flash")
+    result = selector.select([unknown])
 
     assert result.is_certified is False
     assert result.validation_status == ValidationStatus.UNKNOWN
