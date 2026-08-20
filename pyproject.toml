@@ -17,9 +17,9 @@ test = [
     "anyio>=3.7.0",
     "typeguard>=4.0.0",
 ]
-# Prime's self-verification behavior is inherited by the architecture; this
-# extra installs the external probabilistic/logprob backend. Deterministic
-# validation remains available without provider credentials.
+# The self-verification policy is inherited by Prime. This extra only installs
+# the external probabilistic/logprob backend; deterministic Prime remains
+# operational without provider credentials.
 verification = [
     "llm-verifier>=0.2.0,<0.3.0",
 ]
