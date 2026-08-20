@@ -1,39 +1,30 @@
-"""Execution contracts: make plans release only against real-world evidence.
+"""Execution contracts: bind plan claims to bounded, isolated execution evidence.
 
-This module operationalizes the distinction between *plan verification* and
-*execution verification*. A plan may be causally valid while the work product
-is stubbed. The contract therefore carries:
-
-- ``probe``: a minimal executable spike that must produce the expected output
-  before the full plan is trusted (feasibility gate).
-- ``verification_commands``: commands an independent verifier must run.
-- ``expected_artifacts``: filesystem artifacts with minimum size/line budgets.
-- ``symbols``: declared functions/variables per source file. After execution,
-  `symbol_audit` detects missing declarations and undeclared helpers, closing
-  the "write a plausible stub" loophole.
-- ``parity_checks``: equality/hash comparisons against the old behavior.
-- ``workspace_invariants``: natural-language invariants enforced by the
-  harness-level verifier.
-
-Literature grounding:
-- ACID-Agent (2608.13900): evidence obligations and validated-effect-only commits.
-- STAIR (2608.09524): validate execution effects before experience reuse.
-- FlowScout (2608.10039): execution-feedback-guided repair.
-- AgentRewind (2608.14380): checkpoint before execution; rewind on failed probe.
+Plan-declared commands are untrusted input.  Probes, verification commands and
+exit criteria therefore run through Prime's STRICT sandbox by default.  The
+only raw-host escape hatch is the explicit development environment variable
+``PLAN_ALLOW_UNISOLATED_CONTRACT_COMMANDS=1``; production never silently falls
+back when kernel isolation is unavailable.
 """
 from __future__ import annotations
 
 import ast
 import hashlib
 import json
+import os
 import re
 import subprocess
 import sys
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Optional
 
 from .causal_validator import PlanParser
+
+MAX_CONTRACT_COMMANDS = 16
+DEFAULT_TOTAL_COMMAND_BUDGET_SECONDS = 120.0
+UNISOLATED_DEV_ENV = "PLAN_ALLOW_UNISOLATED_CONTRACT_COMMANDS"
 
 
 @dataclass
@@ -49,15 +40,9 @@ class ExecutionContract:
 
 
 def parse_execution_contract(plan_text: str) -> tuple[Optional[ExecutionContract], list[str]]:
-    """Extract the JSON execution contract from a plan.
-
-    Accepted forms:
-    1. `## Execution Contract` followed by a fenced ```json block.
-    2. Any fenced ```json block containing ``verification_commands`` or ``probe``.
-    """
+    """Extract the JSON execution contract from markdown safely."""
     errors: list[str] = []
     candidates: list[str] = []
-
     pattern1 = r"##\s*Execution\s+Contract.*?\n[ \t]*```json\s*\n(.*?)\n[ \t]*```"
     m = re.search(pattern1, plan_text, re.I | re.S)
     if m:
@@ -67,7 +52,6 @@ def parse_execution_contract(plan_text: str) -> tuple[Optional[ExecutionContract
         payload = block.group(1)
         if "verification_commands" in payload or "probe" in payload or "symbols" in payload:
             candidates.append(payload)
-
     if not candidates:
         return None, []
 
@@ -80,49 +64,33 @@ def parse_execution_contract(plan_text: str) -> tuple[Optional[ExecutionContract
                 break
         except json.JSONDecodeError as exc:
             errors.append(f"execution contract JSON is invalid: {exc}")
-
     if data is None:
         return None, errors or ["execution contract JSON is invalid"]
 
     raw_probe = data.get("probe")
-    probe = raw_probe if isinstance(raw_probe, dict) else {}
-
     raw_cmds = data.get("verification_commands")
-    verification_commands = [cmd for cmd in raw_cmds if isinstance(cmd, list)] if isinstance(raw_cmds, list) else []
-
     raw_artifacts = data.get("expected_artifacts")
-    expected_artifacts = {str(k): (v if isinstance(v, dict) else {}) for k, v in raw_artifacts.items()} if isinstance(raw_artifacts, dict) else {}
-
     raw_invariants = data.get("workspace_invariants")
-    workspace_invariants = [str(x) for x in raw_invariants] if isinstance(raw_invariants, list) else []
-
     raw_parity = data.get("parity_checks")
-    parity_checks = [p for p in raw_parity if isinstance(p, dict)] if isinstance(raw_parity, list) else []
-
     raw_symbols = data.get("symbols")
-    symbols = {str(k): (v if isinstance(v, dict) else {}) for k, v in raw_symbols.items()} if isinstance(raw_symbols, dict) else {}
-
     raw_exit = data.get("exit_criteria")
-    exit_criteria = [c for c in raw_exit if isinstance(c, dict)] if isinstance(raw_exit, list) else []
 
-    contract = ExecutionContract(
-        probe=probe,
-        verification_commands=verification_commands,
-        expected_artifacts=expected_artifacts,
-        workspace_invariants=workspace_invariants,
-        parity_checks=parity_checks,
-        symbols=symbols,
-        exit_criteria=exit_criteria,
+    return ExecutionContract(
+        probe=raw_probe if isinstance(raw_probe, dict) else {},
+        verification_commands=[cmd for cmd in raw_cmds if isinstance(cmd, list)] if isinstance(raw_cmds, list) else [],
+        expected_artifacts={str(k): (v if isinstance(v, dict) else {}) for k, v in raw_artifacts.items()} if isinstance(raw_artifacts, dict) else {},
+        workspace_invariants=[str(x) for x in raw_invariants] if isinstance(raw_invariants, list) else [],
+        parity_checks=[p for p in raw_parity if isinstance(p, dict)] if isinstance(raw_parity, list) else [],
+        symbols={str(k): (v if isinstance(v, dict) else {}) for k, v in raw_symbols.items()} if isinstance(raw_symbols, dict) else {},
+        exit_criteria=[c for c in raw_exit if isinstance(c, dict)] if isinstance(raw_exit, list) else [],
         raw=data,
-    )
-    return contract, errors
+    ), errors
 
 
 def validate_execution_contract(plan_text: str, *, cwd: str | Path | None = None) -> dict[str, Any]:
-    """Validate the contract against the plan AST without executing it."""
+    """Validate contract shape and artifact budgets without executing commands."""
     contract, parse_errors = parse_execution_contract(plan_text)
     errors = list(parse_errors)
-
     if contract is None:
         return {
             "ok": False,
@@ -132,8 +100,17 @@ def validate_execution_contract(plan_text: str, *, cwd: str | Path | None = None
 
     if not contract.verification_commands:
         errors.append("execution contract must contain at least one verification command")
+    if len(contract.verification_commands) > MAX_CONTRACT_COMMANDS:
+        errors.append(
+            f"execution contract has {len(contract.verification_commands)} verification commands; "
+            f"maximum is {MAX_CONTRACT_COMMANDS}"
+        )
+    if len(contract.exit_criteria) > MAX_CONTRACT_COMMANDS:
+        errors.append(
+            f"execution contract has {len(contract.exit_criteria)} exit criteria; maximum is {MAX_CONTRACT_COMMANDS}"
+        )
     for cmd in contract.verification_commands:
-        if not cmd or not isinstance(cmd[0], str):
+        if not cmd or not isinstance(cmd[0], str) or not all(isinstance(x, str) for x in cmd):
             errors.append(f"invalid verification command: {cmd!r}")
             break
 
@@ -144,8 +121,9 @@ def validate_execution_contract(plan_text: str, *, cwd: str | Path | None = None
         if missing:
             errors.append(f"declared task outputs have no expected-artifact budgets: {missing}")
 
+    base = Path(cwd or Path.cwd())
     for path, budget in contract.expected_artifacts.items():
-        p = Path(cwd or Path.cwd()) / path
+        p = Path(path) if Path(path).is_absolute() else base / path
         if p.exists():
             size = p.stat().st_size
             if budget.get("min_bytes") is not None:
@@ -171,21 +149,25 @@ def validate_execution_contract(plan_text: str, *, cwd: str | Path | None = None
         functions = syms.get("functions", []) if isinstance(syms, dict) else []
         classes = syms.get("classes", []) if isinstance(syms, dict) else []
         variables = syms.get("variables", []) if isinstance(syms, dict) else []
-        if not functions and not classes and not variables:
+        # Non-Python artifacts may legitimately have an empty symbol contract.
+        if Path(path).suffix == ".py" and not functions and not classes and not variables:
             errors.append(f"symbol contract for {path} must declare at least one function, class, or variable")
 
-    return {"ok": not errors, "errors": errors, "contract": contract,
-            "declared_outputs": sorted(declared_outputs)}
+    return {
+        "ok": not errors,
+        "errors": errors,
+        "contract": contract,
+        "declared_outputs": sorted(declared_outputs),
+    }
 
 
 def _symbols_from_source(source: str) -> dict[str, set[str]]:
-    """Extract top-level module functions, classes, and variables from Python source."""
     tree = ast.parse(source)
     funcs: set[str] = set()
     classes: set[str] = set()
     vars_: set[str] = set()
 
-    def _extract_target(target):
+    def _extract_target(target: ast.AST) -> None:
         if isinstance(target, ast.Name):
             vars_.add(target.id)
         elif isinstance(target, (ast.Tuple, ast.List)):
@@ -204,13 +186,11 @@ def _symbols_from_source(source: str) -> dict[str, set[str]]:
             _extract_target(node.target)
         elif isinstance(node, ast.NamedExpr):
             _extract_target(node.target)
-
     return {"functions": funcs, "classes": classes, "variables": vars_}
 
 
 def scan_symbols(paths: list[str] | tuple[str, ...] | set[str], *,
                  cwd: str | Path | None = None) -> dict[str, dict[str, Any]]:
-    """Return actual functions/classes/variables for each existing Python file."""
     base = Path(cwd or Path.cwd())
     out: dict[str, dict[str, Any]] = {}
     for raw in paths:
@@ -230,7 +210,6 @@ def scan_symbols(paths: list[str] | tuple[str, ...] | set[str], *,
 
 
 def symbol_audit(plan_text: str, *, cwd: str | Path | None = None) -> dict[str, Any]:
-    """Compare declared symbol contracts with the actual source tree."""
     contract, parse_errors = parse_execution_contract(plan_text)
     if contract is None:
         return {"ok": False, "errors": parse_errors or ["execution contract missing"], "files": {}}
@@ -289,6 +268,46 @@ def symbol_audit(plan_text: str, *, cwd: str | Path | None = None) -> dict[str, 
     return {"ok": not errors, "errors": errors, "files": files, "contract": contract}
 
 
+def artifact_audit(contract: ExecutionContract, *, cwd: str | Path | None = None) -> dict[str, Any]:
+    """Empirically verify declared artifact existence, budgets and SHA-256 hashes."""
+    base = Path(cwd or Path.cwd())
+    errors: list[str] = []
+    artifacts: dict[str, Any] = {}
+    for raw, budget in contract.expected_artifacts.items():
+        p = Path(raw) if Path(raw).is_absolute() else base / raw
+        if not p.exists() or not p.is_file():
+            errors.append(f"{raw}: expected artifact is missing")
+            artifacts[raw] = {"exists": False}
+            continue
+        data = p.read_bytes()
+        info: dict[str, Any] = {
+            "exists": True,
+            "bytes": len(data),
+            "sha256": hashlib.sha256(data).hexdigest(),
+        }
+        try:
+            info["lines"] = len(data.decode("utf-8").splitlines())
+        except Exception:
+            info["lines"] = None
+        if budget.get("min_bytes") is not None:
+            try:
+                minimum = int(budget["min_bytes"])
+                if len(data) < minimum:
+                    errors.append(f"{raw}: actual {len(data)} bytes < min_bytes {minimum}")
+            except (TypeError, ValueError):
+                errors.append(f"{raw}: invalid min_bytes budget")
+        if budget.get("min_lines") is not None:
+            try:
+                minimum = int(budget["min_lines"])
+                lines = info["lines"] if isinstance(info["lines"], int) else 0
+                if lines < minimum:
+                    errors.append(f"{raw}: actual {lines} lines < min_lines {minimum}")
+            except (TypeError, ValueError):
+                errors.append(f"{raw}: invalid min_lines budget")
+        artifacts[raw] = info
+    return {"ok": not errors, "errors": errors, "artifacts": artifacts}
+
+
 def parse_exit_criteria(plan_text: str) -> tuple[list[dict[str, Any]], list[str]]:
     contract, errors = parse_execution_contract(plan_text)
     if contract is None:
@@ -301,32 +320,124 @@ def validate_exit_criteria(plan_text: str) -> dict[str, Any]:
     if errors:
         return {"ok": False, "errors": errors, "criteria": []}
     problems: list[str] = []
-    for c in criteria:
-        cmd = c.get("command")
-        if not isinstance(cmd, list) or not cmd or not isinstance(cmd[0], str):
+    if len(criteria) > MAX_CONTRACT_COMMANDS:
+        problems.append(f"too many exit criteria: {len(criteria)} > {MAX_CONTRACT_COMMANDS}")
+    for criterion in criteria:
+        cmd = criterion.get("command")
+        if not isinstance(cmd, list) or not cmd or not all(isinstance(x, str) for x in cmd):
             problems.append(f"invalid exit criterion command: {cmd!r}")
-        if c.get("must_contain") is not None and not isinstance(c.get("must_contain"), list):
+        if criterion.get("must_contain") is not None and not isinstance(criterion.get("must_contain"), list):
             problems.append("must_contain must be a list of strings")
-        if c.get("expected_count") is not None and not isinstance(c.get("expected_count"), int):
+        if criterion.get("expected_count") is not None and not isinstance(criterion.get("expected_count"), int):
             problems.append("expected_count must be an integer")
     return {"ok": not problems, "errors": problems, "criteria": criteria}
 
 
+def _dev_unisolated_allowed() -> bool:
+    return os.environ.get(UNISOLATED_DEV_ENV, "").strip().lower() in {"1", "true", "yes"}
+
+
+def _run_unisolated_dev(cmd: list[str], *, cwd: Path, timeout: float) -> dict[str, Any]:
+    """Explicit development-only compatibility path; never selected silently."""
+    resolved = list(cmd)
+    if resolved and resolved[0] in ("python", "python3"):
+        resolved[0] = sys.executable
+    try:
+        proc = subprocess.run(resolved, cwd=str(cwd), capture_output=True, text=True, timeout=timeout)
+        return {
+            "command": cmd,
+            "exit_code": proc.returncode,
+            "ok": proc.returncode == 0,
+            "stdout": proc.stdout[-4000:],
+            "stderr": proc.stderr[-4000:],
+            "timeout": False,
+            "isolation": "UNISOLATED_DEV_EXPLICIT",
+        }
+    except subprocess.TimeoutExpired:
+        return {"command": cmd, "exit_code": None, "ok": False, "stdout": "", "stderr": "timeout", "timeout": True, "isolation": "UNISOLATED_DEV_EXPLICIT"}
+    except (FileNotFoundError, PermissionError, OSError) as exc:
+        return {"command": cmd, "exit_code": None, "ok": False, "stdout": "", "stderr": f"command execution failed: {exc}", "timeout": False, "isolation": "UNISOLATED_DEV_EXPLICIT"}
+
+
+def run_command(cmd: list[str], *, cwd: str | Path | None = None,
+                timeout: float = 60.0) -> dict[str, Any]:
+    """Run an untrusted plan-declared argv in a strict sandbox.
+
+    The function fails closed when Bubblewrap is unavailable.  Raw host
+    execution requires the explicit development opt-in environment variable.
+    """
+    if not isinstance(cmd, list) or not cmd or not all(isinstance(x, str) for x in cmd):
+        return {"command": cmd, "exit_code": None, "ok": False, "stdout": "", "stderr": "invalid argv", "timeout": False, "isolation": "REFUSED"}
+    base = Path(cwd or Path.cwd()).resolve()
+    if _dev_unisolated_allowed():
+        return _run_unisolated_dev(cmd, cwd=base, timeout=float(timeout))
+
+    resolved = list(cmd)
+    if resolved[0] in ("python", "python3"):
+        resolved[0] = sys.executable
+    try:
+        from .runtime.sandbox import ExecutionSandbox, SecurityProfile
+        policy = SecurityProfile.get_profile("STRICT").model_copy(
+            update={"workspace_dir": str(base)}
+        )
+        sandbox = ExecutionSandbox(policy=policy)
+        result = sandbox.execute_argv_pipeline(
+            [resolved],
+            cwd=str(base),
+            timeout_seconds=float(timeout),
+        )
+        return {
+            "command": cmd,
+            "exit_code": result.returncode,
+            "ok": result.returncode == 0,
+            "stdout": result.stdout[-4000:],
+            "stderr": result.stderr[-4000:],
+            "timeout": bool(result.timeout_exceeded),
+            "isolation": "STRICT_SANDBOX",
+        }
+    except Exception as exc:
+        return {
+            "command": cmd,
+            "exit_code": None,
+            "ok": False,
+            "stdout": "",
+            "stderr": f"strict sandbox execution refused/failed: {exc}",
+            "timeout": False,
+            "isolation": "REFUSED",
+        }
+
+
+def _bounded_command_timeout(started: float, total_budget_seconds: float, per_command_timeout: float) -> float:
+    remaining = total_budget_seconds - (time.monotonic() - started)
+    return max(0.0, min(float(per_command_timeout), remaining))
+
+
 def run_exit_criteria(contract: ExecutionContract, *, cwd: str | Path | None = None,
-                      timeout: float = 60.0) -> dict[str, Any]:
-    """Run structured exit criteria and check stdout, not only exit code."""
+                      timeout: float = 60.0,
+                      total_budget_seconds: float = DEFAULT_TOTAL_COMMAND_BUDGET_SECONDS) -> dict[str, Any]:
+    """Run exit criteria under a count cap and a total wall-clock budget."""
     results: list[dict[str, Any]] = []
     errors: list[str] = []
-    for criterion in contract.exit_criteria:
+    criteria = contract.exit_criteria
+    if len(criteria) > MAX_CONTRACT_COMMANDS:
+        return {"ok": False, "errors": [f"too many exit criteria: {len(criteria)} > {MAX_CONTRACT_COMMANDS}"], "results": [], "total": len(criteria), "passed": 0, "budget_exhausted": False}
+    started = time.monotonic()
+    budget_exhausted = False
+    for criterion in criteria:
         cmd = criterion.get("command")
         if not isinstance(cmd, list) or not cmd:
             errors.append(f"invalid criterion: {criterion!r}")
             results.append({"criterion": criterion, "ok": False})
             continue
-        run = run_command(cmd, cwd=cwd, timeout=timeout)
+        call_timeout = _bounded_command_timeout(started, total_budget_seconds, timeout)
+        if call_timeout <= 0:
+            budget_exhausted = True
+            errors.append("exit-criteria total execution budget exhausted")
+            break
+        run = run_command(cmd, cwd=cwd, timeout=call_timeout)
         criterion_errors: list[str] = []
         if run.get("ok") is False:
-            criterion_errors.append(f"exit_code={run.get('exit_code')}, stderr={run.get('stderr')[:160]}")
+            criterion_errors.append(f"exit_code={run.get('exit_code')}, stderr={(run.get('stderr') or '')[:160]}")
         stdout = run.get("stdout") or ""
         for needle in (criterion.get("must_contain") or []):
             if str(needle) not in stdout:
@@ -334,33 +445,54 @@ def run_exit_criteria(contract: ExecutionContract, *, cwd: str | Path | None = N
         if criterion.get("expected_stdout") is not None and stdout.strip() != str(criterion["expected_stdout"]).strip():
             criterion_errors.append(f"stdout mismatch: {stdout[:80]!r}")
         expected_count = criterion.get("expected_count")
-        if isinstance(expected_count, int):
-            import re as _re
-            if len(_re.findall(r"\d+(?:\.\d+)?", stdout)) < expected_count:
-                criterion_errors.append(f"fewer than {expected_count} numeric outputs")
+        if isinstance(expected_count, int) and len(re.findall(r"\d+(?:\.\d+)?", stdout)) < expected_count:
+            criterion_errors.append(f"fewer than {expected_count} numeric outputs")
         ok = not criterion_errors
         if not ok:
             errors.append(f"criterion {cmd!r} failed: {'; '.join(criterion_errors)}")
-        results.append({"criterion": criterion, "run": run, "ok": ok,
-                        "errors": criterion_errors})
-    return {"ok": not errors, "errors": errors, "results": results,
-            "total": len(results), "passed": sum(bool(r["ok"]) for r in results)}
+        results.append({"criterion": criterion, "run": run, "ok": ok, "errors": criterion_errors})
+    return {
+        "ok": not errors and not budget_exhausted and len(results) == len(criteria),
+        "errors": errors,
+        "results": results,
+        "total": len(criteria),
+        "passed": sum(bool(r.get("ok")) for r in results),
+        "budget_exhausted": budget_exhausted,
+    }
 
 
 def run_verification_commands(contract: ExecutionContract, *, cwd: str | Path | None = None,
-                              timeout: float = 60.0) -> dict[str, Any]:
-    """Run every verification command declared by the contract.
-
-    The verdict is true only when all commands exit 0.
-    """
-    results = [run_command(cmd, cwd=cwd, timeout=timeout) for cmd in contract.verification_commands]
-    ok = all(r.get("ok") for r in results)
-    return {"ok": ok, "results": results, "total": len(results),
-            "passed": sum(bool(r.get("ok")) for r in results)}
+                              timeout: float = 60.0,
+                              total_budget_seconds: float = DEFAULT_TOTAL_COMMAND_BUDGET_SECONDS) -> dict[str, Any]:
+    """Run verification commands with strict isolation and aggregate bounds."""
+    commands = contract.verification_commands
+    if len(commands) > MAX_CONTRACT_COMMANDS:
+        return {"ok": False, "results": [], "total": len(commands), "passed": 0, "errors": [f"too many verification commands: {len(commands)} > {MAX_CONTRACT_COMMANDS}"], "budget_exhausted": False}
+    results: list[dict[str, Any]] = []
+    errors: list[str] = []
+    started = time.monotonic()
+    budget_exhausted = False
+    for cmd in commands:
+        call_timeout = _bounded_command_timeout(started, total_budget_seconds, timeout)
+        if call_timeout <= 0:
+            budget_exhausted = True
+            errors.append("verification-command total execution budget exhausted")
+            break
+        result = run_command(cmd, cwd=cwd, timeout=call_timeout)
+        results.append(result)
+        if not result.get("ok"):
+            errors.append(f"verification command {cmd!r} failed: {(result.get('stderr') or '')[:160]}")
+    return {
+        "ok": not errors and not budget_exhausted and len(results) == len(commands),
+        "results": results,
+        "total": len(commands),
+        "passed": sum(bool(r.get("ok")) for r in results),
+        "errors": errors,
+        "budget_exhausted": budget_exhausted,
+    }
 
 
 def parity_audit(contract: ExecutionContract, *, cwd: str | Path | None = None) -> dict[str, Any]:
-    """Execute parity checks by hashing the declared left/right artifacts."""
     base = Path(cwd or Path.cwd())
     results: list[dict[str, Any]] = []
     errors: list[str] = []
@@ -387,52 +519,40 @@ def parity_audit(contract: ExecutionContract, *, cwd: str | Path | None = None) 
         ok = lh == rh
         if not ok:
             errors.append(f"parity mismatch for {left} vs {right}")
-        results.append({"left": str(left), "right": str(right), "algorithm": algo,
-                        "left_hash": lh, "right_hash": rh, "ok": ok})
+        results.append({"left": str(left), "right": str(right), "algorithm": algo, "left_hash": lh, "right_hash": rh, "ok": ok})
     return {"ok": not errors, "errors": errors, "results": results}
-
-
-def run_command(cmd: list[str], *, cwd: str | Path | None = None,
-                timeout: float = 60.0) -> dict[str, Any]:
-    resolved = list(cmd)
-    if resolved and resolved[0] in ("python", "python3"):
-        resolved[0] = sys.executable
-    try:
-        proc = subprocess.run(resolved, cwd=str(cwd or Path.cwd()), capture_output=True,
-                              text=True, timeout=timeout)
-        return {"command": cmd, "exit_code": proc.returncode, "ok": proc.returncode == 0,
-                "stdout": proc.stdout[-4000:], "stderr": proc.stderr[-4000:],
-                "timeout": False}
-    except subprocess.TimeoutExpired:
-        return {"command": cmd, "exit_code": None, "ok": False, "stdout": "",
-                "stderr": "timeout", "timeout": True}
-    except (FileNotFoundError, PermissionError, OSError) as exc:
-        return {"command": cmd, "exit_code": None, "ok": False, "stdout": "",
-                "stderr": f"command execution failed: {exc}", "timeout": False}
 
 
 def probe_contract(plan_text: str, *, cwd: str | Path | None = None,
                    timeout: float | None = None) -> dict[str, Any]:
-    """Run the contract's minimal feasibility spike.
-
-    If the spike fails, the plan should be revised before full implementation.
-    """
+    """Run the minimal feasibility spike through the strict command runner."""
     contract, parse_errors = parse_execution_contract(plan_text)
     if contract is None:
-        return {"ok": False, "configured": False,
-                "errors": parse_errors or ["execution contract missing"], "result": None}
+        return {"ok": False, "configured": False, "errors": parse_errors or ["execution contract missing"], "result": None}
     probe = contract.probe
     if not probe or not probe.get("command"):
-        return {"ok": True, "configured": False, "error": None, "result": None,
-                "message": "no probe configured; full verification deferred"}
+        return {"ok": True, "configured": False, "error": None, "result": None, "message": "no probe configured; full verification deferred"}
     cmd = probe["command"]
-    if not isinstance(cmd, list) or not cmd:
-        return {"ok": False, "configured": True,
-                "errors": [f"invalid probe command: {cmd!r}"], "result": None}
-    result = run_command(cmd, cwd=cwd, timeout=timeout or float(probe.get("timeout_seconds", 30)))
+    if not isinstance(cmd, list) or not cmd or not all(isinstance(x, str) for x in cmd):
+        return {"ok": False, "configured": True, "errors": [f"invalid probe command: {cmd!r}"], "result": None}
+    try:
+        configured_timeout = float(probe.get("timeout_seconds", 30))
+    except (TypeError, ValueError):
+        configured_timeout = 30.0
+    result = run_command(cmd, cwd=cwd, timeout=float(timeout or configured_timeout))
     expected = str(probe.get("expected_output", "")).strip()
     matched = not expected or expected in (result.get("stdout") or "")
     ok = bool(result.get("ok")) and matched
-    errors = [] if ok else [f"probe failed (exit={result.get('exit_code')}, expected_output={'present' if expected else 'none'}, stderr={result.get('stderr')[:200]})"]
-    return {"ok": ok, "configured": True, "errors": errors, "result": result,
-            "expected_output": expected, "matched": matched, "probe": probe}
+    errors = [] if ok else [
+        f"probe failed (exit={result.get('exit_code')}, expected_output={'present' if expected else 'none'}, "
+        f"stderr={(result.get('stderr') or '')[:200]})"
+    ]
+    return {
+        "ok": ok,
+        "configured": True,
+        "errors": errors,
+        "result": result,
+        "expected_output": expected,
+        "matched": matched,
+        "probe": probe,
+    }
