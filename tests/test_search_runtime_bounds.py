@@ -71,6 +71,47 @@ async def test_already_converged_search_returns_before_any_llm_setup(tmp_path, m
     assert result["best_score"] == 99.87
     assert result["timed_out"] is False
     assert result["rollouts"] == 0
+    assert result["convergence_checks"] == {
+        "verify_ok": True,
+        "ground_ok": True,
+        "sim_ok": True,
+    }
+
+
+@pytest.mark.asyncio
+async def test_convergence_requires_grounded_feasibility(tmp_path, monkeypatch):
+    session = plan_mode.start("grounded convergence", plans_dir=tmp_path)
+    plan_mode.assess(session, PLAN, plans_dir=tmp_path)
+
+    def high_rollout(plan_text, rubric):
+        return {
+            "score": 99.87,
+            "value": 0.9987,
+            "verify_ok": True,
+            "sim_ok": True,
+            "critiques": [],
+        }
+
+    calls = []
+
+    def failed_ground_check(plan_text, *, cwd=None):
+        calls.append(cwd)
+        return {"ok": False, "verified": [], "missing": ["required.bin"]}
+
+    monkeypatch.setattr(se, "_rollout", high_rollout)
+    monkeypatch.setattr(plan_mode, "ground_check", failed_ground_check)
+
+    result = await plan_mode.search(
+        session,
+        iterations=0,
+        width=1,
+        cwd=tmp_path,
+        plans_dir=tmp_path,
+    )
+
+    assert calls == [tmp_path]
+    assert result["termination_reason"] != "already-converged"
+    assert result["convergence_checks"]["ground_ok"] is False
 
 
 @pytest.mark.asyncio
@@ -125,6 +166,36 @@ async def test_llm_search_inherits_same_model_and_thinking(tmp_path):
     assert calls[0]["thinking_profile"]["reasoning_effort"] == "high"
     assert result["implementation_model"] == "gemini-3.7-flash"
     assert result["implementation_thinking"] == calls[0]["thinking_profile"]
+
+
+@pytest.mark.asyncio
+async def test_sync_runtime_proposer_is_rejected_before_it_can_block(tmp_path):
+    session = plan_mode.start(
+        "sync proposer rejection",
+        plans_dir=tmp_path,
+        meta={"implementation_model": "model-x", "implementation_thinking": "default"},
+    )
+    plan_mode.assess(session, PLAN, plans_dir=tmp_path)
+
+    def blocking_sync_proposer(**kwargs):
+        time.sleep(5.0)
+        return [kwargs["plan_text"]], 0
+
+    started = time.monotonic()
+    with pytest.raises(ValueError, match="async"):
+        await plan_mode.search(
+            session,
+            mode="mcts",
+            expansion="llm",
+            llm_proposer=blocking_sync_proposer,
+            iterations=1,
+            width=1,
+            skip_if_converged=False,
+            plans_dir=tmp_path,
+        )
+    elapsed = time.monotonic() - started
+
+    assert elapsed < 0.5
 
 
 @pytest.mark.asyncio
