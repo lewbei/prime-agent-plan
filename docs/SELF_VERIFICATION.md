@@ -2,11 +2,13 @@
 
 ## Status
 
-This is an **optional test-time selection layer**, not an empirical truth source and not a benchmark claim.
+Self-verification is an **inherited Prime candidate-ranking behavior**, not a separate mode that callers must select. It is still not an empirical truth source and not a benchmark claim.
+
+This work is layered on the complete PR #1 runtime already merged into `main`. PR #2 therefore inherits the full Phase 0–5 architecture; its diff only shows the new verification-scaling changes relative to that merged base.
 
 It is inspired by **LLM-as-a-Verifier: A General-Purpose Verification Framework** (arXiv:2607.05391) and the public `llm-as-a-verifier/llm-as-a-verifier` implementation. The upstream project demonstrates **same-model self-verification** on Terminal-Bench 2.1: `deepseek-v4-flash` generates multiple mini-swe-agent trajectories and the same `deepseek-v4-flash` model ranks/verifies those trajectories. Their reported Best-of-5 result improves from 78.7% Pass@1 to 88.0% ± 0.6% after self-verifier selection. Those numbers belong to the upstream project and are **not Prime results**.
 
-Prime mainly uses **Gemini 3.7 Flash** for implementation, so Prime's recommended analogue is:
+Prime mainly uses **Gemini 3.7 Flash** for implementation, so Prime's inherited analogue is:
 
 ```text
 Gemini 3.7 Flash -> generate candidate implementations/plans
@@ -15,7 +17,7 @@ Prime deterministic validator -> certify or reject the selected candidate
 Prime runtime witness -> verify empirical execution effects
 ```
 
-The current Google model identifier is `gemini-3.7-flash`.
+The model identifier is `gemini-3.7-flash`.
 
 ## Why it fits Prime
 
@@ -66,14 +68,15 @@ Gemini 3.7 Flash
         execution + empirical witnessing
 ```
 
-## Recommended same-model configuration
+## Inherited same-model defaults
 
-The direct convenience API is:
+Normal selection already uses the same-model configuration; no separate `select_same_model()` call is required:
 
 ```python
 from plan_mode.self_verification import PlanSelfVerifier
 
-result = selector.select_same_model(candidate_plans)
+selector = PlanSelfVerifier(registry=registry, verifier=soft_verifier)
+result = selector.select(candidate_plans)
 ```
 
 This defaults to:
@@ -85,20 +88,11 @@ n_evaluations K:  2
 pivots:            1
 ```
 
-`K=2` and `pivots=1` match the upstream repository's Best-of-5 Terminal-Bench 2.1 self-verification reproduction settings. The model is changed from the paper/repository's `deepseek-v4-flash` to `gemini-3.7-flash` because Gemini 3.7 Flash is Prime's primary implementation model.
+`K=2` and `pivots=1` match the upstream repository's Best-of-5 Terminal-Bench 2.1 self-verification reproduction settings. The model is changed from the upstream `deepseek-v4-flash` to `gemini-3.7-flash` because Gemini 3.7 Flash is Prime's primary implementation model.
 
-For difficult work, generate **5 independent candidates** before calling `select_same_model`; for routine work, 3 candidates can be used to reduce cost. Candidate generation remains the responsibility of the agent/harness rather than this selector.
+For difficult work, the harness should generate **5 independent candidates**; for routine work, 3 candidates can reduce cost. Candidate generation remains the responsibility of the agent/harness.
 
-An explicit model can still be supplied:
-
-```python
-result = selector.select_same_model(
-    candidate_plans,
-    model="gemini-3.7-flash",
-    n_evaluations=2,
-    pivots=1,
-)
-```
+`select_same_model()` remains only as a backward-compatible alias. It is not the normal API requirement.
 
 `result.is_self_verification` records that generator and verifier model identities match. This flag is descriptive only; it does not change certification semantics.
 
@@ -116,7 +110,7 @@ vertex_client = genai.Client(vertexai=True, api_key=VERTEX_API_KEY)
 soft_verifier = ProbabilisticSelfVerifier(client=vertex_client)
 selector = PlanSelfVerifier(registry=registry, verifier=soft_verifier)
 
-result = selector.select_same_model(candidate_plans)
+result = selector.select(candidate_plans)
 ```
 
 Alternatively, configure the upstream package with `VERTEX_API_KEY` and no higher-priority incompatible verifier backend.
@@ -145,9 +139,9 @@ These criteria are advisory. A high probabilistic score cannot override a determ
 - Probabilistic verifier scores never modify `WorldFact`, `FactTruth`, authorization certificates, verifier evidence, or empirical runtime state.
 - The verifier may rank or suggest; it may not attest.
 
-## Installation
+## Installation and provider availability
 
-Core Prime does not depend on the external verifier package.
+The self-verification behavior is part of Prime's architecture, while the external probabilistic provider backend is kept as a lazy dependency so deterministic Prime still operates when provider credentials are unavailable.
 
 ```bash
 pip install -e '.[verification]'
@@ -157,4 +151,4 @@ The extra pins `llm-verifier>=0.2.0,<0.3.0` so upstream scoring API changes cann
 
 ## What we are not claiming
 
-This integration does **not** claim that Prime reproduces the paper's Terminal-Bench, SWE-Bench, robotics, or medical results. It also does not claim that Gemini 3.7 Flash necessarily achieves the same verification uplift reported for DeepSeek V4 Flash. It provides the same-model verification mechanism adapted to Prime's actual implementation model while retaining Prime's deterministic and empirical verification boundaries.
+This integration does **not** claim that Prime reproduces the paper's Terminal-Bench, SWE-Bench, robotics, or medical results. It also does not claim that Gemini 3.7 Flash necessarily achieves the same verification uplift reported for DeepSeek V4 Flash. It provides the same-model verification mechanism adapted to Prime's implementation model while retaining Prime's deterministic and empirical verification boundaries.
