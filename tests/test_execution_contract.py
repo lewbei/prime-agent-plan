@@ -1,9 +1,27 @@
-"""Tests for execution contracts, probes, and symbol audits."""
+"""Tests for execution contracts, probes, command isolation, and symbol audits."""
 from __future__ import annotations
 
 import json
+import sys
+
+import pytest
 
 import plan_mode
+from plan_mode.execution_contract import (
+    MAX_CONTRACT_COMMANDS,
+    run_command,
+    run_verification_commands,
+)
+
+
+@pytest.fixture(autouse=True)
+def _explicit_test_dev_execution(monkeypatch):
+    """Most legacy unit tests exercise parsing/output semantics, not bwrap.
+
+    Production defaults remain strict; tests that verify the secure boundary
+    explicitly remove this opt-in.
+    """
+    monkeypatch.setenv("PLAN_ALLOW_UNISOLATED_CONTRACT_COMMANDS", "1")
 
 
 def _plan_with_contract(contract: dict) -> str:
@@ -68,29 +86,28 @@ def test_invalid_contract_blocks_release_even_when_soft(tmp_path):
 def test_probe_success_and_failure(tmp_path):
     probe_file = tmp_path / "spike.py"
     probe_file.write_text("print('runner=40')\n")
-    good = _plan_with_contract({
-        "probe": {"command": ["python", "spike.py"], "expected_output": "runner=40"},
+    base = {
         "verification_commands": [["python", "spike.py"]],
         "expected_artifacts": {"runner.py": {"min_lines": 1}, "report.txt": {"min_lines": 1}},
         "symbols": {"runner.py": {"functions": ["main"], "variables": ["PROFILES"]}},
+    }
+    good = _plan_with_contract({
+        **base,
+        "probe": {"command": ["python", "spike.py"], "expected_output": "runner=40"},
     })
     res = plan_mode.probe_contract(good, cwd=tmp_path)
     assert res["ok"] is True and res["matched"] is True
 
     bad = _plan_with_contract({
+        **base,
         "probe": {"command": ["python", "spike.py"], "expected_output": "runner=999"},
-        "verification_commands": [["python", "spike.py"]],
-        "expected_artifacts": {"runner.py": {"min_lines": 1}, "report.txt": {"min_lines": 1}},
-        "symbols": {"runner.py": {"functions": ["main"], "variables": ["PROFILES"]}},
     })
     res = plan_mode.probe_contract(bad, cwd=tmp_path)
     assert res["ok"] is False
 
 
 def test_symbol_audit_detects_stub_loophole(tmp_path):
-    (tmp_path / "runner.py").write_text(
-        "def run_one():\n    return 1\n\nTOKEN = 'x'\n"
-    )
+    (tmp_path / "runner.py").write_text("def run_one():\n    return 1\n\nTOKEN = 'x'\n")
     plan = _plan_with_contract({
         "verification_commands": [["python", "-m", "pytest", "-q"]],
         "expected_artifacts": {"runner.py": {"min_lines": 1}, "report.txt": {"min_lines": 1}},
@@ -104,8 +121,7 @@ def test_symbol_audit_detects_stub_loophole(tmp_path):
 
 
 def test_assess_with_contract_and_probe_critiques(tmp_path):
-    probe_file = tmp_path / "spike.py"
-    probe_file.write_text("print('ok')\n")
+    (tmp_path / "spike.py").write_text("print('ok')\n")
     plan = _plan_with_contract({
         "probe": {"command": ["python", "spike.py"], "expected_output": "ok"},
         "verification_commands": [["python", "spike.py"]],
@@ -156,8 +172,8 @@ def test_release_requires_passed_probe(tmp_path):
     assert gate["ok"] is False
     assert any("probe" in p.lower() for p in gate["problems"])
 
+
 def test_contract_defensive_null_and_primitive_handling():
-    """Verify parse_execution_contract handles nulls and non-dict/list primitives without crashing."""
     raw_plan = """# Goal
 Goal: Test null handling.
 
@@ -176,7 +192,7 @@ Goal: Test null handling.
 }
 ```
 """
-    contract, errors = plan_mode.parse_execution_contract(raw_plan)
+    contract, _ = plan_mode.parse_execution_contract(raw_plan)
     assert contract is not None
     assert contract.probe == {}
     assert contract.verification_commands == []
@@ -184,14 +200,12 @@ Goal: Test null handling.
     assert contract.workspace_invariants == []
     assert contract.parity_checks == []
     assert contract.symbols == {}
-
     val = plan_mode.validate_execution_contract(raw_plan)
     assert val["ok"] is False
     assert any("verification command" in e for e in val["errors"])
 
 
 def test_contract_indented_markdown_fences():
-    """Verify indented markdown code fences are recognized."""
     raw_plan = """# Goal
 Goal: Test indentation.
 
@@ -207,7 +221,7 @@ Goal: Test indentation.
    }
    ```
 """
-    contract, errors = plan_mode.parse_execution_contract(raw_plan)
+    contract, _ = plan_mode.parse_execution_contract(raw_plan)
     assert contract is not None
     assert len(contract.verification_commands) == 1
     val = plan_mode.validate_execution_contract(raw_plan)
@@ -215,12 +229,11 @@ Goal: Test indentation.
 
 
 def test_contract_invalid_budget_integers(tmp_path):
-    """Verify malformed non-integer budget values do not crash."""
     (tmp_path / "a.py").write_text("x = 1\n")
     plan = _plan_with_contract({
         "verification_commands": [["python", "-V"]],
         "expected_artifacts": {"a.py": {"min_bytes": "100KB", "min_lines": "ten"}, "report.txt": {"min_lines": 1}},
-        "symbols": {"a.py": {"variables": ["x"]}}
+        "symbols": {"a.py": {"variables": ["x"]}},
     })
     val = plan_mode.validate_execution_contract(plan, cwd=tmp_path)
     assert val["ok"] is False
@@ -228,12 +241,11 @@ def test_contract_invalid_budget_integers(tmp_path):
 
 
 def test_probe_missing_binary_no_crash(tmp_path):
-    """Verify missing executable binary returns ok=False cleanly without raising FileNotFoundError."""
     plan = _plan_with_contract({
         "probe": {"command": ["non_existent_binary_xyz_12345", "--version"]},
         "verification_commands": [["python", "-V"]],
         "expected_artifacts": {"runner.py": {"min_lines": 1}, "report.txt": {"min_lines": 1}},
-        "symbols": {"runner.py": {"functions": ["main"]}}
+        "symbols": {"runner.py": {"functions": ["main"]}},
     })
     probe = plan_mode.probe_contract(plan, cwd=tmp_path)
     assert probe["ok"] is False
@@ -241,7 +253,6 @@ def test_probe_missing_binary_no_crash(tmp_path):
 
 
 def test_symbol_audit_ignores_inner_locals_and_class_methods(tmp_path):
-    """Verify local variables inside functions and class methods don't cause false positives in symbol audit."""
     src = """import sys
 
 GLOBAL_VAR = "hello"
@@ -262,19 +273,63 @@ def run():
     plan = _plan_with_contract({
         "verification_commands": [["python", "-V"]],
         "expected_artifacts": {"worker.py": {"min_lines": 1}, "report.txt": {"min_lines": 1}},
-        "symbols": {"worker.py": {"functions": ["run"], "classes": ["Worker"], "variables": ["GLOBAL_VAR"]}}
+        "symbols": {"worker.py": {"functions": ["run"], "classes": ["Worker"], "variables": ["GLOBAL_VAR"]}},
     })
     audit = plan_mode.symbol_audit(plan, cwd=tmp_path)
     assert audit["ok"] is True, audit["errors"]
 
 
 def test_symbol_audit_non_python_artifacts(tmp_path):
-    """Verify non-Python artifacts in symbol contracts don't trigger missing file false alarms."""
     (tmp_path / "config.json").write_text('{"key": "value"}\n')
     plan = _plan_with_contract({
         "verification_commands": [["python", "-V"]],
         "expected_artifacts": {"config.json": {"min_lines": 1}, "report.txt": {"min_lines": 1}},
-        "symbols": {"config.json": {"variables": []}}
+        "symbols": {"config.json": {"variables": []}},
     })
     audit = plan_mode.symbol_audit(plan, cwd=tmp_path)
     assert audit["files"]["config.json"].get("non_python") is True
+
+
+def test_plan_declared_command_cannot_escape_workspace_by_default(tmp_path, monkeypatch):
+    monkeypatch.delenv("PLAN_ALLOW_UNISOLATED_CONTRACT_COMMANDS", raising=False)
+    outside = tmp_path.parent / "prime_contract_escape.txt"
+    outside.unlink(missing_ok=True)
+    result = run_command(
+        [sys.executable, "-c", f"from pathlib import Path; Path({str(outside)!r}).write_text('escape')"],
+        cwd=tmp_path,
+        timeout=2.0,
+    )
+    assert outside.exists() is False
+    assert result["ok"] is False
+    assert result["isolation"] in {"STRICT_SANDBOX", "REFUSED"}
+
+
+def test_contract_rejects_unbounded_command_count():
+    plan = _plan_with_contract({
+        "verification_commands": [["python", "-V"] for _ in range(MAX_CONTRACT_COMMANDS + 1)],
+        "expected_artifacts": {"runner.py": {"min_lines": 1}, "report.txt": {"min_lines": 1}},
+        "symbols": {"runner.py": {"functions": ["main"]}},
+    })
+    result = plan_mode.validate_execution_contract(plan)
+    assert result["ok"] is False
+    assert any("maximum" in error for error in result["errors"])
+
+
+def test_verification_commands_have_total_wall_clock_budget(tmp_path):
+    plan = _plan_with_contract({
+        "verification_commands": [
+            ["python", "-c", "import time; time.sleep(0.05)"],
+            ["python", "-c", "import time; time.sleep(0.05)"],
+        ],
+        "expected_artifacts": {"runner.py": {"min_lines": 1}, "report.txt": {"min_lines": 1}},
+        "symbols": {"runner.py": {"functions": ["main"]}},
+    })
+    contract = plan_mode.parse_execution_contract(plan)[0]
+    result = run_verification_commands(
+        contract,
+        cwd=tmp_path,
+        timeout=0.05,
+        total_budget_seconds=0.02,
+    )
+    assert result["ok"] is False
+    assert result["budget_exhausted"] is True or any(r.get("timeout") for r in result["results"])
