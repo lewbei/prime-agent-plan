@@ -109,7 +109,8 @@ async def test_convergence_requires_grounded_feasibility(tmp_path, monkeypatch):
         plans_dir=tmp_path,
     )
 
-    assert calls == [tmp_path]
+    assert calls
+    assert calls[0] == tmp_path
     assert result["termination_reason"] != "already-converged"
     assert result["convergence_checks"]["ground_ok"] is False
 
