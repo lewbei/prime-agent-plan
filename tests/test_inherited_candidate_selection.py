@@ -1,4 +1,4 @@
-"""Integration tests for inherited self-verification in the public Prime API."""
+"""Integration tests for inherent self-verification in the public Prime API."""
 from __future__ import annotations
 
 from types import SimpleNamespace
@@ -42,11 +42,12 @@ class FakeVerifier:
         )
 
 
-def test_normal_plan_assess_candidates_inherits_gemini_self_verification(tmp_path):
+def test_normal_assess_candidates_inherits_session_implementation_model(tmp_path):
     session = plan.start(
         "choose implementation",
         plans_dir=tmp_path,
         session_id="inherited-selector",
+        meta={"implementation_model": "deepseek-v4-flash"},
     )
     verifier = FakeVerifier(selected=1)
 
@@ -59,14 +60,56 @@ def test_normal_plan_assess_candidates_inherits_gemini_self_verification(tmp_pat
 
     assert result["selection_method"] == "inherited-same-model-self-verification"
     assert result["selected_candidate"] == 1
-    assert result["generator_model"] == "gemini-3.7-flash"
-    assert result["verifier_model"] == "gemini-3.7-flash"
+    assert result["implementation_model"] == "deepseek-v4-flash"
+    assert result["generator_model"] == "deepseek-v4-flash"
+    assert result["verifier_model"] == "deepseek-v4-flash"
     assert result["is_self_verification"] is True
-    assert result["n_evaluations"] == 2
-    assert result["pivots"] == 1
-    assert verifier.calls[0]["model"] == "gemini-3.7-flash"
+    assert verifier.calls[0]["model"] == "deepseek-v4-flash"
     assert verifier.calls[0]["n_evaluations"] == 2
     assert verifier.calls[0]["pivots"] == 1
+
+
+def test_explicit_runtime_model_is_inherited_without_architecture_default(tmp_path):
+    session = plan.start(
+        "choose runtime model",
+        plans_dir=tmp_path,
+        session_id="runtime-selector",
+    )
+    verifier = FakeVerifier(selected=0)
+
+    result = plan.assess_candidates(
+        session,
+        [DRAFT_A, DRAFT_B],
+        plans_dir=tmp_path,
+        verifier=verifier,
+        implementation_model="gemini-3.7-flash",
+    )
+
+    assert result["implementation_model"] == "gemini-3.7-flash"
+    assert result["verifier_model"] == "gemini-3.7-flash"
+    assert verifier.calls[0]["model"] == "gemini-3.7-flash"
+
+
+def test_unknown_model_identity_falls_back_without_calling_verifier(tmp_path):
+    class MustNotRun:
+        def select(self, **kwargs):
+            raise AssertionError("verifier must not run when implementation model is unknown")
+
+    session = plan.start(
+        "choose unknown runtime",
+        plans_dir=tmp_path,
+        session_id="unknown-model",
+    )
+    result = plan.assess_candidates(
+        session,
+        [DRAFT_A, DRAFT_B],
+        plans_dir=tmp_path,
+        verifier=MustNotRun(),
+    )
+
+    assert result["selection_method"] == "deterministic-fallback-no-model"
+    assert result["self_verification_available"] is False
+    assert "identity unavailable" in result["self_verification_error"]
 
 
 def test_verifier_outage_inherits_pr1_deterministic_fallback(tmp_path):
@@ -78,6 +121,7 @@ def test_verifier_outage_inherits_pr1_deterministic_fallback(tmp_path):
         "choose with fallback",
         plans_dir=tmp_path,
         session_id="inherited-fallback",
+        meta={"implementation_model": "model-z"},
     )
     result = plan.assess_candidates(
         session,
@@ -87,11 +131,10 @@ def test_verifier_outage_inherits_pr1_deterministic_fallback(tmp_path):
     )
 
     assert result["selection_method"] == "deterministic-fallback"
+    assert result["implementation_model"] == "model-z"
     assert result["self_verification_available"] is False
     assert "provider unavailable" in result["self_verification_error"]
 
 
 def test_importing_plan_exposes_inherited_selector_through_plan_mode():
-    # The global Prime entrypoint patches the existing PR #1 public symbol, so
-    # callers in the same runtime do not need to choose a separate PR #2 API.
     assert plan_mode.assess_candidates is plan.assess_candidates
