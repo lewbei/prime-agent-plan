@@ -334,7 +334,7 @@ class ExecutionSandbox:
             for idx, raw_cmd in enumerate(pipeline):
                 is_first = idx == 0
                 sandboxed_cmd = self._wrap_command_with_bwrap(raw_cmd, effective_cwd)
-                stdin_source = subprocess.PIPE if (is_first and input_data) else prev_stdout
+                stdin_source = subprocess.PIPE if (is_first and input_data is not None) else prev_stdout
                 proc = subprocess.Popen(
                     sandboxed_cmd,
                     stdin=stdin_source,
@@ -352,13 +352,19 @@ class ExecutionSandbox:
 
             last_proc = processes[-1]
             first_proc = processes[0]
-            stdout_out, stderr_out = last_proc.communicate(timeout=timeout_seconds)
-            if input_data and first_proc != last_proc and first_proc.stdin:
-                try:
-                    first_proc.stdin.write(input_data)
-                    first_proc.stdin.close()
-                except Exception:
-                    pass
+
+            # Feed the head of a multi-process pipeline *before* waiting for the
+            # tail.  The previous order waited on the last process while the
+            # first process was still blocked on stdin, creating a deterministic
+            # deadlock until timeout.
+            if input_data is not None and first_proc != last_proc and first_proc.stdin:
+                first_proc.stdin.write(input_data)
+                first_proc.stdin.close()
+
+            stdout_out, stderr_out = last_proc.communicate(
+                input=input_data if (input_data is not None and first_proc == last_proc) else None,
+                timeout=timeout_seconds,
+            )
 
             duration = (time.time() - start_time) * 1000.0
             return SandboxExecutionResult(
