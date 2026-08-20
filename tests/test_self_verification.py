@@ -1,4 +1,4 @@
-"""Tests for probabilistic Best-of-N self-verification with a hard deterministic gate."""
+"""Tests for inherited probabilistic Best-of-N self-verification."""
 from __future__ import annotations
 
 from types import SimpleNamespace
@@ -37,17 +37,17 @@ def _plans() -> list[PlanIR]:
     ]
 
 
-def test_default_selection_inherits_gemini_same_model_verification_and_certifies_only_after_validator_pass():
+def test_default_select_inherits_gemini_same_model_verification():
     calls = []
 
     def fake_select(**kwargs):
         calls.append(kwargs)
         return SimpleNamespace(index=1, ranking=[1, 0], scores=[0.25, 0.91])
 
-    verifier = ProbabilisticSelfVerifier(select_fn=fake_select)
-    selector = PlanSelfVerifier(registry=_registry(), verifier=verifier)
-
-    # No model mode is selected here: same-model Gemini verification is the default.
+    selector = PlanSelfVerifier(
+        registry=_registry(),
+        verifier=ProbabilisticSelfVerifier(select_fn=fake_select),
+    )
     result = selector.select(_plans())
 
     assert result.selected_index == 1
@@ -63,7 +63,7 @@ def test_default_selection_inherits_gemini_same_model_verification_and_certifies
     assert calls[0]["pivots"] == 1
 
 
-def test_inherited_defaults_match_prime_model_and_paper_matched_verification_settings():
+def test_inherited_defaults_match_prime_model_and_paper_settings():
     calls = []
 
     def fake_select(**kwargs):
@@ -79,17 +79,12 @@ def test_inherited_defaults_match_prime_model_and_paper_matched_verification_set
     assert DEFAULT_SELF_VERIFICATION_MODEL == "gemini-3.7-flash"
     assert DEFAULT_SELF_VERIFICATION_N_EVALUATIONS == 2
     assert DEFAULT_SELF_VERIFICATION_PIVOTS == 1
-    assert result.generator_model == "gemini-3.7-flash"
-    assert result.verifier_model == "gemini-3.7-flash"
-    assert result.is_self_verification is True
     assert result.n_evaluations == 2
     assert result.pivots == 1
-    assert calls[0]["model"] == "gemini-3.7-flash"
-    assert calls[0]["n_evaluations"] == 2
-    assert calls[0]["pivots"] == 1
+    assert calls[0]["model"] == DEFAULT_SELF_VERIFICATION_MODEL
 
 
-def test_same_model_helper_remains_only_as_backward_compatible_alias():
+def test_compatibility_alias_does_not_change_default_semantics():
     def fake_select(**kwargs):
         return SimpleNamespace(index=0, ranking=[0, 1], scores=[0.9, 0.2])
 
@@ -97,10 +92,11 @@ def test_same_model_helper_remains_only_as_backward_compatible_alias():
         registry=_registry(),
         verifier=ProbabilisticSelfVerifier(select_fn=fake_select),
     )
-    result = selector.select_same_model(_plans())
-    assert result.generator_model == DEFAULT_SELF_VERIFICATION_MODEL
-    assert result.verifier_model == DEFAULT_SELF_VERIFICATION_MODEL
-    assert result.is_self_verification is True
+    normal = selector.select(_plans())
+    alias = selector.select_same_model(_plans())
+    assert normal.generator_model == alias.generator_model == DEFAULT_SELF_VERIFICATION_MODEL
+    assert normal.verifier_model == alias.verifier_model == DEFAULT_SELF_VERIFICATION_MODEL
+    assert normal.is_self_verification is alias.is_self_verification is True
 
 
 def test_deterministic_fail_candidate_is_never_sent_to_llm_selector():
