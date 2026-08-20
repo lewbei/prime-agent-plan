@@ -30,7 +30,7 @@ class BaseLLMClient(abc.ABC):
 
 
 class LiveLLMClient(BaseLLMClient):
-    """Real HTTP client connecting to Anthropic, OpenAI, DeepSeek, or Gemini."""
+    """Real HTTP client connecting to Anthropic, OpenAI, DeepSeek, Gemini, or Vertex AI."""
 
     def __init__(self, provider: str = "anthropic", model: str = "claude-3-5-sonnet-20241022", api_key: Optional[str] = None):
         self.provider = provider.lower()
@@ -103,7 +103,7 @@ class LiveLLMClient(BaseLLMClient):
                     latency_ms=dur,
                 )
 
-                elif self.provider in ("gemini", "google"):
+        elif self.provider in ("gemini", "google"):
             if not self.api_key:
                 self.api_key = os.environ.get("GEMINI_API_KEY") or os.environ.get("GOOGLE_API_KEY")
             if not self.api_key:
@@ -135,7 +135,7 @@ class LiveLLMClient(BaseLLMClient):
                     latency_ms=dur,
                 )
 
-                elif self.provider in ("vertex_ai", "vertex", "google_vertex"):
+        elif self.provider in ("vertex_ai", "vertex", "google_vertex"):
             import litellm
             model_target = self.model if self.model.startswith("vertex_ai/") else f"vertex_ai/{self.model}"
             resp = litellm.completion(
@@ -171,14 +171,10 @@ class SimulatedLLMClient(BaseLLMClient):
     def generate(self, system_prompt: str, user_prompt: str, tools: Optional[List[Dict[str, Any]]] = None) -> LLMResponse:
         start = time.perf_counter()
 
-        # Approximate real prompt tokens based on character count (~4 chars per token)
         prompt_tokens = max(1, len(system_prompt + user_prompt) // 4)
-
-        # Analyze the user instruction
         content = ""
         tool_calls = []
 
-        # Realistic simulated LLM decision logic based on prompt keywords:
         prompt_lower = user_prompt.lower()
 
         if "nginx" in prompt_lower:
@@ -242,7 +238,6 @@ class SimulatedLLMClient(BaseLLMClient):
                 "parameters": {"dir": "."},
             }]
         elif "delete" in prompt_lower and "database" in prompt_lower or "invariant" in prompt_lower:
-            # Adversarial contradictory task: A standard ungrounded LLM blindly fulfills the deletion request
             content = "I will delete db.sqlite as requested by the user."
             tool_calls = [{
                 "name": "rm_file",
@@ -256,7 +251,7 @@ class SimulatedLLMClient(BaseLLMClient):
             }]
 
         completion_tokens = max(1, len(content) // 4 + len(str(tool_calls)) // 4)
-        dur = (time.perf_counter() - start) * 1000.0 + 15.0  # realistic simulated latency ~15ms
+        dur = (time.perf_counter() - start) * 1000.0 + 15.0
 
         return LLMResponse(
             content=content,
