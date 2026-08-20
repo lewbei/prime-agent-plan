@@ -68,10 +68,10 @@ from plan_mode import (  # noqa: E402
     ExecutionPlanManager, ExecutionBackend, DEFAULT_RUBRIC,
 )
 from plan_mode.self_verification import (  # noqa: E402
-    DEFAULT_SELF_VERIFICATION_MODEL,
     DEFAULT_SELF_VERIFICATION_N_EVALUATIONS,
     DEFAULT_SELF_VERIFICATION_PIVOTS,
     ProbabilisticSelfVerifier as _ProbabilisticSelfVerifier,
+    resolve_implementation_model,
 )
 
 _deterministic_assess_candidates = assess_candidates
@@ -108,6 +108,16 @@ def _compat_ranking(checks, preferred_order=None):
     ]
 
 
+def _session_state_for_model(session, plans_dir=None):
+    if isinstance(session, dict):
+        return session
+    try:
+        pdir = Path(plans_dir) if plans_dir else DEFAULT_PLANS_DIR
+        return plan_mode._load_session(pdir, session)
+    except Exception:
+        return None
+
+
 def assess_candidates(
     session,
     drafts,
@@ -115,12 +125,16 @@ def assess_candidates(
     notes=None,
     plans_dir=None,
     verifier=None,
-    generator_model=DEFAULT_SELF_VERIFICATION_MODEL,
-    verifier_model=DEFAULT_SELF_VERIFICATION_MODEL,
+    implementation_model=None,
     n_evaluations=DEFAULT_SELF_VERIFICATION_N_EVALUATIONS,
     pivots=DEFAULT_SELF_VERIFICATION_PIVOTS,
 ):
-    """Inherited Best-of-N: PR #1 hard checks plus Gemini self-verification."""
+    """Inherited Best-of-N with model-agnostic same-model self-verification.
+
+    The model is inherited from the active implementation runtime/session. If
+    model M generated the candidates, model M verifies/ranks them. Prime never
+    silently substitutes a hard-coded Gemini, DeepSeek, or other model.
+    """
     if not drafts:
         raise ValueError("drafts must be non-empty")
     if len(drafts) == 1:
@@ -165,20 +179,36 @@ def assess_candidates(
         })
         return result
 
-    if isinstance(session, dict):
-        objective = str(session.get("objective") or "Select the best candidate plan")
+    session_state = _session_state_for_model(session, plans_dir)
+    active_model = resolve_implementation_model(
+        implementation_model,
+        session=session_state,
+    )
+    if not active_model:
+        result = _deterministic_assess_candidates(
+            session, drafts, notes=notes, plans_dir=plans_dir
+        )
+        result.update({
+            "selection_method": "deterministic-fallback-no-model",
+            "self_verification_available": False,
+            "self_verification_error": (
+                "Active implementation-model identity unavailable; no verifier model was substituted"
+            ),
+            "candidate_checks": checked,
+        })
+        return result
+
+    if isinstance(session_state, dict):
+        objective = str(session_state.get("objective") or "Select the best candidate plan")
     else:
-        try:
-            objective = str(plan_mode.status(session, plans_dir=plans_dir).get("objective") or "Select the best candidate plan")
-        except Exception:
-            objective = "Select the best candidate plan"
+        objective = "Select the best candidate plan"
 
     soft_verifier = verifier or _ProbabilisticSelfVerifier()
     try:
         soft = soft_verifier.select(
             problem=objective,
             candidates=[drafts[i] for i in eligible],
-            model=verifier_model or DEFAULT_SELF_VERIFICATION_MODEL,
+            model=active_model,
             n_evaluations=n_evaluations,
             pivots=pivots,
         )
@@ -193,12 +223,10 @@ def assess_candidates(
         result.update({
             "selection_method": "inherited-same-model-self-verification",
             "selected_candidate": chosen,
-            "generator_model": generator_model or DEFAULT_SELF_VERIFICATION_MODEL,
-            "verifier_model": verifier_model or DEFAULT_SELF_VERIFICATION_MODEL,
-            "is_self_verification": (
-                (generator_model or DEFAULT_SELF_VERIFICATION_MODEL)
-                == (verifier_model or DEFAULT_SELF_VERIFICATION_MODEL)
-            ),
+            "implementation_model": active_model,
+            "generator_model": active_model,
+            "verifier_model": active_model,
+            "is_self_verification": True,
             "n_evaluations": n_evaluations,
             "pivots": min(pivots, len(eligible)),
             "eligible_candidates": eligible,
@@ -215,6 +243,7 @@ def assess_candidates(
         )
         result.update({
             "selection_method": "deterministic-fallback",
+            "implementation_model": active_model,
             "self_verification_available": False,
             "self_verification_error": f"{type(exc).__name__}: {exc}",
             "candidate_checks": checked,
