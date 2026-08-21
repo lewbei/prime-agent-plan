@@ -94,6 +94,35 @@ def _mapped_contract(contract: Any, source: Path, snapshot: Path) -> Any:
     return mapped
 
 
+def _json_safe(value: Any) -> Any:
+    """Convert runtime result objects into deterministic JSON-compatible data."""
+    if value is None or isinstance(value, (str, int, float, bool)):
+        return value
+    if isinstance(value, Path):
+        return str(value)
+    if isinstance(value, bytes):
+        return value.hex()
+    if hasattr(value, "model_dump"):
+        try:
+            return _json_safe(value.model_dump(mode="json"))
+        except TypeError:
+            return _json_safe(value.model_dump())
+    if isinstance(value, dict):
+        return {
+            str(key): _json_safe(item)
+            for key, item in sorted(value.items(), key=lambda pair: str(pair[0]))
+        }
+    if isinstance(value, (list, tuple)):
+        return [_json_safe(item) for item in value]
+    if isinstance(value, set):
+        normalized = [_json_safe(item) for item in value]
+        return sorted(normalized, key=lambda item: canonical_json(item))
+    enum_value = getattr(value, "value", None)
+    if isinstance(enum_value, (str, int, float, bool)):
+        return enum_value
+    return repr(value)
+
+
 def _evidence_digest(result: dict[str, Any]) -> str:
     evidence = result.get("evidence")
     raw = getattr(evidence, "raw", None) if evidence is not None else None
@@ -101,10 +130,10 @@ def _evidence_digest(result: dict[str, Any]) -> str:
         "ok": bool(result.get("ok")),
         "errors": list(result.get("errors") or []),
         "warnings": list(result.get("warnings") or []),
-        "alignment": result.get("alignment"),
-        "exit_criteria": result.get("exit_criteria"),
-        "workspace_reverification": result.get("workspace_reverification"),
-        "raw_evidence": raw if isinstance(raw, dict) else None,
+        "alignment": _json_safe(result.get("alignment")),
+        "exit_criteria": _json_safe(result.get("exit_criteria")),
+        "workspace_reverification": _json_safe(result.get("workspace_reverification")),
+        "raw_evidence": _json_safe(raw) if isinstance(raw, dict) else None,
     }
     return hashlib.sha256(canonical_json(payload).encode("utf-8")).hexdigest()
 
