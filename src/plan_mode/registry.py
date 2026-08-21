@@ -169,8 +169,8 @@ class CapabilityRegistry(BaseModel):
                 f"{p.fact_key} ({p.expected_truth.value})" for p in missing
             )
             raise SchemaMismatchError(
-                f"Action '{action.action_id}' omits required {label} from capability "
-                f"'{action.capability_name}': [{rendered}]."
+                f"Action '{action.action_id}' capability contract mismatch: omits required {label} "
+                f"from capability '{action.capability_name}': [{rendered}]."
             )
 
     def validate_action(self, action: ActionIR) -> None:
