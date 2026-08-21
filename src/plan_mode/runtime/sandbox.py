@@ -3,7 +3,7 @@
 The low-level ``ExecutionSandbox`` retains an explicit development fallback for
 compatibility. Security-sensitive callers must use a fail-closed profile (the
 ``STRICT`` and ``NETWORK_ALLOWED`` profiles do so) or otherwise set
-``require_bwrap=True`` / ``allow_unisolated_fallback=False``.  Portable Python
+``require_bwrap=True`` / ``allow_unisolated_fallback=False``. Portable Python
 hooks are defense in depth only; they are never treated as a replacement for a
 kernel isolation boundary.
 """
@@ -17,7 +17,7 @@ import subprocess
 import tempfile
 import time
 from enum import Enum
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, TextIO
 
 from pydantic import BaseModel, Field
 
@@ -53,11 +53,7 @@ class SecurityProfileType(str, Enum):
 
 
 class IsolationPolicy(BaseModel):
-    """Declarative policy constraining capability and payload execution.
-
-    The model defaults are intentionally compatibility-oriented. Production
-    transaction execution is responsible for selecting a fail-closed profile.
-    """
+    """Declarative policy constraining capability and payload execution."""
 
     workspace_dir: Optional[str] = None
     allow_network: bool = False
@@ -86,11 +82,7 @@ class IsolationPolicy(BaseModel):
 
 
 class SecurityProfile:
-    """Pre-configured security policies.
-
-    STRICT and NETWORK_ALLOWED require a real Bubblewrap boundary.  Only the
-    explicitly named PERMISSIVE_DEV profile permits raw-process fallback.
-    """
+    """Pre-configured security policies."""
 
     STRICT = SecurityProfileType.STRICT
     PERMISSIVE_DEV = SecurityProfileType.PERMISSIVE_DEV
@@ -187,8 +179,6 @@ class EphemeralWorkspace:
 
 
 class SandboxExecutionResult(BaseModel):
-    """Execution telemetry and scrubbed outputs from structured execution."""
-
     stdout: str = ""
     stderr: str = ""
     returncode: int = 0
@@ -197,8 +187,6 @@ class SandboxExecutionResult(BaseModel):
     resource_limit_exceeded: bool = False
 
 
-# Python hooks are defense in depth for an explicitly allowed development
-# fallback.  Security claims never depend on these hooks.
 _NET_BLOCKER_SCRIPT = """
 import socket, builtins, os, io
 if os.environ.get("PRIME_NETWORK_DENY") == "1":
@@ -258,12 +246,10 @@ class ExecutionSandbox:
 
     @property
     def kernel_isolation_ready(self) -> bool:
-        """Whether the configured kernel isolation backend is available."""
         return bool(self.policy.use_bwrap and self._bwrap_binary)
 
     @property
     def is_fail_closed(self) -> bool:
-        """Whether the policy refuses execution without kernel isolation."""
         return bool(
             self.policy.require_bwrap
             or (self.policy.use_bwrap and not self.policy.allow_unisolated_fallback)
@@ -277,8 +263,17 @@ class ExecutionSandbox:
         timeout_seconds: float = 10.0,
         input_data: Optional[str] = None,
     ) -> SandboxExecutionResult:
+        """Run a structured pipeline with total deadline and pipefail semantics.
+
+        Intermediate stderr is redirected into temporary files rather than
+        unread OS pipes, so a verbose upstream stage cannot deadlock the
+        pipeline. The final return code is the rightmost non-zero stage code
+        (shell ``pipefail`` behavior), never merely the tail process status.
+        """
         if not pipeline:
             return SandboxExecutionResult(returncode=0)
+        if timeout_seconds <= 0:
+            return SandboxExecutionResult(stderr="Execution timeout must be > 0.", returncode=124, timeout_exceeded=True)
 
         isolation_required = self.policy.require_bwrap or not self.policy.allow_unisolated_fallback
         if isolation_required and not self.kernel_isolation_ready:
@@ -325,21 +320,34 @@ class ExecutionSandbox:
         orig_pypath = exec_env.get("PYTHONPATH", "")
         exec_env["PYTHONPATH"] = f"{hook_dir}:{orig_pypath}" if orig_pypath else hook_dir
 
-        start_time = time.time()
+        start_time = time.monotonic()
+        deadline = start_time + float(timeout_seconds)
         processes: List[subprocess.Popen] = []
+        stderr_files: List[TextIO] = []
         preexec = self._build_preexec_fn()
+
+        def remaining() -> float:
+            return max(0.001, deadline - time.monotonic())
 
         try:
             prev_stdout = None
             for idx, raw_cmd in enumerate(pipeline):
                 is_first = idx == 0
+                is_last = idx == len(pipeline) - 1
                 sandboxed_cmd = self._wrap_command_with_bwrap(raw_cmd, effective_cwd)
                 stdin_source = subprocess.PIPE if (is_first and input_data is not None) else prev_stdout
+                stderr_target: Any
+                if is_last:
+                    stderr_target = subprocess.PIPE
+                else:
+                    stderr_tmp = tempfile.TemporaryFile(mode="w+t", encoding="utf-8")
+                    stderr_files.append(stderr_tmp)
+                    stderr_target = stderr_tmp
                 proc = subprocess.Popen(
                     sandboxed_cmd,
                     stdin=stdin_source,
                     stdout=subprocess.PIPE,
-                    stderr=subprocess.PIPE,
+                    stderr=stderr_target,
                     cwd=effective_cwd,
                     env=exec_env,
                     text=True,
@@ -350,27 +358,40 @@ class ExecutionSandbox:
                     prev_stdout.close()
                 prev_stdout = proc.stdout
 
-            last_proc = processes[-1]
             first_proc = processes[0]
-
-            # Feed the head of a multi-process pipeline *before* waiting for the
-            # tail.  The previous order waited on the last process while the
-            # first process was still blocked on stdin, creating a deterministic
-            # deadlock until timeout.
+            last_proc = processes[-1]
             if input_data is not None and first_proc != last_proc and first_proc.stdin:
                 first_proc.stdin.write(input_data)
                 first_proc.stdin.close()
 
-            stdout_out, stderr_out = last_proc.communicate(
+            stdout_out, last_stderr = last_proc.communicate(
                 input=input_data if (input_data is not None and first_proc == last_proc) else None,
-                timeout=timeout_seconds,
+                timeout=remaining(),
             )
 
-            duration = (time.time() - start_time) * 1000.0
+            # Reap every upstream stage under the same total deadline. Their
+            # stdout is already consumed through the downstream pipe.
+            for proc in processes[:-1]:
+                proc.wait(timeout=remaining())
+
+            stage_codes = [int(proc.returncode or 0) for proc in processes]
+            pipefail_code = next((code for code in reversed(stage_codes) if code != 0), 0)
+
+            stderr_parts: List[str] = []
+            for idx, stderr_tmp in enumerate(stderr_files):
+                stderr_tmp.flush()
+                stderr_tmp.seek(0)
+                data = stderr_tmp.read()
+                if data:
+                    stderr_parts.append(f"[stage {idx + 1}]\n{data}")
+            if last_stderr:
+                stderr_parts.append(f"[stage {len(processes)}]\n{last_stderr}")
+
+            duration = (time.monotonic() - start_time) * 1000.0
             return SandboxExecutionResult(
                 stdout=self._truncate_and_scrub(stdout_out or ""),
-                stderr=self._truncate_and_scrub(stderr_out or ""),
-                returncode=last_proc.returncode,
+                stderr=self._truncate_and_scrub("\n".join(stderr_parts)),
+                returncode=pipefail_code,
                 duration_ms=round(duration, 2),
                 timeout_exceeded=False,
             )
@@ -378,22 +399,31 @@ class ExecutionSandbox:
             for process in processes:
                 try:
                     process.kill()
+                except Exception:
+                    pass
+            for process in processes:
+                try:
                     process.wait(timeout=1.0)
                 except Exception:
                     pass
             return SandboxExecutionResult(
                 stderr="Execution timed out and was forcefully terminated.",
                 returncode=124,
-                duration_ms=round((time.time() - start_time) * 1000.0, 2),
+                duration_ms=round((time.monotonic() - start_time) * 1000.0, 2),
                 timeout_exceeded=True,
             )
         except Exception as exc:
             return SandboxExecutionResult(
                 stderr=f"Execution error: {exc}",
                 returncode=1,
-                duration_ms=round((time.time() - start_time) * 1000.0, 2),
+                duration_ms=round((time.monotonic() - start_time) * 1000.0, 2),
             )
         finally:
+            for stderr_tmp in stderr_files:
+                try:
+                    stderr_tmp.close()
+                except Exception:
+                    pass
             if os.path.exists(hook_dir):
                 shutil.rmtree(hook_dir, ignore_errors=True)
 
@@ -425,9 +455,6 @@ class ExecutionSandbox:
         if not self.kernel_isolation_ready:
             return cmd
 
-        # Make the user namespace explicit instead of relying on Bubblewrap's
-        # implicit unprivileged-user behavior.  The process is root only inside
-        # the new user namespace and carries no host-root authority.
         bwrap_args = [
             self._bwrap_binary,
             "--unshare-user",
