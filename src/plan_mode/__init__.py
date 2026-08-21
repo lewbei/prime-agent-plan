@@ -18,8 +18,11 @@ del _impl_source
 
 from .api_hardening import install_api_hardening as _install_api_hardening
 from .api_hardening_compat import install_api_hardening_compat as _install_api_hardening_compat
+from .followup_hardening import install_followup_hardening as _install_followup_hardening
 
 _install_api_hardening(globals())
 _install_api_hardening_compat(globals())
+_install_followup_hardening(globals())
 del _install_api_hardening
 del _install_api_hardening_compat
+del _install_followup_hardening
