@@ -72,7 +72,7 @@ def _anchor_verdict(parsed: dict[str, Any], mech: dict[str, Any]) -> dict[str, A
             and parsed.get("verdict") == "go":
         parsed["verdict"] = "rework"
         parsed.setdefault("blockers", []).append(
-            "[mechanical] deterministic verification/grounding/simulation failed; verdict capped at rework"
+            "[grounding][mechanical] deterministic verification/grounding/simulation failed; verdict capped at rework"
         )
         try:
             parsed["feasibility_0_100"] = min(int(parsed.get("feasibility_0_100", 100)), 60)
@@ -111,7 +111,7 @@ def _extract_text(data: dict[str, Any]) -> str:
     text = text.strip()
     if text.startswith("```"):
         text = text.strip("`")
-    start, end = text.find("{"), text.rfind("}")
+    start, end = text.find("{") , text.rfind("}")
     if start >= 0 and end > start:
         text = text[start:end + 1]
     return text
