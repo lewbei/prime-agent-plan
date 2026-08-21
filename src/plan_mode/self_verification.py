@@ -1,10 +1,10 @@
 """Inherent same-model, same-thinking probabilistic self-verification.
 
-Inspired by LLM-as-a-Verifier (arXiv:2607.05391). Prime inherits both the
-implementation model identity and its reasoning/thinking profile for candidate
-verification. Probabilistic scores remain advisory: they never create empirical
-facts or certify execution. Certification remains Prime's deterministic/runtime
-responsibility.
+Prime never chooses the verifier transport by credential precedence.  The
+implementation model determines the provider family, the implementation
+thinking profile is preserved, individual provider requests are bounded, and
+an explicit call/concurrency budget prevents verifier scaling from turning a
+small Best-of-N decision into an unbounded network job.
 """
 from __future__ import annotations
 
@@ -22,6 +22,9 @@ from plan_mode.registry import CapabilityNotFoundError, CapabilityRegistry
 
 DEFAULT_SELF_VERIFICATION_N_EVALUATIONS = 2
 DEFAULT_SELF_VERIFICATION_PIVOTS = 1
+DEFAULT_VERIFIER_REQUEST_TIMEOUT_SECONDS = 30.0
+DEFAULT_VERIFIER_MAX_WORKERS = 16
+DEFAULT_VERIFIER_MAX_CALLS = 128
 
 IMPLEMENTATION_MODEL_META_KEYS = (
     "implementation_model",
@@ -67,10 +70,8 @@ def resolve_implementation_model(
     session: Optional[Mapping[str, Any]] = None,
     environ: Optional[Mapping[str, str]] = None,
 ) -> Optional[str]:
-    """Resolve the active implementation model without choosing one for the caller."""
     if explicit_model and str(explicit_model).strip():
         return str(explicit_model).strip()
-
     if session:
         meta = session.get("meta") if isinstance(session, Mapping) else None
         for source in (meta, session):
@@ -80,7 +81,6 @@ def resolve_implementation_model(
                 value = source.get(key)
                 if value and str(value).strip():
                     return str(value).strip()
-
     env = environ if environ is not None else os.environ
     for key in IMPLEMENTATION_MODEL_ENV_KEYS:
         value = env.get(key)
@@ -90,17 +90,8 @@ def resolve_implementation_model(
 
 
 def normalize_thinking_profile(value: Any = None) -> Dict[str, Any]:
-    """Canonicalize an implementation reasoning profile without changing it.
-
-    ``None`` means the implementation used the provider/model default. Strings
-    such as ``low``/``medium``/``high`` are represented as a level/effort.
-    Integer values are treated as exact legacy thinking budgets. Mappings may
-    carry provider-native fields such as ``thinking_level``,
-    ``reasoning_effort``, ``thinking_budget`` and ``max_tokens``.
-    """
     if value is None:
         return {"mode": "default"}
-
     if isinstance(value, Mapping):
         profile = {str(k): v for k, v in value.items() if v is not None}
         if not profile:
@@ -116,25 +107,21 @@ def normalize_thinking_profile(value: Any = None) -> Dict[str, Any]:
             if str(profile["thinking_level"]).lower() != str(profile["reasoning_effort"]).lower():
                 raise ValueError("thinking_level and reasoning_effort disagree")
         return profile
-
     if isinstance(value, bool):
-        return {"mode": "level", "thinking_level": "high" if value else "off",
-                "reasoning_effort": "high" if value else "off"}
-
+        level = "high" if value else "off"
+        return {"mode": "level", "thinking_level": level, "reasoning_effort": level}
     if isinstance(value, int):
         if value < 0:
             raise ValueError("thinking budget must be >= 0")
         return {"mode": "budget", "thinking_budget": value}
-
     raw = str(value).strip()
     if not raw or raw.lower() in {"default", "provider_default", "auto"}:
         return {"mode": "default"}
     if raw.startswith("{"):
         try:
-            decoded = json.loads(raw)
+            return normalize_thinking_profile(json.loads(raw))
         except json.JSONDecodeError as exc:
             raise ValueError("invalid JSON thinking profile") from exc
-        return normalize_thinking_profile(decoded)
     if raw.isdigit():
         return {"mode": "budget", "thinking_budget": int(raw)}
     level = raw.lower()
@@ -147,15 +134,8 @@ def resolve_implementation_thinking(
     session: Optional[Mapping[str, Any]] = None,
     environ: Optional[Mapping[str, str]] = None,
 ) -> Dict[str, Any]:
-    """Resolve the implementation thinking profile; absent metadata means default.
-
-    The same canonical profile is used for generation metadata and verifier
-    configuration. Prime never substitutes a deeper or shallower verifier
-    profile on its own.
-    """
     if explicit_thinking is not None:
         return normalize_thinking_profile(explicit_thinking)
-
     if session:
         meta = session.get("meta") if isinstance(session, Mapping) else None
         for source in (meta, session):
@@ -165,7 +145,6 @@ def resolve_implementation_thinking(
                 return normalize_thinking_profile(source.get("implementation_thinking"))
             if "thinking_profile" in source:
                 return normalize_thinking_profile(source.get("thinking_profile"))
-            # Provider-shaped metadata is also accepted.
             shaped: Dict[str, Any] = {}
             for key in ("thinking_level", "reasoning_effort", "thinking_budget", "max_tokens"):
                 if source.get(key) is not None:
@@ -174,7 +153,6 @@ def resolve_implementation_thinking(
                 return normalize_thinking_profile(shaped)
             if source.get("thinking") is not None:
                 return normalize_thinking_profile(source.get("thinking"))
-
     env = environ if environ is not None else os.environ
     for key in IMPLEMENTATION_THINKING_ENV_KEYS:
         if env.get(key) is not None:
@@ -225,25 +203,18 @@ def _apply_openai_thinking(
     out = dict(kwargs)
     extra = _strip_reasoning_overrides(out.get("extra_body"))
     out.pop("reasoning_effort", None)
-
     mode = str(profile.get("mode", "default"))
     level = profile.get("thinking_level", profile.get("reasoning_effort"))
     budget = profile.get("thinking_budget")
     max_tokens = profile.get("max_tokens")
-
     if max_tokens is not None:
         out["max_tokens"] = int(max_tokens)
-
     if mode == "default":
-        # Remove the upstream verifier's provider-specific forced thinking
-        # choices so the verifier uses the same model/provider default as an
-        # implementation that did not set a reasoning override.
         if extra:
             out["extra_body"] = extra
         else:
             out.pop("extra_body", None)
         return out
-
     if budget is not None:
         if model.lower().startswith("gemini"):
             google = dict(extra.get("google") or {})
@@ -254,11 +225,9 @@ def _apply_openai_thinking(
         raise SelfVerificationUnavailableError(
             f"backend cannot faithfully apply exact thinking_budget={budget} for model {model}"
         )
-
     if level is None:
         raise SelfVerificationUnavailableError("thinking profile has no enforceable level/effort")
     level = str(level).lower()
-
     if is_deepseek:
         if level in {"off", "none", "disabled", "minimal"}:
             extra["thinking"] = {"type": "disabled"}
@@ -268,10 +237,6 @@ def _apply_openai_thinking(
             extra["reasoning_effort"] = level
         out["extra_body"] = extra
         return out
-
-    # Recent OpenAI-compatible reasoning APIs (including Gemini OpenAI
-    # compatibility) accept reasoning_effort. If the provider rejects it, the
-    # call fails and Prime's outer deterministic fallback is used.
     out["reasoning_effort"] = level
     if extra:
         out["extra_body"] = extra
@@ -326,7 +291,6 @@ class _ModelsProxy:
         mode = str(self._profile.get("mode", "default"))
         level = self._profile.get("thinking_level", self._profile.get("reasoning_effort"))
         budget = self._profile.get("thinking_budget")
-
         try:
             if mode == "default":
                 replacement = thinking_type()
@@ -344,7 +308,6 @@ class _ModelsProxy:
             raise SelfVerificationUnavailableError(
                 f"native Gemini client cannot apply inherited thinking profile: {exc}"
             ) from exc
-
         updates: Dict[str, Any] = {"thinking_config": replacement}
         if self._profile.get("max_tokens") is not None:
             updates["max_output_tokens"] = int(self._profile["max_tokens"])
@@ -361,8 +324,6 @@ class _ModelsProxy:
 
 
 class _ThinkingClientProxy:
-    """Proxy that replaces upstream verifier thinking overrides with the implementation profile."""
-
     def __init__(self, client: Any, profile: Mapping[str, Any], model: str):
         self._client = client
         self._profile = dict(profile)
@@ -385,6 +346,95 @@ def _wrap_client_for_thinking(client: Any, profile: Mapping[str, Any], model: st
     )
 
 
+def _model_family(model: str) -> str:
+    lower = model.lower()
+    if lower.startswith("deepseek"):
+        return "deepseek"
+    if lower.startswith("gemini"):
+        return "gemini"
+    return "openai_compatible"
+
+
+def _create_model_family_client(model: str, request_timeout_seconds: float) -> Any:
+    """Construct only a transport capable of serving *model*; never use key precedence."""
+    family = _model_family(model)
+    timeout = float(request_timeout_seconds)
+    if timeout <= 0:
+        raise ValueError("request_timeout_seconds must be > 0")
+
+    if family == "deepseek":
+        key = os.environ.get("DEEPSEEK_API_KEY", "").strip()
+        if not key:
+            raise SelfVerificationUnavailableError("DEEPSEEK_API_KEY is required for a DeepSeek implementation model")
+        try:
+            from openai import OpenAI  # type: ignore
+        except ImportError as exc:  # pragma: no cover
+            raise SelfVerificationUnavailableError("openai client dependency unavailable") from exc
+        client = OpenAI(
+            api_key=key,
+            base_url="https://api.deepseek.com",
+            timeout=timeout,
+            max_retries=0,
+        )
+        client._llm_verifier_model = model
+        client._llm_verifier_deepseek = True
+        return client
+
+    if family == "gemini":
+        key = os.environ.get("VERTEX_API_KEY", "").strip()
+        if not key:
+            raise SelfVerificationUnavailableError(
+                "VERTEX_API_KEY is required for Gemini self-verification because token logprobs require Vertex AI"
+            )
+        try:
+            from google import genai  # type: ignore
+            from google.genai import types  # type: ignore
+            http_options = types.HttpOptions(timeout=max(1, int(timeout * 1000)))
+            return genai.Client(vertexai=True, api_key=key, http_options=http_options)
+        except Exception as exc:  # pragma: no cover - optional provider dependency
+            raise SelfVerificationUnavailableError(
+                f"could not create bounded Gemini/Vertex verifier client: {exc}"
+            ) from exc
+
+    base_url = os.environ.get("OPENAI_BASE_URL", "").strip() or None
+    key = os.environ.get("OPENAI_API_KEY", "").strip()
+    if not key and base_url is None:
+        raise SelfVerificationUnavailableError(
+            "OPENAI_API_KEY or OPENAI_BASE_URL is required for an OpenAI-compatible implementation model"
+        )
+    try:
+        from openai import OpenAI  # type: ignore
+    except ImportError as exc:  # pragma: no cover
+        raise SelfVerificationUnavailableError("openai client dependency unavailable") from exc
+    kwargs: Dict[str, Any] = {
+        "api_key": key or "EMPTY",
+        "timeout": timeout,
+        "max_retries": 0,
+    }
+    if base_url:
+        kwargs["base_url"] = base_url
+    client = OpenAI(**kwargs)
+    client._llm_verifier_model = model
+    return client
+
+
+def _validate_client_family(client: Any, model: str) -> None:
+    family = _model_family(model)
+    if family == "deepseek" and not bool(getattr(client, "_llm_verifier_deepseek", False)):
+        raise SelfVerificationUnavailableError("DeepSeek model was paired with a non-DeepSeek verifier transport")
+    if family == "gemini" and not hasattr(client, "models"):
+        raise SelfVerificationUnavailableError("Gemini model was paired with a non-Gemini verifier transport")
+    if family == "openai_compatible" and not hasattr(client, "chat"):
+        raise SelfVerificationUnavailableError("OpenAI-compatible model was paired with an incompatible verifier transport")
+
+
+def _estimated_verifier_calls(candidate_count: int, criteria_count: int, n_evaluations: int, pivots: int) -> int:
+    # Conservative upper bound for ring pass plus pivot rounds, before each
+    # directed pair is expanded over criteria and repeated evaluations.
+    pair_upper = candidate_count + candidate_count * min(pivots, candidate_count)
+    return pair_upper * criteria_count * n_evaluations
+
+
 class ProbabilisticSelection(BaseModel):
     selected_index: int
     ranking: List[int] = Field(default_factory=list)
@@ -393,6 +443,7 @@ class ProbabilisticSelection(BaseModel):
     thinking_profile: Dict[str, Any] = Field(default_factory=dict)
     n_evaluations: int = DEFAULT_SELF_VERIFICATION_N_EVALUATIONS
     pivots: int = DEFAULT_SELF_VERIFICATION_PIVOTS
+    estimated_calls: int = 0
 
 
 class PlanSelfVerificationResult(BaseModel):
@@ -434,14 +485,8 @@ class ProbabilisticSelfVerifier:
         return llm_verifier.select
 
     @staticmethod
-    def _create_upstream_client() -> Any:
-        try:
-            from llm_verifier.fine_grained_reward import create_client  # type: ignore
-        except ImportError as exc:  # pragma: no cover
-            raise SelfVerificationUnavailableError(
-                "llm-verifier client factory unavailable"
-            ) from exc
-        return create_client()
+    def _create_upstream_client(model: str, request_timeout_seconds: float) -> Any:
+        return _create_model_family_client(model, request_timeout_seconds)
 
     def select(
         self,
@@ -454,6 +499,9 @@ class ProbabilisticSelfVerifier:
         n_evaluations: int = DEFAULT_SELF_VERIFICATION_N_EVALUATIONS,
         pivots: int = DEFAULT_SELF_VERIFICATION_PIVOTS,
         client: Any = None,
+        request_timeout_seconds: float = DEFAULT_VERIFIER_REQUEST_TIMEOUT_SECONDS,
+        max_workers: int = DEFAULT_VERIFIER_MAX_WORKERS,
+        max_verifier_calls: int = DEFAULT_VERIFIER_MAX_CALLS,
     ) -> ProbabilisticSelection:
         if not candidates:
             raise ValueError("Best-of-N verification requires at least one candidate")
@@ -461,34 +509,55 @@ class ProbabilisticSelfVerifier:
             raise SelfVerificationUnavailableError(
                 "Active implementation-model identity is unavailable; refusing to choose a different verifier model"
             )
-        if n_evaluations < 1:
-            raise ValueError("n_evaluations must be >= 1")
-        if pivots < 1:
-            raise ValueError("pivots must be >= 1")
+        if n_evaluations < 1 or pivots < 1:
+            raise ValueError("n_evaluations and pivots must be >= 1")
+        if max_workers < 1 or max_verifier_calls < 1:
+            raise ValueError("verifier worker/call budgets must be >= 1")
 
         verifier_model = str(model).strip()
         profile = normalize_thinking_profile(thinking_profile)
+        criterion_map = criteria or DEFAULT_VERIFICATION_CRITERIA
+        estimated_calls = _estimated_verifier_calls(
+            len(candidates), len(criterion_map), n_evaluations, pivots
+        )
+        if estimated_calls > max_verifier_calls:
+            raise SelfVerificationUnavailableError(
+                f"self-verification would require up to {estimated_calls} calls, exceeding budget {max_verifier_calls}"
+            )
+
         select_fn = self._resolve_select_fn()
         kwargs: Dict[str, Any] = {
             "problem": problem,
             "candidates": candidates,
-            "criteria": criteria or DEFAULT_VERIFICATION_CRITERIA,
+            "criteria": criterion_map,
             "model": verifier_model,
             "n_evaluations": n_evaluations,
             "pivots": min(pivots, len(candidates)),
         }
 
-        if self._select_fn is not None:
-            selected_client = client if client is not None else self._client
+        selected_client = client if client is not None else self._client
+        if self._select_fn is None:
+            if selected_client is None:
+                selected_client = self._create_upstream_client(
+                    verifier_model, request_timeout_seconds
+                )
+            _validate_client_family(selected_client, verifier_model)
+            kwargs["client"] = _wrap_client_for_thinking(selected_client, profile, verifier_model)
+            if _callable_accepts_keyword(select_fn, "max_workers"):
+                kwargs["max_workers"] = min(max_workers, max(1, estimated_calls))
+            if _callable_accepts_keyword(select_fn, "on_error"):
+                kwargs["on_error"] = "raise"
+            if _callable_accepts_keyword(select_fn, "progress"):
+                kwargs["progress"] = False
+        else:
             if selected_client is not None:
                 kwargs["client"] = _wrap_client_for_thinking(selected_client, profile, verifier_model)
             if _callable_accepts_keyword(select_fn, "thinking_profile"):
                 kwargs["thinking_profile"] = dict(profile)
-        else:
-            selected_client = client if client is not None else self._client
-            if selected_client is None:
-                selected_client = self._create_upstream_client()
-            kwargs["client"] = _wrap_client_for_thinking(selected_client, profile, verifier_model)
+            if _callable_accepts_keyword(select_fn, "max_workers"):
+                kwargs["max_workers"] = min(max_workers, max(1, estimated_calls))
+            if _callable_accepts_keyword(select_fn, "on_error"):
+                kwargs["on_error"] = "raise"
 
         raw = select_fn(**kwargs)
         selected_index = int(getattr(raw, "index", getattr(raw, "selected_index", -1)))
@@ -498,8 +567,7 @@ class ProbabilisticSelfVerifier:
         ranking = [int(i) for i in raw_ranking] if raw_ranking else [selected_index]
         if any(i < 0 or i >= len(candidates) for i in ranking):
             raise ValueError("Verifier returned an out-of-range ranking index")
-        raw_scores = list(getattr(raw, "scores", []))
-        scores = [float(score) for score in raw_scores]
+        scores = [float(score) for score in list(getattr(raw, "scores", []))]
         if scores and len(scores) != len(candidates):
             raise ValueError("Verifier score vector length does not match candidate count")
         return ProbabilisticSelection(
@@ -510,6 +578,7 @@ class ProbabilisticSelfVerifier:
             thinking_profile=dict(profile),
             n_evaluations=n_evaluations,
             pivots=min(pivots, len(candidates)),
+            estimated_calls=estimated_calls,
         )
 
 
@@ -579,7 +648,6 @@ class PlanSelfVerifier:
         )
         if verifier_model and effective_model and verifier_model != effective_model:
             raise ValueError("inherent self-verification requires verifier_model == implementation model")
-        effective_verifier_model = effective_model
         effective_thinking = resolve_implementation_thinking(
             implementation_thinking if implementation_thinking is not None else self.implementation_thinking
         )
@@ -594,7 +662,7 @@ class PlanSelfVerifier:
                 is_certified=False,
                 requires_rework=True,
                 generator_model=effective_model,
-                verifier_model=effective_verifier_model,
+                verifier_model=effective_model,
                 generator_thinking=dict(effective_thinking),
                 verifier_thinking=dict(effective_thinking),
                 is_self_verification=bool(effective_model),
@@ -662,7 +730,6 @@ class PlanSelfVerifier:
         n_evaluations: int = DEFAULT_SELF_VERIFICATION_N_EVALUATIONS,
         pivots: int = DEFAULT_SELF_VERIFICATION_PIVOTS,
     ) -> PlanSelfVerificationResult:
-        """Compatibility alias; normal ``select`` already inherits model + thinking."""
         return self.select(
             candidates,
             goal_description=goal_description,
