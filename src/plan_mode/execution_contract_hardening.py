@@ -41,6 +41,8 @@ def install_execution_contract_hardening(ns: MutableMapping[str, Any]) -> None:
             except ValueError as exc:
                 errors.append(f"{kind} {text!r}: {exc}")
 
+        # These paths are dereferenced by contract validation/auditing and must
+        # never turn a plan-authored string into an arbitrary host-file read.
         for raw in getattr(contract, "expected_artifacts", {}).keys():
             check("expected artifact", raw)
         for raw in getattr(contract, "symbols", {}).keys():
@@ -52,15 +54,14 @@ def install_execution_contract_hardening(ns: MutableMapping[str, Any]) -> None:
                 if item.get("right"):
                     check("parity right", item["right"])
 
+        # Declared outputs are also release/audit targets and therefore belong
+        # to the execution workspace. Read-only environment inputs are not
+        # constrained here; grounding and sandbox policy govern those separately.
         if plan_text:
             ast_tree = ns["PlanParser"].parse_plan(plan_text)
             for action in ast_tree.actions:
                 for raw in action.outputs:
                     check(f"task {action.id} output", raw)
-                for raw in action.inputs:
-                    # Internal and environmental artifacts are still contract
-                    # paths once an execution workspace is selected.
-                    check(f"task {action.id} input", raw)
         return errors
 
     def validate_execution_contract(plan_text: str, *, cwd: str | Path | None = None) -> dict[str, Any]:
