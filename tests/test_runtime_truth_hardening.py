@@ -187,7 +187,7 @@ def test_public_assess_reports_dirty_max_round_stop_as_plateaued(tmp_path):
     session = plan.start("dirty convergence regression", plans_dir=tmp_path, max_rounds=1)
     result = plan.assess(
         session,
-        "# Goal\nGoal: x.\n\n## Tasks\n1. Maybe do something. Output: out.txt.\n",
+        "# Goal\nGoal: x.\n\n## Tasks\n1. Maybe do something. Inputs: missing.bin. Output: out.txt.\n",
         plans_dir=tmp_path,
     )
     assert result["status"] == "plateaued"
