@@ -9,73 +9,15 @@ from __future__ import annotations
 import asyncio
 import copy
 import inspect
-import time
 from pathlib import Path
 from typing import Any, MutableMapping
 
 
 def install_followup_hardening(ns: MutableMapping[str, Any]) -> None:
-    _harden_authorization()
     _harden_execution_trace()
     _harden_provider_judges()
     _harden_cordis(ns)
     _harden_release_judge_binding(ns)
-
-
-def _harden_authorization() -> None:
-    from .epistemic_validator import CausalValidator, ValidationStatus
-    from .session import PlanningSession, StateDriftError
-
-    original = PlanningSession.authorize_selected
-    if getattr(original, "_pr5_hardened", False):
-        return
-
-    def authorize_selected(self: PlanningSession, registry: Any, policy_hash: str,
-                           ttl_seconds: float = 60.0,
-                           isolation_policy_hash: str | None = None):
-        version_number = self.best_candidate_version
-        if version_number is not None and version_number in self.versions:
-            version = self.versions[version_number]
-            live_hash = version.plan_ir.compute_hash()
-            if live_hash != version.plan_hash:
-                raise StateDriftError(
-                    "Plan semantics changed after validation; revalidate before authorization."
-                )
-
-            # Authorization must not bless a registry that differs semantically
-            # from the one under which the candidate was checked. Re-run the
-            # closed-world capability contracts and causal validator against the
-            # stored trusted snapshot immediately before issuing a certificate.
-            try:
-                for action in version.plan_ir.actions:
-                    registry.validate_action(action)
-            except Exception as exc:
-                raise StateDriftError(
-                    f"Capability registry/contract changed after validation: {exc}"
-                ) from exc
-
-            revalidated = CausalValidator().validate_plan(
-                version.plan_ir,
-                registry=registry,
-                observed_world_state=version.validation_world_state,
-                current_time=time.time(),
-            )
-            if revalidated.status != ValidationStatus.PASS:
-                raise StateDriftError(
-                    "Validated plan is no longer PASS at authorization time; "
-                    f"status={revalidated.status.value}."
-                )
-
-        return original(
-            self,
-            registry,
-            policy_hash,
-            ttl_seconds=ttl_seconds,
-            isolation_policy_hash=isolation_policy_hash,
-        )
-
-    authorize_selected._pr5_hardened = True  # type: ignore[attr-defined]
-    PlanningSession.authorize_selected = authorize_selected  # type: ignore[assignment]
 
 
 def _harden_execution_trace() -> None:
@@ -117,6 +59,7 @@ def _harden_provider_judges() -> None:
     async def evaluate(self: BaseLLMJudge, plan_ir: Any, goal_description: str = "",
                        registry: Any = None, observed_world_state: Any = None,
                        timeout: float = 30.0):
+        import time
         t0 = time.time()
         if timeout <= 0:
             return self._unknown(
