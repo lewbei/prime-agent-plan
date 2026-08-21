@@ -81,11 +81,19 @@ def test_validate_action_success(sample_registry: CapabilityRegistry):
         action_id="act_01",
         capability_name="fs.create_file",
         parameters={"path": "/tmp/test.txt", "content": "hello world"},
-        preconditions=[],
-        positive_effects=[],
+        preconditions=[
+            PredicateCondition(predicate="parent_dir_exists", args=["/tmp/test.txt"])
+        ],
+        positive_effects=[
+            PredicateCondition(
+                predicate="file_exists",
+                args=["/tmp/test.txt"],
+                expected_truth=FactTruth.VERIFIED_TRUE,
+            )
+        ],
         provenance=prov,
     )
-    # Should not raise
+    # Should not raise: the action now carries the complete instantiated contract.
     sample_registry.validate_action(action)
 
 

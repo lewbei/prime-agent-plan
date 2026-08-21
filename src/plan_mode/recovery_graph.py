@@ -14,13 +14,10 @@ n2: {write_operations, read_operations}
 n3: {apps_name}
 n4: {write_reversible, write_not_reversible}
 n5: {action, arguments}
-
-This implementation is deterministic. An optional `policy` callable can be
-injected later for the learned small-model specialisation described in the
-paper.
 """
 from __future__ import annotations
 
+from copy import deepcopy
 from dataclasses import dataclass, field
 from typing import Any, Callable, Optional
 
@@ -43,14 +40,14 @@ class DriftEvidence:
 
 @dataclass
 class RecoveryDecision:
-    action: str            # retry | rewind | replan | abort
+    action: str
     node_path: list[str]
     arguments: dict[str, Any] = field(default_factory=dict)
     reason: str = ""
 
 
 def classify_drift(evidence: DriftEvidence, *, policy: Optional[Callable[[DriftEvidence], dict[str, Any]]] = None) -> dict[str, Any]:
-    """Node n1: alignment classification."""
+    """Node n1: alignment classification on caller-owned or copied evidence."""
     if policy is not None:
         out = policy(evidence)
         if isinstance(out, dict):
@@ -67,12 +64,14 @@ def classify_drift(evidence: DriftEvidence, *, policy: Optional[Callable[[DriftE
 
 def recovery_decision(evidence: DriftEvidence, *, K: int = 2,
                       policy: Optional[Callable[[DriftEvidence], dict[str, Any]]] = None) -> RecoveryDecision:
-    """Route evidence through n1..n5 and return the terminal recovery action."""
+    """Route evidence through n1..n5 without mutating caller-owned evidence."""
     path: list[str] = []
     aligned_streak: list[bool] = []
-    current = evidence
+    current = deepcopy(evidence)
     current.step = max(1, int(current.step))
     current.suspected_onset = max(1, int(current.suspected_onset))
+    starting_step = current.step
+    onset = current.suspected_onset
 
     for _ in range(max(1, current.step - current.suspected_onset + 1) + 3):
         n1 = classify_drift(current, policy=policy)
@@ -81,24 +80,22 @@ def recovery_decision(evidence: DriftEvidence, *, K: int = 2,
         if not n1.get("is_aligned"):
             if not current.write_operations:
                 path.append("n2")
-                current.step -= 1
+                current.step = max(onset, current.step - 1)
                 continue
-            path.append("n2")
-            path.append("n3")
-            path.append("n4")
+            path.extend(["n2", "n3", "n4"])
             break
         if len(aligned_streak) >= K and all(aligned_streak[-K:]):
             break
-        current.step -= 1
+        current.step = max(onset, current.step - 1)
 
     path.append("n5")
-    if evidence.write_not_reversible and evidence.risk >= 0.5:
-        action = "rewind" if evidence.checkpoint_available else "abort"
+    if current.write_not_reversible and current.risk >= 0.5:
+        action = "rewind" if current.checkpoint_available else "abort"
         reason = "non-reversible writes with high drift risk"
-    elif evidence.risk >= 0.5:
+    elif current.risk >= 0.5:
         action = "replan"
         reason = "high drift risk despite reversible writes"
-    elif evidence.write_operations:
+    elif current.write_operations:
         action = "retry"
         reason = "drift is reversible and risk is bounded"
     else:
@@ -108,15 +105,18 @@ def recovery_decision(evidence: DriftEvidence, *, K: int = 2,
     return RecoveryDecision(
         action=action,
         node_path=path,
-        arguments={"step": evidence.step, "onset": evidence.suspected_onset,
-                   "apps_name": evidence.apps_name, "K": K},
+        arguments={
+            "step": starting_step,
+            "audited_step": current.step,
+            "onset": onset,
+            "apps_name": current.apps_name,
+            "K": K,
+        },
         reason=reason,
     )
 
 
 class RecoveryGraph:
-    """Public wrapper around the paper's five-node recovery graph."""
-
     def __init__(self, K: int = 2, policy: Optional[Callable[[DriftEvidence], dict[str, Any]]] = None):
         self.K = K
         self.policy = policy

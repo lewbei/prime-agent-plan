@@ -1,7 +1,6 @@
 """Tests for Planning Session, State Machine, Immutable Plan Versions, and Authorization Certificates."""
 
 import pytest
-import time
 from plan_mode.ir import (
     FactTruth,
     Provenance,
@@ -12,7 +11,8 @@ from plan_mode.ir import (
     PlanIR,
 )
 from plan_mode.registry import CapabilityEntry, CapabilityRegistry
-from plan_mode.causal_validator import CausalValidator
+from plan_mode.runtime import EvidenceLedger, TransactionOutcome, TransactionalExecutionManager
+from plan_mode.runtime.sandbox import ExecutionSandbox, IsolationPolicy
 from plan_mode.session import (
     SessionState,
     PlanVersion,
@@ -35,7 +35,14 @@ def mock_registry() -> CapabilityRegistry:
             description="Test action",
             input_schema={"msg": {"type": "str", "required": True}},
             positive_effects=[PredicateCondition(predicate="task_done", args=[])],
-            verifiers=[ObservationVerifier(verifier_id="v_done", predicate="task_done")],
+            verifiers=[
+                ObservationVerifier(
+                    verifier_id="v_done",
+                    predicate="task_done",
+                    command_template=["true"],
+                )
+            ],
+            executor_command_template=["true"],
         )
     )
     return reg
@@ -88,9 +95,25 @@ def test_session_lifecycle_happy_path(valid_plan: PlanIR, mock_registry: Capabil
     session.start_execution(mock_registry, policy_hash="policy_v1")
     assert session.current_state == SessionState.EXECUTING
 
-    # Phase 3: execution evidence must be bound before commit.
-    session.record_execution_result(True, valid_plan.initial_state)
-    session.commit_execution(live_world_state=valid_plan.initial_state)
+    sandbox = ExecutionSandbox(
+        IsolationPolicy(
+            use_bwrap=False,
+            require_bwrap=False,
+            allow_unisolated_fallback=True,
+            read_only_root=False,
+        )
+    )
+    manager = TransactionalExecutionManager(
+        session=session,
+        registry=mock_registry,
+        ledger=EvidenceLedger(session_id=session.session_id),
+        observed_world_state=valid_plan.initial_state,
+        policy_hash="policy_v1",
+        sandbox=sandbox,
+        allow_insecure_test_sandbox=True,
+    )
+    summary = manager.execute_and_finalize(cert)
+    assert summary.outcome == TransactionOutcome.COMMITTED
     assert session.current_state == SessionState.COMMITTED
     assert session.committed_version == 1
 
