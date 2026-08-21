@@ -12,10 +12,10 @@ import plan
 import plan_mode
 
 
-def test_public_run_uses_hardened_assess_status(tmp_path):
+def test_public_run_marks_hard_invalid_stop_as_plateaued(tmp_path):
     session = plan.run(
         "dirty run wrapper",
-        "# Goal\nGoal: x.\n\n## Tasks\n1. Maybe do it. Output: out.txt.\n",
+        "# Goal\nGoal: x.\n\n## Tasks\n1. Maybe do it. Inputs: missing.bin. Output: out.txt.\n",
         plans_dir=tmp_path,
         max_rounds=1,
     )
@@ -87,11 +87,11 @@ def test_local_search_mutations_are_stable_across_hash_seeds(tmp_path):
     assert outputs[0] == outputs[1]
 
 
-def test_importing_plan_does_not_replace_unrelated_plan_mode_entrypoints():
-    # assess_candidates is the one intentional alias. Other core functions stay
-    # owned by plan_mode, avoiding import-order-dependent test/runtime behavior.
-    assert plan_mode.assess is not plan.assess
-    assert plan_mode.release is not plan.release
-    assert plan_mode.finish is not plan.finish
-    assert plan_mode.execute_plan is not plan.execute_plan
+def test_importing_plan_preserves_public_plan_mode_identity_contract():
+    assert plan_mode.assess is plan.assess
+    assert plan_mode.run is plan.run
+    assert plan_mode.release is plan.release
+    assert plan_mode.finish is plan.finish
+    assert plan_mode.execute_plan is plan.execute_plan
+    assert plan_mode.execute_plan_sync is plan.execute_plan_sync
     assert plan_mode.assess_candidates is plan.assess_candidates
