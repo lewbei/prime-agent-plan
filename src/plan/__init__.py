@@ -1,10 +1,10 @@
 """Public, fail-closed Plan Mode entrypoint.
 
-``plan_mode`` remains the implementation package.  This module re-exports its
-public API and strengthens the user-facing convergence/release/execution paths
-without replacing unrelated ``plan_mode`` functions at import time.  The sole
-intentional alias installed back onto ``plan_mode`` is ``assess_candidates`` —
-matching the established same-model/same-thinking integration contract.
+``plan_mode`` remains the implementation package. This module re-exports its
+public API and strengthens the convergence/release/execution paths. Hardened
+wrappers are deliberately installed back onto ``plan_mode`` for the affected
+public symbols so ``plan`` and ``plan_mode`` continue to expose identical
+callable objects, preserving the package's established API identity contract.
 """
 from __future__ import annotations
 
@@ -42,7 +42,7 @@ from plan_mode.self_verification import (
     resolve_implementation_thinking,
 )
 
-# Re-export the implementation package's declared public API first.  Hardened
+# Re-export the implementation package's declared public API first. Hardened
 # wrappers defined below intentionally replace selected names in this module.
 for _public_name in getattr(plan_mode, "__all__", []):
     if hasattr(plan_mode, _public_name):
@@ -548,7 +548,14 @@ def _stable_search_mutations(plan_text, width, critiques=None):
 # stable SHA-256-derived seed for the exact same mutation library.
 _search_engine._mutations = _stable_search_mutations
 
-# Preserve the already-established identity invariant used by callers/tests.
+# Preserve the package's public identity contract. Only the affected hardened
+# public callables are replaced; unrelated plan_mode behavior remains intact.
+plan_mode.assess = assess
+plan_mode.run = run
+plan_mode.release = release
+plan_mode.finish = finish
+plan_mode.execute_plan = execute_plan
+plan_mode.execute_plan_sync = execute_plan_sync
 plan_mode.assess_candidates = assess_candidates
 
 __all__ = list(getattr(plan_mode, "__all__", []))
