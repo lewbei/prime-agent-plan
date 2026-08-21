@@ -4,7 +4,6 @@ from __future__ import annotations
 import copy
 import hashlib
 import hmac
-import json
 import secrets
 from typing import Any
 
@@ -190,9 +189,14 @@ def install_observation_attestation_closure() -> None:
         transaction_id = ACTIVE_TRANSACTION_ID.get()
         workspace_identity = ACTIVE_WORKSPACE_ID.get()
         certificate = self.authorization_certificate
-        blockers: list[str] = []
+
+        # Preserve the authoritative transaction-only gate and its public error
+        # semantics. The wrapped commit rejects this call before any attestation
+        # logic can be mistaken for the primary authorization boundary.
         if not transaction_id or not workspace_identity or certificate is None:
-            blockers.append("runtime observation attestation context is missing")
+            raw_commit(self, live_world_state=live_world_state)
+            return
+
         if live_world_state is None:
             facts = []
         elif isinstance(live_world_state, dict):
@@ -200,8 +204,9 @@ def install_observation_attestation_closure() -> None:
         else:
             facts = list(live_world_state)
         fact_map = {fact.fact_key: fact for fact in facts}
+        blockers: list[str] = []
 
-        if certificate is not None and self.authorized_version is not None:
+        if self.authorized_version is not None:
             plan = self.versions[self.authorized_version].plan_ir
             for criterion in plan.success_criteria:
                 if not criterion.is_mandatory:
@@ -211,8 +216,8 @@ def install_observation_attestation_closure() -> None:
                     continue  # the canonical commit gate reports the missing fact
                 if not _verify_fact_attestation(
                     fact,
-                    transaction_id=transaction_id or "",
-                    workspace_identity=workspace_identity or "",
+                    transaction_id=transaction_id,
+                    workspace_identity=workspace_identity,
                     certificate_id=certificate.certificate_id,
                     plan_hash=certificate.plan_hash,
                 ):

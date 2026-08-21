@@ -19,15 +19,6 @@ def install_public_release_closure(ns: MutableMapping[str, Any]) -> None:
             return session
         return ns["_load_session"](plans_dir_for(session, plans_dir), session)
 
-    def best_plan_text(state: dict[str, Any]) -> str:
-        rounds = state.get("rounds") or []
-        version = state.get("best_version")
-        if isinstance(version, int) and 1 <= version <= len(rounds):
-            return str(rounds[version - 1].get("plan_text") or "")
-        if rounds:
-            return str(rounds[-1].get("plan_text") or "")
-        return ""
-
     def release(
         session,
         *,
@@ -60,7 +51,9 @@ def install_public_release_closure(ns: MutableMapping[str, Any]) -> None:
 
             cwd_checks = None
             if execution_cwd is not None:
-                text = best_plan_text(state)
+                # Resolve through the public hook so tests and integrations that
+                # replace the canonical plan-text selector observe this gate too.
+                text = ns["_best_plan_text"](state, pdir)
                 cwd = Path(execution_cwd).resolve()
                 grounded = ns["ground_check"](text, cwd=cwd) if text else {
                     "ok": False,
