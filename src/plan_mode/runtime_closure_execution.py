@@ -142,7 +142,7 @@ def install_execution_closure() -> None:
     TransactionalExecutionManager._dispatched_action_ids = dispatched_action_ids  # type: ignore[assignment]
 
     raw_execute_and_finalize = TransactionalExecutionManager.execute_and_finalize
-    if getatr(raw_execute_and_finalize, "_runtime_closure", False):
+    if getattr(raw_execute_and_finalize, "_runtime_closure", False):
         return
 
     def execute_and_finalize(self: Any, certificate: Any, execution_backend: Any = None):
@@ -186,7 +186,7 @@ def install_execution_closure() -> None:
         finally:
             ACTIVE_WORKSPACE_PATH.reset(token_path)
             ACTIVE_WORKSPACE_ID.reset(token_ws)
-            ACTIVE_TRANSAACTION_ID.reset(token_tx)
+            ACTIVE_TRANSACTION_ID.reset(token_tx)
 
         if not self.ledger.verify_integrity():
             if getattr(self, "_owned_workspace", None) is not None:
