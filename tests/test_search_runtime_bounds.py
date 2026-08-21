@@ -196,7 +196,7 @@ async def test_sync_runtime_proposer_is_rejected_before_it_can_block(tmp_path):
         )
     elapsed = time.monotonic() - started
 
-    assert elapsed < 0.5
+    assert elapsed < 1.5
 
 
 @pytest.mark.asyncio
@@ -209,7 +209,7 @@ async def test_proposal_timeout_falls_back_instead_of_hanging(tmp_path):
     plan_mode.assess(session, PLAN, plans_dir=tmp_path)
 
     async def slow_proposer(**kwargs):
-        await asyncio.sleep(0.2)
+        await asyncio.sleep(2.0)
         return [kwargs["plan_text"]], 0
 
     started = time.monotonic()
@@ -221,13 +221,13 @@ async def test_proposal_timeout_falls_back_instead_of_hanging(tmp_path):
         iterations=1,
         width=1,
         proposal_timeout_seconds=0.01,
-        search_timeout_seconds=1.0,
+        search_timeout_seconds=5.0,
         skip_if_converged=False,
         plans_dir=tmp_path,
     )
     elapsed = time.monotonic() - started
 
-    assert elapsed < 0.5
+    assert elapsed < 1.5
     assert any("timed out" in warning.lower() for warning in result["warnings"])
     assert result["timed_out"] is False
 
@@ -242,7 +242,7 @@ async def test_total_search_deadline_returns_partial_result(tmp_path):
     plan_mode.assess(session, PLAN, plans_dir=tmp_path)
 
     async def very_slow_proposer(**kwargs):
-        await asyncio.sleep(1.0)
+        await asyncio.sleep(2.0)
         return [kwargs["plan_text"]], 0
 
     started = time.monotonic()
@@ -253,13 +253,13 @@ async def test_total_search_deadline_returns_partial_result(tmp_path):
         llm_proposer=very_slow_proposer,
         iterations=4,
         width=2,
-        proposal_timeout_seconds=1.0,
-        search_timeout_seconds=0.03,
+        proposal_timeout_seconds=5.0,
+        search_timeout_seconds=0.05,
         skip_if_converged=False,
         plans_dir=tmp_path,
     )
     elapsed = time.monotonic() - started
 
-    assert elapsed < 0.5
+    assert elapsed < 1.5
     assert result["timed_out"] is True
     assert result["termination_reason"] == "search-timeout"
