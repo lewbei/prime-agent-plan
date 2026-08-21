@@ -102,7 +102,13 @@ def assess(session, plan_text, *, note=None, addressed=None, plans_dir=None,
            require_execution_contract=False, run_probe=False, probe_cwd=None,
            execution_evidence=None, require_execution_evidence=False,
            conflicts=None, require_conflict_free=False):
-    """Assess while reserving ``converged`` for a clean deterministic state."""
+    """Assess while reserving ``plateaued`` for failed hard correctness gates.
+
+    Rubric/style critiques remain useful optimization advice, but they do not by
+    themselves make a causally valid, grounded and simulatable plan incorrect.
+    ``converged`` therefore remains backward-compatible when the hard gates pass,
+    while an optimizer stop with a failed hard gate is surfaced as ``plateaued``.
+    """
     result = _raw_assess(
         session,
         plan_text,
@@ -125,8 +131,7 @@ def assess(session, plan_text, *, note=None, addressed=None, plans_dir=None,
     grounded = plan_mode.ground_check(plan_text, cwd=cwd)
     simulated = plan_mode.simulate(plan_text, initial_state=set(grounded.get("verified", [])))
     clean = bool(
-        not result.get("critiques")
-        and verified.get("ok")
+        verified.get("ok")
         and grounded.get("ok")
         and simulated.get("executable_plan")
     )
@@ -145,21 +150,30 @@ def assess(session, plan_text, *, note=None, addressed=None, plans_dir=None,
         "ground_ok": bool(grounded.get("ok")),
         "sim_ok": bool(simulated.get("executable_plan")),
     }
+    result["open_critiques"] = len(result.get("critiques") or [])
     if clean:
-        _persist_status(session, "converged", plans_dir, convergence_quality="clean")
+        result["convergence_quality"] = "hard-gates-clean"
+        _persist_status(
+            session,
+            "converged",
+            plans_dir,
+            convergence_quality="hard-gates-clean",
+            open_critiques=result["open_critiques"],
+        )
         return result
 
     result.update({
         "status": "plateaued",
         "continue": False,
         "requires_revision": True,
-        "convergence_quality": "stopped-with-open-issues",
+        "convergence_quality": "stopped-with-hard-gate-failure",
     })
     _persist_status(
         session,
         "plateaued",
         plans_dir,
-        convergence_quality="stopped-with-open-issues",
+        convergence_quality="stopped-with-hard-gate-failure",
+        open_critiques=result["open_critiques"],
     )
     return result
 
