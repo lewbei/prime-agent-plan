@@ -194,7 +194,7 @@ class SagaRecoveryManager:
                 return self._containment_failure(
                     session=session,
                     step_id=action.action_id,
-                    capability=action.action_id,
+                    capability=action.capability_name,
                     compensated_count=compensated_count,
                     notes=notes,
                     uncompensated=uncompensated,
