@@ -17,13 +17,16 @@ exec(compile(_legacy_source, str(_legacy_path), "exec"), globals(), globals())
 
 from ._correctness_hardening import install as _install_correctness_hardening
 from ._correctness_hardening_patch2 import patch as _patch_correctness_hardening
+from ._correctness_hardening_patch3 import patch as _patch_correctness_api
 
 _install_correctness_hardening(globals())
 _patch_correctness_hardening(globals())
+_patch_correctness_api(globals())
 
 del (
     _install_correctness_hardening,
     _patch_correctness_hardening,
+    _patch_correctness_api,
     _legacy_source,
     _legacy_path,
     _Path,
