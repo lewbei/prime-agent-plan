@@ -3,7 +3,7 @@
 The pre-PR5 engine implementation is preserved byte-for-byte in
 ``_legacy_init_impl.py`` and executed in this module namespace so all existing
 private/public globals, monkeypatch behavior, session formats, and callables keep
-their historical module identity.  The audited correctness layer is then
+their historical module identity. The audited correctness layers are then
 installed here, making direct ``import plan_mode`` and compatibility ``plan``
 imports converge on the same hardened runtime semantics.
 """
@@ -16,7 +16,15 @@ _legacy_source = _legacy_path.read_text(encoding="utf-8")
 exec(compile(_legacy_source, str(_legacy_path), "exec"), globals(), globals())
 
 from ._correctness_hardening import install as _install_correctness_hardening
+from ._correctness_hardening_patch2 import patch as _patch_correctness_hardening
 
 _install_correctness_hardening(globals())
+_patch_correctness_hardening(globals())
 
-del _install_correctness_hardening, _legacy_source, _legacy_path, _Path
+del (
+    _install_correctness_hardening,
+    _patch_correctness_hardening,
+    _legacy_source,
+    _legacy_path,
+    _Path,
+)
