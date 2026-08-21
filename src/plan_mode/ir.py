@@ -148,9 +148,23 @@ class PlanIR(BaseModel):
     metadata: Dict[str, Any] = Field(default_factory=dict)
     created_at: float = Field(default_factory=time.time)
 
+    @staticmethod
+    def _condition_semantics(condition: PredicateCondition) -> Dict[str, Any]:
+        return {
+            "key": condition.fact_key,
+            "truth": condition.expected_truth.value,
+            "active_until_action_id": condition.active_until_action_id,
+        }
+
     def compute_hash(self) -> str:
-        """Compute deterministic SHA-256 hash of canonical plan representation."""
-        # Serialize fields deterministically excluding dynamic timestamps
+        """Compute the SHA-256 identity of all plan semantics.
+
+        Authorization, execution and commit decisions rely on this hash.  It
+        therefore binds every field capable of changing causal validation,
+        dispatch, recovery, timeout behavior, invariant scope or completion
+        semantics.  Dynamic timestamps and presentation-only metadata remain
+        outside the identity.
+        """
         dump_data = {
             "plan_id": self.plan_id,
             "goal_description": self.goal_description,
@@ -159,8 +173,12 @@ class PlanIR(BaseModel):
                 {
                     "key": f.fact_key,
                     "truth": f.truth.value,
+                    "projected_truth": f.projected_truth.value,
                     "witnessability": f.witnessability.value,
-                    "source": f.provenance.source_type.value,
+                    "ttl_seconds": f.ttl_seconds,
+                    "source_type": f.provenance.source_type.value,
+                    "source_id": f.provenance.source_id,
+                    "confidence": f.provenance.confidence,
                 }
                 for f in self.initial_state
             ],
@@ -169,40 +187,46 @@ class PlanIR(BaseModel):
                     "action_id": a.action_id,
                     "capability_name": a.capability_name,
                     "parameters": a.parameters,
-                    "preconditions": [
-                        {"key": p.fact_key, "truth": p.expected_truth.value}
-                        for p in a.preconditions
-                    ],
-                    "positive_effects": [
-                        {"key": p.fact_key, "truth": p.expected_truth.value}
-                        for p in a.positive_effects
-                    ],
-                    "negative_effects": [
-                        {"key": p.fact_key, "truth": p.expected_truth.value}
-                        for p in a.negative_effects
-                    ],
+                    "preconditions": [self._condition_semantics(p) for p in a.preconditions],
+                    "positive_effects": [self._condition_semantics(p) for p in a.positive_effects],
+                    "negative_effects": [self._condition_semantics(p) for p in a.negative_effects],
+                    "compensation_action_id": a.compensation_action_id,
                     "is_idempotent": a.is_idempotent,
+                    "timeout_seconds": a.timeout_seconds,
+                    "provenance": {
+                        "source_type": a.provenance.source_type.value,
+                        "source_id": a.provenance.source_id,
+                        "confidence": a.provenance.confidence,
+                    },
                 }
                 for a in self.actions
             ],
             "hard_constraints": [
                 {
                     "constraint_id": hc.constraint_id,
-                    "key": hc.condition.fact_key,
-                    "expected": hc.condition.expected_truth.value,
+                    "description": hc.description,
+                    "condition": self._condition_semantics(hc.condition),
+                    "enforcement_level": hc.enforcement_level,
+                    "active_until_action_id": hc.active_until_action_id,
+                    "provenance": {
+                        "source_type": hc.provenance.source_type.value,
+                        "source_id": hc.provenance.source_id,
+                        "confidence": hc.provenance.confidence,
+                    },
                 }
                 for hc in self.hard_constraints
             ],
             "success_criteria": [
                 {
                     "criterion_id": sc.criterion_id,
-                    "key": sc.condition.fact_key,
-                    "expected": sc.condition.expected_truth.value,
+                    "description": sc.description,
+                    "condition": self._condition_semantics(sc.condition),
+                    "is_mandatory": sc.is_mandatory,
                 }
                 for sc in self.success_criteria
             ],
         }
-        serialized = json.dumps(dump_data, sort_keys=True)
+        serialized = json.dumps(dump_data, sort_keys=True, separators=(",", ":"))
         return hashlib.sha256(serialized.encode("utf-8")).hexdigest()
 
 
