@@ -37,6 +37,7 @@ def recovery_setup():
             name="fs.delete_temp_dir",
             description="Delete temporary directory",
             input_schema={"dir_path": {"type": "str", "required": True}},
+            executor_command_template=["true"],
         )
     )
     reg.register(
