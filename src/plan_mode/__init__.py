@@ -4,8 +4,8 @@ The historical implementation is preserved byte-for-byte in ``_api_impl.py``
 and executed in this module namespace. Executing it here, rather than importing
 it as a separate module, preserves the existing public monkeypatch/testing
 semantics: functions still resolve sibling API hooks through ``plan_mode``'s
-own globals. After the implementation finishes loading, PR5 hardening replaces
-only the audited public boundaries.
+own globals. After the implementation finishes loading, the audited hardening
+layers replace only correctness and security boundaries.
 """
 from __future__ import annotations
 
@@ -20,12 +20,15 @@ from .api_hardening import install_api_hardening as _install_api_hardening
 from .api_hardening_compat import install_api_hardening_compat as _install_api_hardening_compat
 from .followup_hardening import install_followup_hardening as _install_followup_hardening
 from .authorization_compat import install_authorization_compat as _install_authorization_compat
+from .runtime_closure import install_runtime_closure as _install_runtime_closure
 
 _install_api_hardening(globals())
 _install_api_hardening_compat(globals())
 _install_followup_hardening(globals())
 _install_authorization_compat()
+_install_runtime_closure(globals())
 del _install_api_hardening
 del _install_api_hardening_compat
 del _install_followup_hardening
 del _install_authorization_compat
+del _install_runtime_closure
