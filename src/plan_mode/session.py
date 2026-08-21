@@ -79,10 +79,13 @@ class CommitGateError(Exception):
 
 
 def compute_world_state_hash(facts: List[WorldFact]) -> str:
-    """Deterministic SHA-256 hash of the live empirical state identity.
+    """Deterministic semantic hash of the empirical state.
 
-    Freshness metadata is included because TTL and observation timestamps can
-    change whether the exact same predicate/value is admissible at execution.
+    Observation timestamps are intentionally excluded: a fresh re-observation
+    of the same typed fact must remain semantically equivalent. TTL duration is
+    included, while actual freshness is enforced by ``normalize_trusted_snapshot``
+    immediately before execution. An expired fact therefore decays to UNKNOWN
+    and changes the hash without making benign re-observation timestamps drift.
     """
     entries = []
     for fact in facts:
@@ -92,9 +95,6 @@ def compute_world_state_hash(facts: List[WorldFact]) -> str:
             "truth": fact.truth.value,
             "witnessability": fact.witnessability.value,
             "ttl_seconds": fact.ttl_seconds,
-            "updated_at": fact.updated_at,
-            "source_type": fact.provenance.source_type.value,
-            "source_id": fact.provenance.source_id,
         })
     serialized_entries = sorted(
         json.dumps(entry, sort_keys=True, separators=(",", ":")) for entry in entries
