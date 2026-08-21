@@ -15,6 +15,7 @@ from plan_mode.epistemic_validator import (
     CausalValidator,
     PlanValidationResult,
     ValidationStatus,
+    normalize_trusted_snapshot,
 )
 from plan_mode.ir import PlanIR, SourceType, WorldFact
 from plan_mode.registry import CapabilityRegistry
@@ -78,7 +79,11 @@ class CommitGateError(Exception):
 
 
 def compute_world_state_hash(facts: List[WorldFact]) -> str:
-    """Deterministic SHA-256 hash preserving raw fact argument types."""
+    """Deterministic SHA-256 hash of the live empirical state identity.
+
+    Freshness metadata is included because TTL and observation timestamps can
+    change whether the exact same predicate/value is admissible at execution.
+    """
     entries = []
     for fact in facts:
         entries.append({
@@ -86,8 +91,14 @@ def compute_world_state_hash(facts: List[WorldFact]) -> str:
             "args": fact.args,
             "truth": fact.truth.value,
             "witnessability": fact.witnessability.value,
+            "ttl_seconds": fact.ttl_seconds,
+            "updated_at": fact.updated_at,
+            "source_type": fact.provenance.source_type.value,
+            "source_id": fact.provenance.source_id,
         })
-    serialized_entries = sorted(json.dumps(entry, sort_keys=True) for entry in entries)
+    serialized_entries = sorted(
+        json.dumps(entry, sort_keys=True, separators=(",", ":")) for entry in entries
+    )
     return hashlib.sha256("\n".join(serialized_entries).encode("utf-8")).hexdigest()
 
 
@@ -102,8 +113,6 @@ class PlanVersion(BaseModel, frozen=True):
 
 
 class AuthorizationCertificate(BaseModel, frozen=True):
-    """HMAC authorization token binding plan, world, registry, and security policy."""
-
     certificate_id: str
     plan_id: str
     plan_version: int
@@ -199,7 +208,7 @@ class PlanningSession(BaseModel):
         ):
             self.transition_to(SessionState.DRAFT)
         next_version = len(self.versions) + 1
-        versioned = plan_ir.model_copy(update={"version": next_version})
+        versioned = plan_ir.model_copy(deep=True, update={"version": next_version})
         version_obj = PlanVersion(
             version_number=next_version,
             plan_ir=versioned,
@@ -228,8 +237,6 @@ class PlanningSession(BaseModel):
         effective_now = current_time if current_time is not None else time.time()
         ttl_decay_policy = getattr(active_validator, "default_ttl_decay_to_unknown", True)
 
-        from plan_mode.epistemic_validator import normalize_trusted_snapshot
-
         normalized_map = (
             normalize_trusted_snapshot(
                 observed_world_state,
@@ -240,11 +247,7 @@ class PlanningSession(BaseModel):
             else None
         )
         canonical_list = list(normalized_map.values()) if normalized_map is not None else None
-        world_hash = (
-            compute_world_state_hash(canonical_list)
-            if canonical_list is not None
-            else compute_world_state_hash([])
-        )
+        world_hash = compute_world_state_hash(canonical_list or [])
         result = active_validator.validate_plan(
             version_obj.plan_ir,
             registry=registry,
@@ -285,12 +288,6 @@ class PlanningSession(BaseModel):
         ttl_seconds: float = 60.0,
         isolation_policy_hash: Optional[str] = None,
     ) -> AuthorizationCertificate:
-        """Authorize a selected plan and bind its allowed isolation privileges.
-
-        If no explicit isolation identity is supplied, authorization defaults to
-        the production STRICT profile.  A network-enabled or otherwise relaxed
-        sandbox therefore requires a different, explicitly authorized hash.
-        """
         if self.current_state != SessionState.SELECTED:
             raise InvalidStateTransitionError(
                 f"Cannot authorize when in state '{self.current_state.value}' (expected SELECTED)."
@@ -358,14 +355,24 @@ class PlanningSession(BaseModel):
 
         assert self.authorized_version is not None
         version_obj = self.versions[self.authorized_version]
-        live_facts = (
-            current_world_facts
-            if current_world_facts is not None
-            else (version_obj.validation_world_state or [])
-        )
+        if version_obj.plan_ir.compute_hash() != certificate.plan_hash:
+            raise StateDriftError("Plan semantics changed after authorization.")
+
+        effective_now = current_time if current_time is not None else time.time()
+        source_facts = current_world_facts
+        if source_facts is None:
+            validation_facts = version_obj.validation_world_state or []
+            if any(f.ttl_seconds is not None for f in validation_facts):
+                raise StateDriftError(
+                    "Fresh current_world_facts are required because authorized world state contains TTL-bound facts."
+                )
+            source_facts = validation_facts
+
+        normalized_map = normalize_trusted_snapshot(source_facts, now=effective_now)
+        live_facts = list(normalized_map.values())
         if compute_world_state_hash(live_facts) != certificate.world_state_hash:
             raise StateDriftError(
-                "World state drift detected between authorization and execution."
+                "World state drift or freshness decay detected between authorization and execution."
             )
         if registry.compute_registry_hash() != certificate.registry_hash:
             raise StateDriftError("Capability registry changed since certificate issuance.")
@@ -416,6 +423,8 @@ class PlanningSession(BaseModel):
             blockers.append("no authorized plan version is bound to this execution")
         else:
             plan = self.versions[self.authorized_version].plan_ir
+            if self.authorization_certificate and plan.compute_hash() != self.authorization_certificate.plan_hash:
+                blockers.append("authorized plan semantics changed before commit")
             fact_map = {fact.fact_key: fact for fact in facts}
             for criterion in plan.success_criteria:
                 if not criterion.is_mandatory:
