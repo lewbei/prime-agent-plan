@@ -7,6 +7,7 @@ import re
 from typing import Any, Dict, List, Optional
 from pydantic import BaseModel, Field, model_validator
 
+from plan_mode.fact_identity import canonical_fact_identity
 from plan_mode.ir import FactTruth
 
 
@@ -30,13 +31,11 @@ class DiagnosticProbe(BaseModel):
 
     @model_validator(mode="after")
     def validate_safety_boundaries(self) -> DiagnosticProbe:
-        # Strict containment: probes must be essentially read-only
         if self.side_effect_risk > 0.1:
             raise UnsafeProbeError(
                 f"Probe '{self.probe_id}' has side_effect_risk={self.side_effect_risk} > 0.1. "
                 "Diagnostic probes must be strictly read-only."
             )
-        # Verify argv pipeline is not empty and has no empty tokens
         if not self.argv_pipeline:
             raise UnsafeProbeError(f"Probe '{self.probe_id}' must define at least one argv stage.")
         for stage in self.argv_pipeline:
@@ -46,9 +45,8 @@ class DiagnosticProbe(BaseModel):
 
     @property
     def fact_key(self) -> str:
-        """Canonical key matching the target WorldFact."""
-        args_str = ",".join(str(a) for a in self.args_normalized)
-        return f"{self.target_predicate}({args_str})"
+        """Canonical typed key matching ``WorldFact.fact_key`` exactly."""
+        return canonical_fact_identity(self.target_predicate, self.args_normalized)
 
     @property
     def args_normalized(self) -> List[Any]:
@@ -69,11 +67,9 @@ class VOIProbingEngine:
         self.probes: Dict[str, DiagnosticProbe] = {}
 
     def register_probe(self, probe: DiagnosticProbe) -> None:
-        """Register a validated diagnostic probe."""
         self.probes[probe.probe_id] = probe
 
     def get_probe(self, probe_id: str) -> DiagnosticProbe:
-        """Retrieve probe by ID."""
         if probe_id not in self.probes:
             raise KeyError(f"Probe '{probe_id}' not found.")
         return self.probes[probe_id]
@@ -83,7 +79,6 @@ class VOIProbingEngine:
         unknown_facts: List[str],
         plan_criticality_map: Optional[Dict[str, float]] = None,
     ) -> List[ProbeCandidate]:
-        """Rank registered probes using VOI(q) = E[ΔU | q] - C(q) - R(q) - P_perm(q)."""
         criticality = plan_criticality_map or {}
         candidates: List[ProbeCandidate] = []
 
@@ -91,12 +86,7 @@ class VOIProbingEngine:
             key = p.fact_key
             if key in unknown_facts:
                 delta_u = criticality.get(key, 1.0)
-                voi = (
-                    delta_u
-                    - p.execution_cost
-                    - p.side_effect_risk
-                    - p.permission_cost
-                )
+                voi = delta_u - p.execution_cost - p.side_effect_risk - p.permission_cost
                 candidates.append(
                     ProbeCandidate(
                         probe=p,
@@ -105,7 +95,6 @@ class VOIProbingEngine:
                     )
                 )
 
-        # Sort descending by VOI score
         candidates.sort(key=lambda c: c.voi_score, reverse=True)
         return candidates
 
@@ -115,7 +104,6 @@ class VOIProbingEngine:
         max_probes: int = 5,
         min_voi_threshold: float = 0.0,
     ) -> List[DiagnosticProbe]:
-        """Select top-k probes exceeding the minimum VOI threshold."""
         ranked = self.rank_probes_for_unknowns(unknown_facts)
         selected: List[DiagnosticProbe] = []
         for cand in ranked:
@@ -129,7 +117,6 @@ class VOIProbingEngine:
         stdout: str,
         returncode: int,
     ) -> FactTruth:
-        """Parse raw sandbox execution output into a 4-state FactTruth."""
         parser = probe.expected_output_parser
 
         if parser == "exit_code_zero":
