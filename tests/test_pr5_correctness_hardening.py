@@ -325,6 +325,7 @@ def test_expired_world_fact_cannot_start_execution_under_old_hash():
     registry.register(
         CapabilityEntry(
             name="cap",
+            description="test capability",
             preconditions=[ready],
             executor_command_template=[sys.executable, "-c", "pass"],
         )
@@ -369,6 +370,7 @@ def test_registry_rejects_action_that_omits_capability_semantics():
     registry.register(
         CapabilityEntry(
             name="cap",
+            description="test capability",
             preconditions=[required],
             positive_effects=[effect],
         )
@@ -389,6 +391,7 @@ def test_saga_recovery_cannot_report_rollback_without_running_compensation():
     registry.register(
         CapabilityEntry(
             name="do",
+            description="effectful capability",
             default_compensation=CompensationAction(
                 compensation_id="undo-do",
                 capability_name="undo",
@@ -397,7 +400,7 @@ def test_saga_recovery_cannot_report_rollback_without_running_compensation():
         )
     )
     # Critically, the compensation capability has no executor contract.
-    registry.register(CapabilityEntry(name="undo"))
+    registry.register(CapabilityEntry(name="undo", description="missing executor"))
     plan = PlanIR(
         plan_id="saga",
         goal_description="must really undo",
