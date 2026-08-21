@@ -2,8 +2,11 @@
 from __future__ import annotations
 
 import copy
+import hashlib
 from pathlib import Path
 from typing import Any, MutableMapping
+
+from .runtime_closure_context import workspace_identity
 
 
 def install_public_release_closure(ns: MutableMapping[str, Any]) -> None:
@@ -18,6 +21,14 @@ def install_public_release_closure(ns: MutableMapping[str, Any]) -> None:
         if isinstance(session, dict):
             return session
         return ns["_load_session"](plans_dir_for(session, plans_dir), session)
+
+    def certificate_id_for(state: dict[str, Any]) -> str | None:
+        certificate = state.get("authorization_certificate")
+        if isinstance(certificate, dict):
+            value = certificate.get("certificate_id")
+            return str(value) if value else None
+        value = getattr(certificate, "certificate_id", None)
+        return str(value) if value else None
 
     def release(
         session,
@@ -49,11 +60,16 @@ def install_public_release_closure(ns: MutableMapping[str, Any]) -> None:
                 for key in commit_keys
             }
 
+            text = ""
+            prechecks: list[dict[str, Any]] = []
+            problems: list[str] = []
             cwd_checks = None
-            if execution_cwd is not None:
-                # Resolve through the public hook so tests and integrations that
-                # replace the canonical plan-text selector observe this gate too.
+            trace_checks = None
+
+            if execution_cwd is not None or require_execution_evidence:
                 text = ns["_best_plan_text"](state, pdir)
+
+            if execution_cwd is not None:
                 cwd = Path(execution_cwd).resolve()
                 grounded = ns["ground_check"](text, cwd=cwd) if text else {
                     "ok": False,
@@ -74,31 +90,79 @@ def install_public_release_closure(ns: MutableMapping[str, Any]) -> None:
                     "missing": grounded.get("missing", []),
                     "simulation_problems": simulated.get("problems", []),
                 }
-                if not cwd_checks["ground_ok"] or not cwd_checks["sim_ok"]:
-                    problems = []
-                    if not cwd_checks["ground_ok"]:
-                        problems.append(
-                            f"execution_cwd grounding failed: {cwd_checks['missing'][:5]}"
-                        )
-                    if not cwd_checks["sim_ok"]:
-                        problems.append(
-                            "execution_cwd simulation failed: "
-                            f"{cwd_checks['simulation_problems'][:5]}"
-                        )
-                    gate = {
-                        "ok": False,
-                        "checks": [{
-                            "name": "execution_cwd",
-                            "ok": False,
-                            "detail": str(problems)[:240],
-                        }],
-                        "problems": problems,
-                        "execution_cwd_checks": cwd_checks,
-                    }
-                    state["release_gate"] = gate
-                    if state.get("session_id"):
-                        ns["_save_session"](pdir, state)
-                    return gate
+                cwd_ok = cwd_checks["ground_ok"] and cwd_checks["sim_ok"]
+                prechecks.append({
+                    "name": "execution_cwd",
+                    "ok": cwd_ok,
+                    "detail": str(cwd_checks)[:240],
+                })
+                if not cwd_checks["ground_ok"]:
+                    problems.append(
+                        f"execution_cwd grounding failed: {cwd_checks['missing'][:5]}"
+                    )
+                if not cwd_checks["sim_ok"]:
+                    problems.append(
+                        "execution_cwd simulation failed: "
+                        f"{cwd_checks['simulation_problems'][:5]}"
+                    )
+
+            if require_execution_evidence:
+                evidence_cwd = Path(execution_cwd or Path.cwd()).resolve()
+                expected_session_id = str(state.get("session_id") or sid)
+                expected_workspace_id = workspace_identity(evidence_cwd)
+                expected_certificate_id = certificate_id_for(state)
+                trace = ns["verify_execution_trace"](
+                    text,
+                    execution_evidence,
+                    cwd=evidence_cwd,
+                    require_independent_verifier=True,
+                    expected_session_id=expected_session_id,
+                    expected_certificate_id=expected_certificate_id,
+                    expected_workspace_identity=expected_workspace_id,
+                )
+                plan_hash = hashlib.sha256(text.encode("utf-8")).hexdigest()
+                attested = bool(trace.get("ok")) and bool(
+                    ns["_verify_execution_trace_runtime_attestation"](
+                        trace,
+                        plan_hash=plan_hash,
+                        session_id=expected_session_id,
+                        workspace_id=expected_workspace_id,
+                        certificate_id=expected_certificate_id,
+                    )
+                )
+                trace_checks = {
+                    "ok": attested,
+                    "cwd": str(evidence_cwd),
+                    "workspace_identity": expected_workspace_id,
+                    "errors": list(trace.get("errors") or []),
+                    "runtime_attested": attested,
+                }
+                prechecks.append({
+                    "name": "execution_trace_runtime_attestation",
+                    "ok": attested,
+                    "detail": str(trace_checks)[:240],
+                })
+                if not attested:
+                    problems.append(
+                        "execution evidence was not independently re-observed and "
+                        "runtime-attested for this plan/session/workspace"
+                    )
+                    problems.extend(trace_checks["errors"][:5])
+
+            if any(not bool(check.get("ok")) for check in prechecks):
+                gate = {
+                    "ok": False,
+                    "checks": prechecks,
+                    "problems": list(dict.fromkeys(problems)),
+                }
+                if cwd_checks is not None:
+                    gate["execution_cwd_checks"] = cwd_checks
+                if trace_checks is not None:
+                    gate["execution_trace_checks"] = trace_checks
+                state["release_gate"] = gate
+                if state.get("session_id"):
+                    ns["_save_session"](pdir, state)
+                return gate
 
             gate = ns["_raw_release"](
                 state,
@@ -115,6 +179,8 @@ def install_public_release_closure(ns: MutableMapping[str, Any]) -> None:
             )
             if cwd_checks is not None:
                 gate["execution_cwd_checks"] = cwd_checks
+            if trace_checks is not None:
+                gate["execution_trace_checks"] = trace_checks
 
             if not gate.get("ok"):
                 for key, (was_present, value) in snapshot.items():
