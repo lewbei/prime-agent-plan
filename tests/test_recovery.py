@@ -1,5 +1,7 @@
 """Tests for Saga-style Recovery and Compensation Execution."""
 
+import sys
+
 import pytest
 from plan_mode.ir import (
     FactTruth,
@@ -37,6 +39,9 @@ def recovery_setup():
             name="fs.delete_temp_dir",
             description="Delete temporary directory",
             input_schema={"dir_path": {"type": "str", "required": True}},
+            # A rollback test must exercise a real executable compensation
+            # rather than relying on the legacy fake-success simulation.
+            executor_command_template=[sys.executable, "-c", "import sys; sys.exit(0)"],
         )
     )
     reg.register(
@@ -84,7 +89,7 @@ def recovery_setup():
 
 def test_saga_successful_rollback(recovery_setup):
     session, plan, reg, ledger = recovery_setup
-    
+
     # Step 1 succeeded, Step 2 failed
     executed_steps = [
         StepExecutionResult(
