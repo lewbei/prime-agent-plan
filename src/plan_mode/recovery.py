@@ -81,7 +81,11 @@ class SagaRecoveryManager:
             uncompensated.append(capability)
         if session.current_state == SessionState.COMPENSATING:
             session.transition_to(SessionState.CONTAINMENT_FAILED)
-        elif session.current_state not in (SessionState.CONTAINMENT_FAILED, SessionState.FAILED):
+        if session.current_state == SessionState.CONTAINMENT_FAILED:
+            # Preserve the public legacy manager's terminal-state contract while
+            # the report still exposes the more precise containment outcome.
+            session.transition_to(SessionState.FAILED)
+        elif session.current_state != SessionState.FAILED:
             session.transition_to(SessionState.FAILED)
         return SagaRecoveryReport(
             status=RecoveryStatus.CONTAINMENT_FAILED,
@@ -190,7 +194,7 @@ class SagaRecoveryManager:
                 return self._containment_failure(
                     session=session,
                     step_id=action.action_id,
-                    capability=action.capability_name,
+                    capability=action.action_id,
                     compensated_count=compensated_count,
                     notes=notes,
                     uncompensated=uncompensated,
