@@ -1,8 +1,4 @@
-"""Adversarial regressions from the full post-PR4 runtime audit.
-
-These tests state public invariants rather than implementation details. They are
-intentionally committed RED before the PR #5 production fixes.
-"""
+"""Adversarial regressions from the full post-PR4 runtime audit."""
 from __future__ import annotations
 
 import asyncio
@@ -21,14 +17,8 @@ from plan_mode.ast_search import ASTSearchEngine
 from plan_mode.causal_validator import ActionSchema, PlanAST
 from plan_mode.execution_contract import ExecutionContract, artifact_audit
 from plan_mode.ir import (
-    ActionIR,
-    FactTruth,
-    PlanIR,
-    PredicateCondition,
-    Provenance,
-    SourceType,
-    SuccessCriterion,
-    WorldFact,
+    ActionIR, FactTruth, PlanIR, PredicateCondition, Provenance, SourceType,
+    SuccessCriterion, WorldFact,
 )
 from plan_mode.ir_search import EpistemicPlanSearch
 from plan_mode.isolation import IsolationManager
@@ -36,7 +26,9 @@ from plan_mode.judges import EnsembleJudge, JudgeAdapter, JudgeVerdict
 from plan_mode.probing import DiagnosticProbe, VOIProbingEngine
 from plan_mode.recovery import RecoveryStatus, SagaRecoveryManager
 from plan_mode.recovery_graph import DriftEvidence, recovery_decision
-from plan_mode.registry import CapabilityEntry, CapabilityRegistry, CompensationAction, SchemaMismatchError
+from plan_mode.registry import (
+    CapabilityEntry, CapabilityRegistry, CompensationAction, SchemaMismatchError,
+)
 from plan_mode.runtime.executor import StepExecutionResult, WitnessStatus
 from plan_mode.runtime.ledger import EvidenceLedger
 from plan_mode.runtime.sandbox import ExecutionSandbox, SandboxExecutionResult, SecurityProfile
@@ -51,37 +43,56 @@ def _plan_ir(*, timeout: float = 5.0, mandatory: bool = True) -> PlanIR:
     return PlanIR(
         plan_id="p",
         goal_description="test",
-        actions=[ActionIR(action_id="a1", capability_name="noop", timeout_seconds=timeout, provenance=_prov())],
+        actions=[ActionIR(
+            action_id="a1", capability_name="noop", timeout_seconds=timeout,
+            provenance=_prov(),
+        )],
         success_criteria=[SuccessCriterion(
-            criterion_id="s1",
-            description="done",
+            criterion_id="s1", description="done",
             condition=PredicateCondition(predicate="done", args=[1]),
             is_mandatory=mandatory,
         )],
     )
 
 
-def _legacy_plan_with_input() -> str:
+def _legacy_valid_plan() -> str:
     return (
-        "# Goal\nGoal: atomic release. In scope: local. Out of scope: network.\n\n"
+        "# Goal\nGoal: atomic release. In scope: x. Out of scope: y.\n\n"
         "## Success criteria\n- S1: 1 test passes. Pass/fail. Deadline: within 1 day.\n\n"
         "## Tasks\n"
-        "1. Read input. Inputs: input.txt. Output: a.txt.\n"
-        "2. Finish. Depends on 1. Inputs: a.txt. Output: out.txt.\n"
+        "1. A. Output: a.md.\n"
+        "2. B. Depends on 1. Inputs: a.md. Output: b.md (verifies S1).\n"
     )
 
 
 def test_failed_execution_cwd_release_never_commits_memory_or_disk(tmp_path, monkeypatch):
-    monkeypatch.chdir(tmp_path)
-    (tmp_path / "input.txt").write_text("ok\n")
+    plans_dir = tmp_path / "plans"
     execution_cwd = tmp_path / "execution"
     execution_cwd.mkdir()
-    plans_dir = tmp_path / "plans"
     session = plan.start("atomic-release-regression", plans_dir=plans_dir, max_rounds=1)
-    assessed = plan.assess(session, _legacy_plan_with_input(), plans_dir=plans_dir)
+    assessed = plan.assess(session, _legacy_valid_plan(), plans_dir=plans_dir)
     assert assessed["status"] == "converged"
     assert session.get("committed_version") is None
-    gate = plan.release(session, min_score=0, require_judge=False, execution_cwd=execution_cwd, plans_dir=plans_dir)
+
+    calls = 0
+    def staged_ground_check(text, *, cwd=None):
+        nonlocal calls
+        calls += 1
+        if calls == 1:  # legacy/raw release gate
+            return {"ok": True, "missing": [], "verified": []}
+        return {"ok": False, "missing": ["forced execution_cwd mismatch"], "verified": []}
+
+    monkeypatch.setattr(plan_mode, "ground_check", staged_ground_check)
+    monkeypatch.setattr(
+        plan_mode,
+        "simulate",
+        lambda *args, **kwargs: {"executable_plan": True, "problems": []},
+    )
+    gate = plan.release(
+        session, min_score=0, require_judge=False,
+        execution_cwd=execution_cwd, plans_dir=plans_dir,
+    )
+    assert calls >= 2
     assert gate["ok"] is False
     assert session.get("committed_version") is None
     persisted = json.loads((plans_dir / f"{session['session_id']}.json").read_text())
@@ -99,8 +110,10 @@ def test_direct_plan_mode_search_mutations_are_cross_process_deterministic(tmp_p
     for seed in ("1", "2", "17", "987654"):
         env = dict(os.environ)
         env["PYTHONHASHSEED"] = seed
-        completed = subprocess.run([sys.executable, "-c", code], cwd=str(tmp_path), env=env,
-                                   capture_output=True, text=True, timeout=10)
+        completed = subprocess.run(
+            [sys.executable, "-c", code], cwd=str(tmp_path), env=env,
+            capture_output=True, text=True, timeout=10,
+        )
         assert completed.returncode == 0, completed.stderr
         outputs.append(json.loads(completed.stdout.strip()))
     assert all(item == outputs[0] for item in outputs[1:])
@@ -151,8 +164,10 @@ def test_spoofed_external_judge_metadata_cannot_satisfy_strict_release(tmp_path)
         "ok": True, "verdict": "go", "falsifiable_criteria": True,
         "source": "external_llm", "external": True,
     }, plans_dir=tmp_path)
-    gate = plan_mode.release(session, min_score=0, require_judge=True,
-                             require_external_judge=True, plans_dir=tmp_path)
+    gate = plan_mode.release(
+        session, min_score=0, require_judge=True,
+        require_external_judge=True, plans_dir=tmp_path,
+    )
     assert gate["ok"] is False
 
 
@@ -168,12 +183,16 @@ async def test_judge_ensemble_does_not_reuse_prior_plan_version_votes(tmp_path, 
     session["best_version"] = 2
 
     async def current_judge(*args, **kwargs):
-        return {"ok": True, "verdict": "rework", "feasibility_0_100": 20,
-                "falsifiable_criteria": True, "source": "external_llm", "external": True}
+        return {
+            "ok": True, "verdict": "rework", "feasibility_0_100": 20,
+            "falsifiable_criteria": True, "source": "external_llm", "external": True,
+        }
 
     monkeypatch.setattr(plan_mode, "judge", current_judge)
-    entry = await plan_mode.judge_ensemble(session, "1. Second changed plan. Output: b.txt.\n",
-                                            "stale-judge-regression", n=3, plans_dir=tmp_path)
+    entry = await plan_mode.judge_ensemble(
+        session, "1. Second changed plan. Output: b.txt.\n",
+        "stale-judge-regression", n=3, plans_dir=tmp_path,
+    )
     assert not any(v.get("round_version") == 1 for v in entry.get("votes", []))
 
 
@@ -201,17 +220,27 @@ def test_submit_draft_after_committed_state_enters_ir_valid():
 
 
 def test_probe_fact_key_preserves_argument_type_identity():
-    int_probe = DiagnosticProbe(probe_id="int", target_predicate="item", target_args=[123], argv_pipeline=[["echo", "x"]])
-    str_probe = DiagnosticProbe(probe_id="str", target_predicate="item", target_args=["123"], argv_pipeline=[["echo", "x"]])
+    int_probe = DiagnosticProbe(
+        probe_id="int", target_predicate="item", target_args=[123],
+        argv_pipeline=[["echo", "x"]],
+    )
+    str_probe = DiagnosticProbe(
+        probe_id="str", target_predicate="item", target_args=["123"],
+        argv_pipeline=[["echo", "x"]],
+    )
     assert int_probe.fact_key != str_probe.fact_key
 
 
 def test_malformed_probe_output_is_unknown_not_empirical_false():
     engine = VOIProbingEngine()
-    integer_probe = DiagnosticProbe(probe_id="integer", target_predicate="count",
-                                    argv_pipeline=[["echo", "x"]], expected_output_parser="integer")
-    json_probe = DiagnosticProbe(probe_id="json", target_predicate="json",
-                                 argv_pipeline=[["echo", "x"]], expected_output_parser="json")
+    integer_probe = DiagnosticProbe(
+        probe_id="integer", target_predicate="count",
+        argv_pipeline=[["echo", "x"]], expected_output_parser="integer",
+    )
+    json_probe = DiagnosticProbe(
+        probe_id="json", target_predicate="json",
+        argv_pipeline=[["echo", "x"]], expected_output_parser="json",
+    )
     assert engine.parse_probe_output(integer_probe, "not-an-integer", 0) == FactTruth.UNKNOWN
     assert engine.parse_probe_output(json_probe, "{broken", 0) == FactTruth.UNKNOWN
 
@@ -227,17 +256,26 @@ def test_saga_recovery_executes_compensation_and_observes_failure():
     sandbox = FailingSandbox()
     manager = SagaRecoveryManager(sandbox=sandbox)  # type: ignore[arg-type]
     registry = CapabilityRegistry()
-    registry.register(CapabilityEntry(name="do", description="do", default_compensation=CompensationAction(
-        compensation_id="undo-1", capability_name="undo")))
-    registry.register(CapabilityEntry(name="undo", description="undo",
-                                      executor_command_template=[sys.executable, "-c", "print('undo')"]))
+    registry.register(CapabilityEntry(
+        name="do", description="do",
+        default_compensation=CompensationAction(
+            compensation_id="undo-1", capability_name="undo",
+        ),
+    ))
+    registry.register(CapabilityEntry(
+        name="undo", description="undo",
+        executor_command_template=[sys.executable, "-c", "print('undo')"],
+    ))
     action = ActionIR(action_id="a1", capability_name="do", provenance=_prov())
-    step = StepExecutionResult(step_id="a1", capability_name="do", exit_code=0,
-                               witness_status=WitnessStatus.WITNESSED_TRUE, duration_ms=1.0)
+    step = StepExecutionResult(
+        step_id="a1", capability_name="do", exit_code=0,
+        witness_status=WitnessStatus.WITNESSED_TRUE, duration_ms=1.0,
+    )
     session = PlanningSession(session_id="saga", current_state=SessionState.EXECUTING)
     report = manager.execute_saga_rollback(
-        [step], PlanIR(plan_id="p", goal_description="g", actions=[action]), registry,
-        EvidenceLedger(session_id="saga"), session)
+        [step], PlanIR(plan_id="p", goal_description="g", actions=[action]),
+        registry, EvidenceLedger(session_id="saga"), session,
+    )
     assert sandbox.calls, "rollback must execute the registered compensation command"
     assert report.status == RecoveryStatus.CONTAINMENT_FAILED
 
@@ -255,10 +293,14 @@ def test_artifact_audit_rejects_paths_outside_workspace(tmp_path):
 
 def test_registry_rejects_undeclared_extra_parameters():
     registry = CapabilityRegistry()
-    registry.register(CapabilityEntry(name="strict-cap", description="strict",
-                                      input_schema={"x": {"type": "int", "required": True}}))
-    action = ActionIR(action_id="a", capability_name="strict-cap",
-                      parameters={"x": 1, "undeclared": "surprise"}, provenance=_prov())
+    registry.register(CapabilityEntry(
+        name="strict-cap", description="strict",
+        input_schema={"x": {"type": "int", "required": True}},
+    ))
+    action = ActionIR(
+        action_id="a", capability_name="strict-cap",
+        parameters={"x": 1, "undeclared": "surprise"}, provenance=_prov(),
+    )
     with pytest.raises(SchemaMismatchError, match="undeclared"):
         registry.validate_action(action)
 
@@ -289,17 +331,26 @@ def test_isolation_release_ends_prior_ownership_conflict():
 class _CountingJudge(JudgeAdapter):
     def __init__(self):
         self.calls = 0
-    async def evaluate(self, plan_ir, goal_description="", registry=None, observed_world_state=None, timeout=30.0):
+
+    async def evaluate(
+        self, plan_ir, goal_description="", registry=None,
+        observed_world_state=None, timeout=30.0,
+    ):
         self.calls += 1
-        return JudgeVerdict(verdict="PASS", feasibility_0_100=90, confidence=1.0,
-                            provider="counting", model="counting")
+        return JudgeVerdict(
+            verdict="PASS", feasibility_0_100=90, confidence=1.0,
+            provider="counting", model="counting",
+        )
 
 
 def test_ir_search_judge_cache_is_bound_to_world_state():
     judge = _CountingJudge()
     search = EpistemicPlanSearch(judge=judge)
     plan_ir = PlanIR(plan_id="cache", goal_description="cache")
-    fact_true = WorldFact(predicate="ready", args=[1], truth=FactTruth.VERIFIED_TRUE, provenance=_prov())
+    fact_true = WorldFact(
+        predicate="ready", args=[1], truth=FactTruth.VERIFIED_TRUE,
+        provenance=_prov(),
+    )
     fact_false = fact_true.model_copy(update={"truth": FactTruth.VERIFIED_FALSE})
     search._run_judge(plan_ir, [fact_true])
     search._run_judge(plan_ir, [fact_false])
@@ -309,13 +360,18 @@ def test_ir_search_judge_cache_is_bound_to_world_state():
 @pytest.mark.asyncio
 async def test_ensemble_enforces_outer_timeout_for_misbehaving_judge():
     class SlowJudge(JudgeAdapter):
-        async def evaluate(self, plan_ir, goal_description="", registry=None, observed_world_state=None, timeout=30.0):
+        async def evaluate(
+            self, plan_ir, goal_description="", registry=None,
+            observed_world_state=None, timeout=30.0,
+        ):
             await asyncio.sleep(0.5)
             return JudgeVerdict(verdict="PASS", feasibility_0_100=100, confidence=1.0)
 
     ensemble = EnsembleJudge([SlowJudge()])
     started = time.monotonic()
-    verdict = await ensemble.evaluate(PlanIR(plan_id="slow", goal_description="slow"), timeout=0.02)
+    verdict = await ensemble.evaluate(
+        PlanIR(plan_id="slow", goal_description="slow"), timeout=0.02,
+    )
     elapsed = time.monotonic() - started
     assert elapsed < 0.2
     assert verdict.verdict == "UNKNOWN"
