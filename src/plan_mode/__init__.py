@@ -19,17 +19,20 @@ from ._correctness_hardening import install as _install_correctness_hardening
 from ._correctness_hardening_patch2 import patch as _patch_correctness_hardening
 from ._correctness_hardening_patch3 import patch as _patch_correctness_api
 from ._correctness_hardening_patch5 import patch as _patch_candidate_selection
+from ._correctness_hardening_patch6 import patch as _patch_second_pass_boundaries
 
 _install_correctness_hardening(globals())
 _patch_correctness_hardening(globals())
 _patch_correctness_api(globals())
 _patch_candidate_selection(globals())
+_patch_second_pass_boundaries(globals())
 
 del (
     _install_correctness_hardening,
     _patch_correctness_hardening,
     _patch_correctness_api,
     _patch_candidate_selection,
+    _patch_second_pass_boundaries,
     _legacy_source,
     _legacy_path,
     _Path,
