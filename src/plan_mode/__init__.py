@@ -17,6 +17,9 @@ exec(compile(_impl_source, str(_impl_path), "exec"), globals(), globals())
 del _impl_source
 
 from .api_hardening import install_api_hardening as _install_api_hardening
+from .api_hardening_compat import install_api_hardening_compat as _install_api_hardening_compat
 
 _install_api_hardening(globals())
+_install_api_hardening_compat(globals())
 del _install_api_hardening
+del _install_api_hardening_compat
