@@ -1,11 +1,10 @@
 """Public plan_mode API facade with late-bound correctness hardening.
 
 The historical implementation is preserved byte-for-byte in ``_api_impl.py``
-and executed in this module namespace. Executing it here, rather than importing
-it as a separate module, preserves the existing public monkeypatch/testing
-semantics: functions still resolve sibling API hooks through ``plan_mode``'s
-own globals. After the implementation finishes loading, the audited hardening
-layers replace only correctness and security boundaries.
+and executed in this module namespace. The established public wrappers are
+likewise executed here from ``_public_api_impl.py`` so ``plan`` can remain an
+exact alias without changing signatures, monkeypatch behavior, or public
+semantics. The audited runtime-closure layer is installed last.
 """
 from __future__ import annotations
 
@@ -26,9 +25,23 @@ _install_api_hardening(globals())
 _install_api_hardening_compat(globals())
 _install_followup_hardening(globals())
 _install_authorization_compat()
+
+_public_api_path = _BootstrapPath(__file__).with_name("_public_api_impl.py")
+_public_api_source = _public_api_path.read_text(encoding="utf-8")
+exec(
+    compile(_public_api_source, str(_public_api_path), "exec"),
+    globals(),
+    globals(),
+)
+del _public_api_source
+
 _install_runtime_closure(globals())
+
 del _install_api_hardening
 del _install_api_hardening_compat
 del _install_followup_hardening
 del _install_authorization_compat
 del _install_runtime_closure
+del _public_api_path
+del _impl_path
+del _BootstrapPath
