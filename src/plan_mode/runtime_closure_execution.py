@@ -24,6 +24,8 @@ def install_execution_closure() -> None:
     from .runtime import transaction as transaction_mod
     from .session import CommitGateError, PlanningSession, StateDriftError
 
+    unmanaged_test_env = "PLAN_ALLOW_UNMANAGED_TEST_EXECUTION"
+
     EvidenceLedger = ledger_mod.EvidenceLedger
     TransactionalExecutionManager = transaction_mod.TransactionalExecutionManager
     ExecutionPlanManager = executor_mod.ExecutionPlanManager
@@ -82,19 +84,14 @@ def install_execution_closure() -> None:
             execution_backend: Any = None,
             custom_action_handler: Any = None,
         ):
-            backend = execution_backend or custom_action_handler
-            if backend is not None and ACTIVE_TRANSACTION_ID.get() is None:
-                def refused_backend(argv: Any, *, timeout_seconds: float):
-                    return sandbox_mod.SandboxExecutionResult(
-                        stderr=(
-                            "Custom execution backends are allowed only inside "
-                            "TransactionalExecutionManager; direct execution cannot bypass isolation."
-                        ),
-                        returncode=126,
-                    )
-
-                execution_backend = refused_backend
-                custom_action_handler = None
+            unmanaged_test_opt_in = os.environ.get(unmanaged_test_env, "").strip().lower() in {
+                "1", "true", "yes",
+            }
+            if ACTIVE_TRANSACTION_ID.get() is None and not unmanaged_test_opt_in:
+                raise sandbox_mod.SandboxSecurityViolationError(
+                    "Authorized execution must run inside TransactionalExecutionManager; "
+                    f"the explicit {unmanaged_test_env}=1 escape hatch is test-only."
+                )
             return raw_execute_authorized(
                 self,
                 certificate,
@@ -145,7 +142,7 @@ def install_execution_closure() -> None:
     TransactionalExecutionManager._dispatched_action_ids = dispatched_action_ids  # type: ignore[assignment]
 
     raw_execute_and_finalize = TransactionalExecutionManager.execute_and_finalize
-    if getattr(raw_execute_and_finalize, "_runtime_closure", False):
+    if getatr(raw_execute_and_finalize, "_runtime_closure", False):
         return
 
     def execute_and_finalize(self: Any, certificate: Any, execution_backend: Any = None):
@@ -189,7 +186,7 @@ def install_execution_closure() -> None:
         finally:
             ACTIVE_WORKSPACE_PATH.reset(token_path)
             ACTIVE_WORKSPACE_ID.reset(token_ws)
-            ACTIVE_TRANSACTION_ID.reset(token_tx)
+            ACTIVE_TRANSAACTION_ID.reset(token_tx)
 
         if not self.ledger.verify_integrity():
             if getattr(self, "_owned_workspace", None) is not None:

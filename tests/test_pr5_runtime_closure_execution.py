@@ -20,7 +20,7 @@ from plan_mode.runtime import (
     TransactionalExecutionManager,
 )
 from plan_mode.runtime.ledger import LedgerTamperError
-from plan_mode.runtime.sandbox import SandboxExecutionResult
+from plan_mode.runtime.sandbox import SandboxExecutionResult, SandboxSecurityViolationError
 from plan_mode.search_engine import _backprop, _fresh_tree, _hash, _new_node, _prune, _select
 from plan_mode.session import CommitGateError, PlanningSession, StateDriftError, compute_world_state_hash
 
@@ -70,7 +70,8 @@ def _prepare_noop_session(session_id: str = "runtime-closure"):
     return session, registry, certificate, policy
 
 
-def test_direct_custom_backend_cannot_execute_outside_transaction():
+def test_direct_custom_backend_cannot_execute_outside_transaction(monkeypatch):
+    monkeypatch.delenv("PLAN_ALLOW_UNMANAGED_TEST_EXECUTION", raising=False)
     session, registry, certificate, policy = _prepare_noop_session("direct-backend")
     calls = []
 
@@ -85,10 +86,9 @@ def test_direct_custom_backend_cannot_execute_outside_transaction():
         observed_world_state=[],
         policy_hash=policy,
     )
-    summary = manager.execute_authorized_plan(certificate, execution_backend=backend)
-    assert summary.success is False
+    with pytest.raises(SandboxSecurityViolationError, match="TransactionalExecutionManager"):
+        manager.execute_authorized_plan(certificate, execution_backend=backend)
     assert calls == []
-    assert "TransactionalExecutionManager" in (summary.step_results[-1].error_message or "")
 
 
 def test_commit_cannot_be_called_outside_transaction_manager():

@@ -168,7 +168,11 @@ def install_causal_closure() -> None:
                 continue
             sanitized.add(text)
 
-        result = raw_validate(ast, initial_state=sanitized)
+        # The legacy validator uses ``initial_state or ast.initial_state``. An
+        # intentionally empty sanitized snapshot must therefore remain truthy,
+        # otherwise negated source facts would be reloaded from ``ast``.
+        effective_state = sanitized or {"prime_internal_empty_initial_state()"}
+        result = raw_validate(ast, initial_state=effective_state)
         flaws = list(result.get("flaws", []))
         for unit, constraints in ast.constraints.items():
             for constraint in constraints:
