@@ -3,6 +3,7 @@ from __future__ import annotations
 
 from typing import Any, MutableMapping
 
+from .runtime_closure_attestation import install_observation_attestation_closure
 from .runtime_closure_execution import install_execution_closure
 from .runtime_closure_public import install_public_release_closure
 from .runtime_closure_search import install_search_closure
@@ -20,6 +21,7 @@ def install_runtime_closure(ns: MutableMapping[str, Any]) -> None:
     install_session_closure(ns)
     install_world_state_identity()
     install_execution_closure()
+    install_observation_attestation_closure()
     install_search_closure()
     install_execution_trace_closure(ns)
     install_memory_closure()
